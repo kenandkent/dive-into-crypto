@@ -4,8 +4,12 @@
 the 0.5% / 1% / 2% bands around the mid price: each band's imbalance is
 ``Σbid − Σask`` normalized by the band's total notional (−1 ask-heavy … +1
 bid-heavy). ``notional_1pct`` is the summed bid+ask notional (USDT) inside the
-1% band — a thin-book honesty read. A book too thin to fill even the 0.5% band
-reports ``{"unavailable": "book_too_thin"}`` instead of degenerate numbers.
+1% band — a thin-book honesty read; ``bid_notional_1pct`` /
+``ask_notional_1pct`` are the per-side ``Σ(price×qty)`` components (design
+§8.2, Tradeability takes ``min`` of the two against the 0.25M/1M single-side
+thresholds, ``None`` when either side is missing). A book too thin to fill
+even the 0.5% band reports ``{"unavailable": "book_too_thin"}`` instead of
+degenerate numbers.
 
 Panel-only by design: served by ``GET /api/symbol/{symbol}``, never attached to
 scan rows (a full scan must not multiply depth calls). Cached 10 seconds.
@@ -53,7 +57,16 @@ def parse_levels(rows: Any) -> list[tuple[float, float]]:
 
 def book_panel(bids: list[tuple[float, float]], asks: list[tuple[float, float]],
                now_ms: int | None = None) -> dict:
-    """Imbalance bands + 1% notional from parsed level lists (pure)."""
+    """Imbalance bands + 1% notional from parsed level lists (pure).
+
+    ``mid = (best_bid + best_ask) / 2``; each side is truncated at ``mid ±
+    band`` (bids keep ``p >= mid*(1-band)``, asks keep ``p <= mid*(1+band)``)
+    and valued as ``Σ(price×qty)``. ``notional_1pct`` is the legacy bilateral
+    total (unchanged); ``bid_notional_1pct`` / ``ask_notional_1pct`` are the
+    per-side 1% components — ``None`` when that side contributes no level
+    inside the band. Either input list empty (or a non-positive best quote)
+    is ``{"unavailable": "book_too_thin"}``, as is a sub-1000-USDT 0.5% band.
+    """
     if not bids or not asks:
         return {"unavailable": "book_too_thin"}
     best_bid, best_ask = bids[0][0], asks[0][0]
@@ -63,15 +76,21 @@ def book_panel(bids: list[tuple[float, float]], asks: list[tuple[float, float]],
 
     bands: dict[str, float] = {}
     notional_1pct = None
+    bid_notional_1pct: float | None = None
+    ask_notional_1pct: float | None = None
     total05 = 0.0
     for band in BANDS_PCT:
-        bid_sum = sum(p * q for p, q in bids if p >= mid * (1 - band))
-        ask_sum = sum(p * q for p, q in asks if p <= mid * (1 + band))
+        bid_levels = [p * q for p, q in bids if p >= mid * (1 - band)]
+        ask_levels = [p * q for p, q in asks if p <= mid * (1 + band)]
+        bid_sum = sum(bid_levels)
+        ask_sum = sum(ask_levels)
         total = bid_sum + ask_sum
         if band == 0.005:
             total05 = total
         if band == 0.01:
             notional_1pct = round(total, 2)
+            bid_notional_1pct = round(bid_sum, 2) if bid_levels else None
+            ask_notional_1pct = round(ask_sum, 2) if ask_levels else None
         bands[f"{int(band * 1000) / 10:g}%"] = (
             round((bid_sum - ask_sum) / total, 4) if total > 0 else None
         )
@@ -85,9 +104,29 @@ def book_panel(bids: list[tuple[float, float]], asks: list[tuple[float, float]],
     return {
         "imbalance": bands,
         "notional_1pct": notional_1pct,
+        "bid_notional_1pct": bid_notional_1pct,
+        "ask_notional_1pct": ask_notional_1pct,
         "mid": mid,
         "ts": ts,
     }
+
+
+def book_depth_min_1pct(panel: dict) -> float | None:
+    """Tradeability input: ``min(bid_notional_1pct, ask_notional_1pct)``.
+
+    ``None`` when the panel is unavailable or either side is missing —
+    scoring must treat that factor as null, never as zero.
+    """
+    if not isinstance(panel, dict) or "unavailable" in panel:
+        return None
+    bid = panel.get("bid_notional_1pct")
+    ask = panel.get("ask_notional_1pct")
+    if bid is None or ask is None:
+        return None
+    try:
+        return min(float(bid), float(ask))
+    except (TypeError, ValueError):
+        return None
 
 
 async def snapshot(symbol: str) -> dict:
