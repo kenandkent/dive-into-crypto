@@ -17,6 +17,7 @@ dependencies = [
   "aiolimiter>=1.1",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
+  "duckdb>=1.5.3",
 ]
 
 [project.scripts]
