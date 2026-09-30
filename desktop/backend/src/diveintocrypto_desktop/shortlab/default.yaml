@@ -1,0 +1,90 @@
+shortlab:
+  enabled: true
+  analysis_tier: LITE
+
+  universe:
+    limit: 500
+    shortlist_size: 50
+    entry_depth_top: 10
+
+  candidate:
+    watch_ltss: 60
+    candidate_ltss: 70
+    ready_ltss: 80
+    ready_entry: 70
+    ready_data_quality: 80
+    ready_tradeability_score: 7
+    entry_required_blocks: [consensus, mtf, micro, regime, failed_bounce, funding]
+
+  score_weights:
+    MEME_LITE: {lifecycle: 40, carry: 45, valuation: 5, tradeability: 10}
+    GENERAL_LITE: {lifecycle: 35, carry: 40, valuation: 15, tradeability: 10}
+    LOW_FLOAT_VC_LITE: {lifecycle: 25, carry: 30, valuation: 35, tradeability: 10}
+    # FULL 的 valuation 键表示 Valuation/Supply 合成模块 raw25
+    MEME_FULL: {lifecycle: 30, carry: 35, valuation: 5, narrative: 20, tradeability: 10}
+    GENERAL_FULL: {lifecycle: 25, carry: 30, valuation: 20, narrative: 15, tradeability: 10}
+    LOW_FLOAT_VC_FULL: {lifecycle: 20, carry: 25, valuation: 35, narrative: 10, tradeability: 10}
+
+  quality_freshness_sec:
+    market_futures: {ttl: 900, grace: 3600}
+    funding_history: {ttl: 1800, grace: 7200}
+    fundamentals: {ttl: 3600, grace: 21600}
+    spot_liquidity: {ttl: 3600, grace: 10800}
+    identity_profile: {ttl: 86400, grace: 259200}
+    unlock: {ttl: 43200, grace: 129600}
+    social: {ttl: 10800, grace: 43200}
+    catalyst: {ttl: 1800, grace: 7200}
+
+  quality_field_overrides_sec:
+    supply_float: {ttl: 21600, grace: 43200}
+
+  liquidity:
+    hard_min_futures_volume_usd: 10000000
+    hard_min_open_interest_usd: 2000000
+    preferred_futures_volume_usd: 30000000
+    preferred_open_interest_usd: 5000000
+
+  lifecycle:
+    ideal_ath_drawdown_min: 0.40
+    ideal_ath_drawdown_max: 0.70
+
+  funding:
+    lookbacks_days: [7, 30, 90]
+    history_requests_per_5min: 80
+    backfill_symbols_per_batch: 80
+
+  evidence_cost:
+    entry_fee: 0.0005
+    exit_fee: 0.0005
+    entry_slippage: 0.001
+    exit_slippage: 0.001
+
+  veto:
+    breakout_24h: 0.35
+    breakout_7d: 0.70
+    new_token_days: 45
+
+  refresh:
+    fundamental_sec: 3600
+    supply_sec: 21600
+    score_sec: 1800
+    entry_sec: 3600
+    grader_sec: 21600
+    jitter_sec: 300
+    entry_concurrency: 2
+    entry_max_upstream_calls_per_run: 240
+    entry_cache_ttl_sec: 3600
+
+  providers:
+    coingecko:
+      enabled: true
+      api_key_env: DIVE_COINGECKO_API_KEY
+    unlock:
+      enabled: false
+      api_key_env: DIVE_TOKENOMIST_API_KEY
+    social:
+      enabled: false
+      api_key_env: DIVE_LUNARCRUSH_API_KEY
+    catalyst:
+      enabled: false
+      api_key_env: null
