@@ -181,7 +181,22 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _configure_logging()
+        # Task 14: start the Short-Lab runtime on the same lifespan.
+        # Tests may override app.state.shortlab_runtime before entering the
+        # TestClient context; respect that override instead of the default.
+        _rt = getattr(app.state, "shortlab_runtime", None)
+        if _rt is not None:
+            try:
+                await _rt.start()
+            except Exception as e:  # unavailable, never fatal to Dive
+                logger.warning("shortlab start failed: %s", str(e)[:150])
         yield
+        _rt = getattr(app.state, "shortlab_runtime", None)
+        if _rt is not None:
+            try:
+                await _rt.stop()
+            except Exception as e:  # shutdown must not raise
+                logger.warning("shortlab stop failed: %s", str(e)[:150])
         await close_session()
         await drb.close_session()
 
@@ -190,6 +205,16 @@ def create_app() -> FastAPI:
         CORSMiddleware, allow_origins=["http://127.0.0.1", "http://localhost"],
         allow_origin_regex=r"http://(127\.0\.0\.1|localhost):\d+", allow_methods=["GET", "POST"], allow_headers=["*"],
     )
+    # Task 14 (sole owner of this block): mount the Short-Lab router on the
+    # same FastAPI process. No old path/schema is touched.
+    try:
+        from diveintocrypto_desktop.api import shortlab as _shortlab_api
+        from diveintocrypto_desktop.shortlab.runtime import ShortLabRuntime as _ShortLabRuntime
+
+        app.state.shortlab_runtime = _ShortLabRuntime()
+        app.include_router(_shortlab_api.router)
+    except Exception as e:  # router must never break legacy app construction
+        logger.warning("shortlab router mount failed: %s", str(e)[:150])
 
     @app.get("/api/health")
     async def health() -> dict:
