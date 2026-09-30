@@ -308,6 +308,60 @@ function _absorbScan(res) {
 
 let _evSeq = 0;  // guards against an older horizon response overwriting a newer one
 
+/* ── Short-Lab adapter (Task 15 · design §25) ───────────────────────────────
+   Components consume ONLY DIVE.shortCandidates / shortDetail / shortRefresh
+   plus the adapted /api/short/* results below. Honesty contract: globals are
+   populated ONLY on a successful fetch; failures throw (with the backend's
+   error/reason surfaced) and NEVER fall back to mock data.
+   Units: minFunding30d travels as a backend decimal (0.005 = 0.5%). Any
+   percent↔decimal conversion lives in shortlab/short-lab-format.js — never
+   here, never in a component. */
+window.SGS_SHORT = null;        // GET /api/short/candidates body (success only)
+window.SGS_SHORT_DETAIL = {};   // symbol → GET /api/short/symbol/{symbol} body
+window.SGS_SHORT_JOB = null;    // POST /api/short/refresh body (success only)
+window.__diveShortQuery = null; // last candidates query (App poll loop reuses it)
+
+/* UI key → API query key. Unknown keys are dropped, never forwarded. */
+const SHORTLAB_QUERY_MAP = {
+  status: "status", candidateStatus: "candidate_status", executionStatus: "execution_status",
+  category: "category", profile: "profile",
+  minLtss: "min_ltss", minEntry: "min_entry", minFunding30d: "min_funding_30d",
+  athDrawdownMin: "ath_drawdown_min", athDrawdownMax: "ath_drawdown_max",
+  minDataQuality: "min_data_quality", sort: "sort", order: "order",
+  generationId: "generation_id", generation_id: "generation_id",
+  limit: "limit", offset: "offset",
+};
+
+async function _shortGet(path) {
+  const r = await fetch(API + path, { headers: { Accept: "application/json" } });
+  if (!r.ok) {
+    let info = "";
+    try {
+      const b = await r.json();
+      if (b && (b.error || b.reason || b.detail)) info = ` · ${b.error || b.reason || ""}${b.detail ? " · " + b.detail : ""}`;
+    } catch (e) { /* opaque body */ }
+    throw new Error(`${path} → ${r.status}${info}`);
+  }
+  return r.json();
+}
+
+async function _shortPost(path, body) {
+  const r = await fetch(API + path, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) {
+    let info = "";
+    try {
+      const b = await r.json();
+      if (b && (b.error || b.reason || b.detail)) info = ` · ${b.error || b.reason || ""}${b.detail ? " · " + b.detail : ""}`;
+    } catch (e) { /* opaque body */ }
+    throw new Error(`POST ${path} → ${r.status}${info}`);
+  }
+  return r.json();
+}
+
 const DIVE = {
   async universe(limit = 60) {
     const rows = await _get(`/api/universe?limit=${limit}`);
@@ -458,5 +512,39 @@ const DIVE = {
     return window.SGS_LOGS;
   },
   async health() { return _get(`/api/health`); },
+  /* ── Short-Lab (design §25): paged candidates, single-symbol detail,
+        async refresh. Globals written ONLY on success. ─────────────────── */
+  async shortCandidates(query = {}) {
+    const p = new URLSearchParams();
+    for (const [uiKey, apiKey] of Object.entries(SHORTLAB_QUERY_MAP)) {
+      const v = query[uiKey];
+      if (v === undefined || v === null || v === "") continue;
+      p.set(apiKey, String(v));
+    }
+    const qs = p.toString();
+    const res = await _shortGet(`/api/short/candidates${qs ? "?" + qs : ""}`);
+    window.SGS_SHORT = res;
+    window.__diveShortQuery = { ...query };
+    _notify();
+    return res;
+  },
+  async shortDetail(symbol, opts = {}) {
+    const sym = String(symbol || "").toUpperCase();
+    if (!sym) throw new Error("shortDetail: empty symbol");
+    const gid = opts.generationId || opts.generation_id;
+    const qs = gid ? `?generation_id=${encodeURIComponent(String(gid))}` : "";
+    const res = await _shortGet(`/api/short/symbol/${encodeURIComponent(sym)}${qs}`);
+    window.SGS_SHORT_DETAIL[sym] = res;
+    _notify();
+    return res;
+  },
+  /* Refresh accepts an in-flight job: the backend answers 202 + existing:true
+     instead of starting a duplicate full-market run. */
+  async shortRefresh(jobType) {
+    const res = await _shortPost(`/api/short/refresh`, jobType ? { jobType: String(jobType) } : {});
+    window.SGS_SHORT_JOB = res;
+    _notify();
+    return res;
+  },
 };
 window.DIVE = DIVE;

@@ -9,6 +9,13 @@ const FILES = [
   "data.js",         // live backend adapter (window.DIVE + globals)
   "mock.js",         // offline demo fallback (window.DIVE_MOCK)
   "i18n.js",         // TR/EN catalogs + L() helper (window.DIVE_I18N / dive_lang)
+  // Short-Lab views (Task 15): format helpers → table → detail → scanner view.
+  // Order matters: desktop-app.jsx references these globals; nothing here may
+  // fetch — all Short-Lab I/O goes through data.js (window.DIVE.*).
+  "shortlab/short-lab-format.js",
+  "shortlab/short-lab-table.jsx",
+  "shortlab/short-lab-detail.jsx",
+  "shortlab/short-lab-view.jsx",
   "desktop-app.jsx", // "Depth Terminal" UI — shell + screens
 ];
 
