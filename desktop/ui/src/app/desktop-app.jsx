@@ -64,6 +64,7 @@ const ICONS = {
   wallet:"M3 7h18v12H3zM3 7l3-4h12l3 4M15 13h4",
   structure:"M9 3h6v4H9zM3 17h6v4H3zM15 17h6v4h-6zM12 7v4M6 17v-3h12v3",
   cmd:"M4 6h16M4 12h10M4 18h7",
+  sl:"M12 3v12M6 11l6 6 6-6M4 21h16",
 };
 const Svg = ({d,vb="0 0 24 24"}) => <svg viewBox={vb}>{(Array.isArray(d)?d:[d]).map((p,i)=><path key={i} d={p}/>)}</svg>;
 
@@ -136,6 +137,10 @@ function StaleBanner({stale,onRetry,onDismiss}){
     <button className="sbtn" aria-label="Uyarıyı kapat · Dismiss stale-data warning" onClick={onDismiss}>✕</button>
   </div>;
 }
+
+/* Short-Lab owns its loading/error states (STALE/UNAVAILABLE/retry page), so the
+   global no-data gate must not cover it. Extracted pure for tests. */
+function shortlabBypassesNoData(view){ return view==="shortlab"; }
 
 /* Boot the symbol universe. Extracted so the no-fabrication guarantee is directly
    testable: on failure this returns an error and MUST NOT touch window.DIVE_MOCK. */
@@ -2100,7 +2105,8 @@ function CommandPalette({open,onClose,onGo,onPickSymbol,onScan,onEvidence,onComp
   useEffect(()=>{ if(open){ setQ(""); setSel(0); setTimeout(()=>inputRef.current&&inputRef.current.focus(),0); } },[open]);
   if(!open)return null;
   const VIEWS=[["scan","pal_scan"],["panel","pal_panel"],["flow","pal_flow"],
-    ["sig","pal_sig"],["evidence","pal_evidence"],["compare","pal_compare"],
+    ["sig","pal_sig"],["evidence","pal_evidence"],["shortlab",null],
+    ["compare","pal_compare"],
     ["map","pal_map"],["portfolio","pal_portfolio"],["structure","pal_structure"],
     ["logs","pal_logs"],["settings","pal_settings"]];
   const themes=[["phosphor","tema: phosphor"],["amber","tema: amber"],["ice","tema: ice"],["paper","tema: paper"]];
@@ -2114,7 +2120,7 @@ function CommandPalette({open,onClose,onGo,onPickSymbol,onScan,onEvidence,onComp
   if(m3)verbs.push({label:`→ kıyas · ${m3[1].toUpperCase()}`,run:()=>onCompare(m3[1].toUpperCase().split(/[\s,]+/).slice(0,4))});
   const items=[
     ...verbs.map(v=>({kind:"verb",text:v.label,run:v.run})),
-    ...VIEWS.map(([id,key])=>({kind:"view",text:L(key),run:()=>onGo(id)})),
+    ...VIEWS.map(([id,key])=>({kind:"view",text:key?L(key):"SHORT LAB · tarama",run:()=>onGo(id)})),
     ...(window.SGS_DATA||[]).slice(0,60).map(r=>({kind:"sym",text:`sembol · ${r.s.replace("USDT","")} · ${r.name||""}`,
       run:()=>onPickSymbol(r.s)})),
     ...themes.map(([id,label])=>({kind:"theme",text:label,run:()=>onTheme(id)})),
@@ -2143,7 +2149,7 @@ function CommandPalette({open,onClose,onGo,onPickSymbol,onScan,onEvidence,onComp
           <span className="pt">{it.text}</span>
         </button>)}
       </div>
-      <div className="phint">↑↓ gez · Enter çalıştır · Esc kapat · 1-7 görünümler · / arama</div>
+      <div className="phint">↑↓ gez · Enter çalıştır · Esc kapat · 1-8 görünümler · / arama</div>
     </div>
   </div>;
 }
@@ -2188,7 +2194,8 @@ function Settings({theme,setTheme,lang,setLang}){
 const NAV=[
   {id:"scan",label:"TARA",icon:"scan"},{id:"panel",label:"PANEL",icon:"panel"},
   {id:"flow",label:"OI·L/S",icon:"oi"},{id:"sig",label:"SİNYAL",icon:"signal"},
-  {id:"evidence",label:"KANIT",icon:"ev"},{id:"compare",label:"KIYAS",icon:"compare"},
+  {id:"evidence",label:"KANIT",icon:"ev"},{id:"shortlab",label:"SHORT LAB",icon:"sl"},
+  {id:"compare",label:"KIYAS",icon:"compare"},
   {id:"map",label:"HARİTA",icon:"map"},{id:"portfolio",label:"PORTFÖY",icon:"wallet"},
   {id:"structure",label:"YAPI",icon:"structure"},{id:"logs",label:"LOG",icon:"logs"},
 ];
@@ -2197,11 +2204,13 @@ const SYMBOL_VIEWS=new Set(["panel","flow","sig"]);
 
 /* Two-way hash routing: view ↔ location.hash. Hash names are the public ones. */
 const VIEW_HASH={scan:"scan",panel:"panel",flow:"flow",sig:"signal",evidence:"evidence",
+  shortlab:"shortlab",
   compare:"compare",map:"map",portfolio:"portfolio",structure:"structure",logs:"log",settings:"settings"};
 const HASH_VIEW=Object.fromEntries(Object.entries(VIEW_HASH).map(([v,h])=>[h,v]));
 const viewFromHash=()=>{const h=(location.hash||"").replace(/^#\/?/,"").split("/")[0];return HASH_VIEW[h]||null;};
-/* 1-7 quick keys (command palette contract); digits skip when typing. */
-const KEY_VIEWS=["scan","panel","flow","sig","evidence","logs","settings"];
+/* 1-8 quick keys (command palette contract); digits skip when typing.
+   Task 15 appends shortlab as key 8 — keys 1-7 keep their views. */
+const KEY_VIEWS=["scan","panel","flow","sig","evidence","logs","settings","shortlab"];
 
 const STALE_MS=90000;  // data older than this = honest "stale" banner
 function App(){
@@ -2259,7 +2268,7 @@ function App(){
       if(e.key==="/"){ e.preventDefault();
         const el=searchRef.current&&searchRef.current.querySelector("input");
         if(el)el.focus(); return; }
-      if(e.key>="1"&&e.key<="7"){ const v=KEY_VIEWS[Number(e.key)-1]; if(v)setRoute(v); }
+      if(e.key>="1"&&e.key<="8"){ const v=KEY_VIEWS[Number(e.key)-1]; if(v)setRoute(v); }
     };
     window.addEventListener("keydown",onKey);
     return()=>window.removeEventListener("keydown",onKey);
@@ -2332,14 +2341,20 @@ function App(){
 
   // One poll loop per view. Every outcome is honest: success stamps freshness and
   // clears the stale banner; any throw names the failing endpoint in the banner.
+  // Short-Lab is an independent failure domain: its outage only names itself and
+  // never touches SGS_DATA / SGS_SCAN.
   const poll=useCallback(async()=>{
     let fail=null;
     try{
       if(view==="scan"){ if(!holdRef.current) await window.DIVE.scan(15,24); }
       else if(view==="evidence"){ if(evHorizon) await window.DIVE.evidence(evHorizon); }
+      else if(view==="shortlab"){
+        if(typeof window.DIVE.shortCandidates==="function")
+          await window.DIVE.shortCandidates((window.__diveShortQuery)||{});
+      }
       else if(SYMBOL_VIEWS.has(view)&&sym) await window.DIVE.symbol(sym);
     }catch(e){
-      const what=view==="scan"?"tarama":view==="evidence"?"kanıt":(sym||"sembol")+" verisi";
+      const what=view==="scan"?"tarama":view==="evidence"?"kanıt":view==="shortlab"?"short lab":(sym||"sembol")+" verisi";
       fail=what+": "+((e&&e.message)||e);
     }
     if(view==="flow"){ try{ await window.DIVE.leaders?.(); }
@@ -2349,7 +2364,7 @@ function App(){
     else { lastOk.current=Date.now(); setStale(null); }
   },[view,sym,evHorizon]);
   useEffect(()=>{ let live=true; const run=async()=>{ if(live) await poll(); };
-    run(); const id=setInterval(run,view==="scan"?20000:15000);
+    run(); const id=setInterval(run,view==="scan"?20000:view==="shortlab"?30000:15000);
     return()=>{live=false;clearInterval(id);}; },[poll]);
   // age watchdog: even without a thrown error, silence > 90s is staleness.
   useEffect(()=>{ const id=setInterval(()=>{ if(!lastOk.current) return;
@@ -2365,12 +2380,15 @@ function App(){
 
   // A failed boot with nothing to show renders the unavailable state, not a
   // fabricated market. Settings stays reachable so the app is not a dead end.
+  // Short-Lab bypasses this gate: it owns its STALE/UNAVAILABLE/retry page and
+  // must stay reachable when the Dive universe boot fails (design §26.5).
   const noData=!!bootErr && !demo && !(window.SGS_DATA||[]).length;
 
   let body;
-  if(noData && view!=="settings") body=<DataSourceDown error={bootErr} onRetry={boot}/>;
+  if(noData && view!=="settings" && !shortlabBypassesNoData(view)) body=<DataSourceDown error={bootErr} onRetry={boot}/>;
   else if(view==="scan") body=<Scanner onPick={pick} onCompare={startCompare} job={job} prog={jobProg} jobErr={jobErr}
     onAsyncStart={startAsync} onAsyncCancel={clearJob} onRetryResult={retryResult}/>;
+  else if(view==="shortlab") body=<ShortLabView/>;
   else if(view==="panel") body=<Panel sym={sym} evHorizon={evHorizon}/>;
   else if(view==="flow") body=<Flow sym={sym} onSelect={setSym}/>;
   else if(view==="sig") body=<Signal onPick={pick}/>;
@@ -2398,7 +2416,7 @@ function App(){
       {fngLive&&<FngChip onOpen={()=>setMacroOpen(o=>!o)}/>}
       <DvolChip/>
       {macroOpen&&<MacroPopover onClose={()=>setMacroOpen(false)}/>}
-      <span>{view==="scan"?L("strip_scan"):(sym||"—").replace("USDT","")}</span><span className="seg">│</span>
+      <span>{view==="scan"?L("strip_scan"):view==="shortlab"?"SHORT LAB":(sym||"—").replace("USDT","")}</span><span className="seg">│</span>
       <form ref={searchRef} onSubmit={submit}><Svg d={ICONS.search}/><input value={q} onChange={e=>setQ(e.target.value)} placeholder={L("search_ph")}/></form>
       <button className="iconbtn cmd" title={L("a11y_palette")} aria-label={L("a11y_palette_open")} onClick={()=>setPalOpen(true)}>
         <Svg d={ICONS.cmd}/><small>K</small></button>
@@ -2411,7 +2429,7 @@ function App(){
     <nav className="rail">
       <div className="mark"><Mark/></div>
       {NAV.map(n=><button key={n.id} className={"rail-btn"+(view===n.id?" on":"")}
-        aria-current={view===n.id?"page":undefined} onClick={()=>setRoute(n.id)}><Svg d={ICONS[n.icon]}/>{L("nav_"+n.id)}</button>)}
+        aria-current={view===n.id?"page":undefined} onClick={()=>setRoute(n.id)}><Svg d={ICONS[n.icon]}/>{n.label||L("nav_"+n.id)}</button>)}
       <div className="grow"/>
       <button className={"rail-btn"+(view==="settings"?" on":"")} aria-current={view==="settings"?"page":undefined}
         onClick={()=>setRoute("settings")}><Svg d={ICONS.gear}/>{L("nav_settings")}</button>
@@ -2430,8 +2448,10 @@ function App(){
 const _diveRoot = (typeof document!=="undefined" && document.getElementById) ? document.getElementById("root") : null;
 if(_diveRoot) ReactDOM.createRoot(_diveRoot).render(<App/>);
 globalThis.DIVE_APP = { App, DemoBanner, DemoMark, DataSourceDown, StaleBanner, Scanner, Flow, Signal,
-  Evidence, CandleChart, ScanProgressPanel, bootUniverse, isDemo,
+  Evidence, CandleChart, ScanProgressPanel, bootUniverse, isDemo, shortlabBypassesNoData,
+  /* Short-Lab views (Task 15 · design §26; concatenated before this file) */
+  ShortLabView, ShortLabDetail, ShortLabTable,
   /* v0.3 surfaces + route map (hash-route registration is pinned by tests) */
   Panel, Compare, MapView, Portfolio, StructureView, PulseStrip, FngChip, DvolChip,
   CommandPalette, HitLabel, ReliabilityDiagram, ReplayPanel, TfMatrix, OpposingEvidence,
-  viewFromHash, VIEW_HASH, HASH_VIEW, KEY_VIEWS, fzScore };
+  NAV, viewFromHash, VIEW_HASH, HASH_VIEW, KEY_VIEWS, fzScore };

@@ -190,7 +190,12 @@ test("portfolio: signed P&L math, strict row validation, corrupt storage dropped
 
 /* ── 7. hash routes registered for every new view ────────────────────────── */
 async function loadBundle() {
-  const FILES = ["data.js", "mock.js", "i18n.js", "desktop-app.jsx"];
+  const FILES = ["data.js", "mock.js", "i18n.js",
+    "shortlab/short-lab-format.js",
+    "shortlab/short-lab-table.jsx",
+    "shortlab/short-lab-detail.jsx",
+    "shortlab/short-lab-view.jsx",
+    "desktop-app.jsx"];
   const prelude =
     "import React from 'react';\n" +
     "const ReactDOM = { createRoot: () => ({ render(){} }) };\n" +
@@ -218,16 +223,16 @@ async function loadBundle() {
 }
 test("hash routes exist for the new views and viewFromHash resolves both ways", async () => {
   const app = await loadBundle();
-  for (const hash of ["compare", "map", "portfolio", "structure", "scan", "panel", "flow", "signal", "evidence", "log", "settings"])
+  for (const hash of ["compare", "map", "portfolio", "structure", "scan", "panel", "flow", "signal", "evidence", "log", "settings", "shortlab"])
     assert.ok(app.VIEW_HASH[hash] || Object.values(app.VIEW_HASH).includes(hash), `route ${hash} must be registered`);
-  for (const [hash, view] of [["compare", "compare"], ["map", "map"], ["portfolio", "portfolio"], ["structure", "structure"]]) {
+  for (const [hash, view] of [["compare", "compare"], ["map", "map"], ["portfolio", "portfolio"], ["structure", "structure"], ["shortlab", "shortlab"]]) {
     globalThis.location.hash = `#/${hash}`;
     assert.equal(app.viewFromHash(), view, `#/${hash} must resolve to ${view}`);
   }
   globalThis.location.hash = "#/nonsense";
   assert.equal(app.viewFromHash(), null, "unknown hashes resolve to no view (default stays)");
-  // rail quick keys cover the 7 canonical views
-  assert.deepEqual(app.KEY_VIEWS, ["scan", "panel", "flow", "sig", "evidence", "logs", "settings"]);
+  // rail quick keys: Task 15 appends shortlab as key 8; keys 1-7 keep their views
+  assert.deepEqual(app.KEY_VIEWS, ["scan", "panel", "flow", "sig", "evidence", "logs", "settings", "shortlab"]);
   // the fuzzy scorer matches subsequences and rejects misses
   assert.ok(app.fzScore("btc", "sembol · BTC · BITCOIN") > 0);
   assert.equal(app.fzScore("zzz", "sembol · BTC"), -1);

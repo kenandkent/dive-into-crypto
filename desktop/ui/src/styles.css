@@ -580,3 +580,44 @@ button.hchip{cursor:pointer}
 .pitem .pt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pempty{padding:16px;color:var(--faint);font-size:12px;text-align:center}
 .phint{padding:7px 14px;font-family:var(--font-m);font-size:9px;color:var(--faint);letter-spacing:.06em}
+
+/* ══════════ SHORT LAB (Task 15 · design §26) ══════════
+   Scoped sl-* classes on top of the Depth Terminal tokens. No second design
+   language: same panels, tags and pills, plus status tints for
+   READY/CANDIDATE/WATCH/PAUSED/BLOCKED/EXCLUDED. */
+
+.scanbar.sl-filters select{background:var(--bg);border:1px solid var(--line2);color:var(--ink);
+  font-family:var(--font-m);font-size:11px;padding:5px 6px;outline:none;max-width:150px}
+.scanbar.sl-filters .pname{width:104px}
+.scanbar.sl-bar .pill{font-size:9px}
+
+.sl-scroll{overflow-x:auto;overflow-y:hidden}
+.sl-scroll::-webkit-scrollbar{height:8px}
+.sl-scroll::-webkit-scrollbar-thumb{background:var(--line2)}
+.sl-table{min-width:1020px}
+.sl-table tbody tr{cursor:pointer}
+.sl-table tr.sl-blocked td:first-child{box-shadow:inset 2px 0 0 var(--down)}
+.sl-table tr.sl-paused td:first-child{box-shadow:inset 2px 0 0 var(--warn)}
+.sl-table tr.sl-ready td:first-child{box-shadow:inset 2px 0 0 var(--up)}
+.sl-reasons{font-family:var(--font-d);font-size:8px;font-weight:700;letter-spacing:.04em;
+  color:var(--warn);margin-top:4px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr.sl-blocked .sl-reasons{color:var(--down)}
+tr.sl-excluded .sl-reasons{color:var(--faint)}
+.sl-warns{font-family:var(--font-m);font-size:9px;color:var(--faint);margin-top:2px;
+  max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.sl-detail{padding-bottom:40px}
+.sl-detail .grid2{margin-bottom:0}
+.sl-detail .panel{margin-bottom:14px}
+.tag.info{color:var(--info);border-color:color-mix(in srgb,var(--info) 40%,transparent)}
+.tag.dim{color:var(--faint)}
+
+/* Narrow screens: the scanner table scrolls horizontally inside .sl-scroll;
+   the detail page keeps scrolling vertically through .stage. Filter bar wraps. */
+@media(max-width:860px){
+  .sl-table{min-width:860px}
+  .scanbar.sl-filters{gap:6px}
+  .scanbar.sl-filters .pname{width:88px;flex:1 1 88px}
+  .scanbar.sl-filters select{flex:1 1 110px}
+  .vhead h1{font-size:24px}
+}

@@ -40,7 +40,12 @@ function makeDom() {
    Returns a fresh module namespace with fresh globals on every call. */
 let _seq = 0;
 async function loadApp() {
-  const FILES = ["data.js", "mock.js", "i18n.js", "desktop-app.jsx"];
+  const FILES = ["data.js", "mock.js", "i18n.js",
+    "shortlab/short-lab-format.js",
+    "shortlab/short-lab-table.jsx",
+    "shortlab/short-lab-detail.jsx",
+    "shortlab/short-lab-view.jsx",
+    "desktop-app.jsx"];
   const { readFileSync } = await import("node:fs");
   const prelude =
     "import React from 'react';\n" +
