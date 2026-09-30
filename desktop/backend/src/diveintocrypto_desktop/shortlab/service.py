@@ -34,7 +34,21 @@ errors) fail the job.
 Tier selection: the service only consults ``ProviderRegistry`` by the
 string names ``unlock`` / ``social`` / ``catalyst``. Future provider
 modules are never imported here; when any of them is unregistered the
-effective tier stays ``LITE`` with ``FULL_PREREQUISITE_MISSING``.
+effective tier stays ``LITE`` with ``FULL_PREREQUISITE_MISSING``. The
+tier is resolved once per refresh, so every score row of one generation
+shares the same ``analysis_tier`` -- a transient 429 never mixes LITE
+rows into a FULL generation (the snapshot stays FULL, DQ drops and the
+symbol degrades to NOT_READY).
+
+FULL stage (Task 17): ``unlock`` / ``social`` / ``catalyst`` are fetched
+through the registry, ``unlock_raw_15`` (forward 30/90D vesting) and
+``narrative_raw_15`` (two aligned 30D attention windows) are scored by
+``features/supply.py`` / ``features/narrative.py``, ``score_full`` applies
+the section-14 weights, FULL DQ groups come from ``quality``, and catalyst
+severity flows into the Task 11 risk engine (``PAUSE_MAJOR_CATALYST``).
+Events/snapshots persist via the repository's idempotent Phase 5/6
+methods (best-effort: a persistence failure degrades to in-memory data,
+never fails the symbol).
 """
 
 from __future__ import annotations
@@ -54,6 +68,7 @@ from diveintocrypto_desktop.shortlab.quality import (
     FULL_PREREQUISITE_MISSING,
     FieldState,
     data_quality,
+    full_tier_field_states,
 )
 from diveintocrypto_desktop.shortlab.scoring.versions import (
     ENTRY_VERSION,
@@ -757,7 +772,11 @@ class ShortLabService:
         tier: str,
     ) -> dict[str, Any]:
         from diveintocrypto_desktop.shortlab.identity.resolver import resolve_identity
-        from diveintocrypto_desktop.shortlab.scoring.ltss import extract_features, score_lite
+        from diveintocrypto_desktop.shortlab.scoring.ltss import (
+            extract_features,
+            score_full,
+            score_lite,
+        )
         from diveintocrypto_desktop.shortlab.scoring.profiles import select_profile
         from diveintocrypto_desktop.shortlab.repository import FeatureSnapshotRecord
         from diveintocrypto_desktop.shortlab.risk.veto import evaluate_risks
@@ -779,17 +798,32 @@ class ShortLabService:
 
         inputs = self._build_inputs(symbol, row, identity, exchange_meta, fund_data,
                                     spot_result, market, funding, as_of_ms)
+        full: dict[str, Any] | None = None
+        if tier == "FULL":
+            full = await self._fetch_full(identity, symbol, inputs, fund_data,
+                                          as_of_ms, now)
+            inputs["unlock_raw_15"] = full["unlock_raw_15"]
+            inputs["narrative_raw_15"] = full["narrative_raw_15"]
+            inputs["unlock_status"] = full["unlock_result"].status
+            inputs["social_status"] = full["social_result"].status
+            inputs["catalyst_major_event"] = full["catalyst_major_event"]
+            inputs["catalyst_severity"] = full["catalyst_severity"]
         features = extract_features(inputs, as_of_ms)
         profile = select_profile(identity, fund_data, self._identity_overrides)
-        breakdown = score_lite(features, profile, self._config)
+        if tier == "FULL":
+            breakdown = score_full(features, profile, self._config)
+        else:
+            breakdown = score_lite(features, profile, self._config)
 
         field_states = self._build_field_states(
-            identity, exchange_meta, fund_result, spot_result, market, funding, as_of_ms, now
+            identity, exchange_meta, fund_result, spot_result, market, funding, as_of_ms, now,
+            full=full,
         )
         dq = data_quality(tier, field_states, as_of_ms)
         risk_meta = self._build_risk_meta(
             symbol, row, identity, exchange_meta, live_symbols, metadata_all,
             fund_data, spot_result, market, funding, as_of_ms,
+            full=full,
         )
         risk = evaluate_risks(inputs, risk_meta, dq.data_quality)
 
@@ -801,7 +835,7 @@ class ShortLabService:
             features=dict(features.features),
             source_meta=self._build_feature_source_meta(
                 identity, exchange_meta, fund_result, spot_result, market, funding,
-                as_of_ms, now,
+                as_of_ms, now, full=full,
             ),
             data_quality=dq.data_quality,
             fundamental_snapshot_id=None,
@@ -1000,6 +1034,208 @@ class ShortLabService:
         out.setdefault("fetched_at_ms", now_ms)
         return out
 
+    # -- FULL stage: unlock / social / catalyst (Task 17, design 5.3-5.5) -----
+    async def _fetch_provider(
+        self, name: str, identity: Any, as_of_ms: int, now_ms: int
+    ) -> ProviderResult[Any]:
+        """Guarded single-provider fetch by registry name (never raises).
+
+        Real Task 17 providers accept ``(identity, as_of_ms)``; the shared
+        ``NullProvider`` accepts ``(identity)`` -- both shapes are tried so
+        unregistered names degrade to explicit ``UNAVAILABLE``.
+        """
+        provider = self._registry.get(name)
+        try:
+            try:
+                result = await _maybe_await(provider.fetch(identity, as_of_ms))
+            except TypeError:
+                result = await _maybe_await(provider.fetch(identity))
+        except Exception as exc:  # noqa: BLE001 - degrade, never raise
+            result = ProviderResult(
+                status="UNAVAILABLE",
+                source=getattr(provider, "name", name),
+                fetched_at_ms=now_ms,
+                as_of_ms=None,
+                data=None,
+                stale=False,
+                reason_code=f"{name.upper()}_FETCH_FAILED",
+                error_message=f"{type(exc).__name__}"[:120],
+            )
+        if not isinstance(result, ProviderResult):
+            return ProviderResult(
+                status="UNAVAILABLE",
+                source=name,
+                fetched_at_ms=now_ms,
+                as_of_ms=None,
+                data=None,
+                stale=False,
+                reason_code=f"{name.upper()}_BAD_SHAPE",
+                error_message=None,
+            )
+        return result
+
+    async def _fetch_full(
+        self,
+        identity: Any,
+        symbol: str,
+        inputs: Mapping[str, Any],
+        fund_data: Any | None,
+        as_of_ms: int,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Fetch the three FULL providers and score unlock/narrative raws.
+
+        Returns the provider results plus ``unlock_raw_15`` /
+        ``narrative_raw_15`` (``None`` when unknown -- no reweighting
+        downstream), catalyst pause signals, and persists the raw
+        events/snapshots best-effort for point-in-time replay.
+        """
+        from diveintocrypto_desktop.shortlab.features import narrative as narrative_mod
+        from diveintocrypto_desktop.shortlab.features import supply as supply_mod
+
+        unlock_result = await self._fetch_provider("unlock", identity, as_of_ms, now_ms)
+        social_result = await self._fetch_provider("social", identity, as_of_ms, now_ms)
+        catalyst_result = await self._fetch_provider("catalyst", identity, as_of_ms, now_ms)
+
+        unlock_data = unlock_result.data if unlock_result.data is not None else None
+        unlock_events = _provider_events(unlock_data)
+        circulating = _field(fund_data, "circulating_supply")
+        if unlock_events is None and unlock_result.status == "OK":
+            unlock_events = []
+        unlock_raw, unlock_details, _ = supply_mod.compute_unlock_raw_15_forward(
+            unlock_events, circulating, as_of_ms
+        )
+
+        social_data = social_result.data if social_result.data is not None else None
+        if social_data is not None and social_result.status in ("OK", "PARTIAL"):
+            narrative_raw, narrative_details, _ = narrative_mod.compute_narrative_raw_15(
+                _field(social_data, "volume_prev_30d"),
+                _field(social_data, "volume_30d"),
+                _field(social_data, "contributors_prev_30d"),
+                _field(social_data, "contributors_30d"),
+                _field(social_data, "dominance_prev_30d"),
+                _field(social_data, "dominance_30d"),
+                inputs.get("return_30d", inputs.get("price_change_30d")),
+                _spot_change_30d(inputs),
+                social_volume_change_30d=_field(social_data, "volume_change_30d"),
+            )
+        else:
+            narrative_raw, narrative_details = None, {}
+
+        catalyst_data = (
+            catalyst_result.data if catalyst_result.data is not None else None
+        )
+        catalyst_events = _provider_events(catalyst_data)
+        major_event, top_severity = _catalyst_signals(catalyst_events or [], as_of_ms)
+
+        full = {
+            "unlock_result": unlock_result,
+            "social_result": social_result,
+            "catalyst_result": catalyst_result,
+            "unlock_raw_15": unlock_raw,
+            "unlock_details": unlock_details,
+            "narrative_raw_15": narrative_raw,
+            "narrative_details": narrative_details,
+            "catalyst_major_event": major_event,
+            "catalyst_severity": top_severity,
+        }
+        await self._persist_full_snapshots(
+            identity, symbol, full, unlock_events,
+            social_data, catalyst_events, as_of_ms, now_ms,
+        )
+        return full
+
+    async def _persist_full_snapshots(
+        self,
+        identity: Any,
+        symbol: str,
+        full: Mapping[str, Any],
+        unlock_events: list[Any] | None,
+        social_data: Any | None,
+        catalyst_events: list[Any] | None,
+        as_of_ms: int,
+        now_ms: int,
+    ) -> None:
+        """Best-effort persistence of FULL raw events (never fails the symbol)."""
+        repo = self._repository
+        if repo is None:
+            return
+        canonical = str(getattr(identity, "canonical_id", None) or symbol.lower())
+        try:
+            from diveintocrypto_desktop.shortlab.repository import (
+                CatalystEventRecord,
+                SocialSnapshotRecord,
+                UnlockEventRecord,
+            )
+
+            if unlock_events:
+                records = []
+                for event in unlock_events:
+                    records.append(
+                        UnlockEventRecord(
+                            event_id=str(_field(event, "event_id") or ""),
+                            canonical_id=canonical,
+                            known_at_ms=int(_field(event, "known_at_ms") or as_of_ms),
+                            unlock_at_ms=int(_field(event, "unlock_at_ms") or 0),
+                            amount_tokens=float(_field(event, "amount_tokens") or 0.0),
+                            allocation_type=str(
+                                _field(event, "allocation_type") or "OTHER"
+                            ),
+                            source=str(_field(event, "source") or "unlock"),
+                            fetched_at_ms=int(
+                                full["unlock_result"].fetched_at_ms or now_ms
+                            ),
+                        )
+                    )
+                await repo.save_unlock_events(
+                    [r for r in records if r.event_id and r.unlock_at_ms > 0]
+                )
+            if social_data is not None and full["social_result"].status in ("OK", "PARTIAL"):
+                metrics = {
+                    name: _field(social_data, name)
+                    for name in (
+                        "volume_prev_30d", "volume_30d",
+                        "contributors_prev_30d", "contributors_30d",
+                        "dominance_prev_30d", "dominance_30d",
+                        "price_change_30d", "spot_volume_change_30d",
+                    )
+                }
+                await repo.save_social_snapshot(
+                    SocialSnapshotRecord(
+                        snapshot_id=f"social-{canonical}-{as_of_ms}",
+                        canonical_id=canonical,
+                        as_of_ms=int(_field(social_data, "as_of_ms") or as_of_ms),
+                        fetched_at_ms=int(
+                            full["social_result"].fetched_at_ms or now_ms
+                        ),
+                        source=str(full["social_result"].source or "social"),
+                        metrics=metrics,
+                    )
+                )
+            if catalyst_events:
+                records = []
+                for event in catalyst_events:
+                    records.append(
+                        CatalystEventRecord(
+                            event_id=str(_field(event, "event_id") or ""),
+                            canonical_id=canonical,
+                            known_at_ms=int(_field(event, "known_at_ms") or as_of_ms),
+                            announced_at_ms=int(_field(event, "announced_at_ms") or 0),
+                            effective_at_ms=_optional_int(_field(event, "effective_at_ms")),
+                            event_type=str(_field(event, "event_type") or "OTHER"),
+                            severity=str(_field(event, "severity") or "INFO"),
+                            confidence=float(_field(event, "confidence") or 0.0),
+                            source_url=_field(event, "source_url"),
+                            title=str(_field(event, "title") or ""),
+                        )
+                    )
+                await repo.save_catalyst_events(
+                    [r for r in records if r.event_id and r.announced_at_ms > 0]
+                )
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort here
+            log.debug("shortlab FULL snapshot persist skipped for %s: %s",
+                      symbol, str(exc)[:120])
+
     # -- input assembly ------------------------------------------------------------------
     def _build_inputs(
         self,
@@ -1098,17 +1334,19 @@ class ShortLabService:
         market: Mapping[str, Any],
         funding: Mapping[str, Any],
         as_of_ms: int,
+        full: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Raw metadata reference for the Task 11 risk authority.
 
         The Task 8 universe lifecycle view is passed through as data
         (``exchange_status`` / ``delivery_at_ms`` / live presence) -- the
         service draws no veto conclusions from it; ``evaluate_risks`` alone
-        decides BLOCK vs PAUSE vs WARN.
+        decides BLOCK vs PAUSE vs WARN. On the FULL tier the catalyst pause
+        signals and provider statuses ride along the same way.
         """
         w30 = funding["windows"].get(30, {})
         w7 = funding["windows"].get(7, {})
-        return {
+        meta: dict[str, Any] = {
             "symbol": symbol,
             "as_of_ms": as_of_ms,
             "mapping_confidence": getattr(identity, "mapping_confidence", None),
@@ -1128,12 +1366,24 @@ class ShortLabService:
             "futures_qv_1d": _finite(market.get("futures_qv_1d")),
             "futures_quote_volume_24h": _finite(market.get("futures_qv_1d")),
         }
+        if full is not None:
+            meta["catalyst_major_event"] = bool(full.get("catalyst_major_event"))
+            if full.get("catalyst_severity") is not None:
+                meta["catalyst_severity"] = full["catalyst_severity"]
+            for key in ("unlock_result", "social_result", "catalyst_result"):
+                result = full.get(key)
+                if result is not None:
+                    meta[f"{key}"] = getattr(result, "status", None)
+            meta["unlock_status"] = getattr(full.get("unlock_result"), "status", None)
+            meta["social_status"] = getattr(full.get("social_result"), "status", None)
+        return meta
 
     # -- DQ + source-meta ------------------------------------------------------------------
     def _build_field_states(
         self, identity: Any, exchange_meta: Mapping[str, Any], fund_result: ProviderResult[Any],
         spot_result: ProviderResult[Any], market: Mapping[str, Any], funding: Mapping[str, Any],
         as_of_ms: int, now_ms: int,
+        full: Mapping[str, Any] | None = None,
     ) -> list[FieldState]:
         closes = market.get("daily_closes") or []
         n_daily = len(closes) if isinstance(closes, list) else 0
@@ -1228,12 +1478,22 @@ class ShortLabService:
                                  fetched_at_ms=now_ms,
                                  reason_code=None if identity_ok else "IDENTITY_UNVERIFIED",
                                  source="shortlab-identity"))
+        if full is not None:
+            states.extend(
+                full_tier_field_states(
+                    full.get("unlock_result"),
+                    full.get("social_result"),
+                    full.get("catalyst_result"),
+                    as_of_ms=as_of_ms,
+                )
+            )
         return states
 
     def _build_feature_source_meta(
         self, identity: Any, exchange_meta: Mapping[str, Any], fund_result: ProviderResult[Any],
         spot_result: ProviderResult[Any], market: Mapping[str, Any], funding: Mapping[str, Any],
         as_of_ms: int, now_ms: int,
+        full: Mapping[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Field-level provenance for the feature snapshot (Task 2 contract)."""
         states = {s.field_id: s for s in self._build_field_states(
@@ -1284,6 +1544,23 @@ class ShortLabService:
                 st.status, st.fetched_at_ms, as_of_ms, st.source or "shortlab",
                 st.reason_code, coverage_of[repo_field],
             )
+        if full is not None:
+            for repo_field, result_key in (
+                ("unlock", "unlock_result"),
+                ("social", "social_result"),
+                ("catalyst", "catalyst_result"),
+            ):
+                result = full.get(result_key)
+                if result is None:
+                    continue
+                meta[repo_field] = _meta_block(
+                    str(getattr(result, "status", "UNAVAILABLE")),
+                    getattr(result, "fetched_at_ms", now_ms),
+                    as_of_ms,
+                    str(getattr(result, "source", None) or repo_field),
+                    getattr(result, "reason_code", None),
+                    1.0 if str(getattr(result, "status", "")) == "OK" else 0.0,
+                )
         return meta
 
     # -- Entry stage (top-N, 240-call budget) -------------------------------------------
@@ -1438,6 +1715,70 @@ def _pct(value: Any) -> float | None:
     if number is None:
         return None
     return number / 100.0
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_events(data: Any) -> list[Any] | None:
+    """Extract the event list from an unlock/catalyst provider payload."""
+    if data is None:
+        return None
+    events = _field(data, "events")
+    if events is None:
+        return None
+    if isinstance(events, (list, tuple)):
+        return list(events)
+    return None
+
+
+def _spot_change_30d(inputs: Mapping[str, Any]) -> float | None:
+    """Aligned 30D spot-volume change from already-closed inputs (or None)."""
+    if not isinstance(inputs, Mapping):
+        return None
+    recent = _finite(inputs.get("spot_volume_30d"))
+    previous = _finite(inputs.get("spot_volume_prev_30d"))
+    if recent is None or previous is None or previous <= 0 or recent < 0:
+        return None
+    return recent / previous - 1.0
+
+
+CATALYST_PAUSE_WINDOW_MS = 30 * DAY_MS
+
+
+def _catalyst_signals(
+    events: list[Any], as_of_ms: int
+) -> tuple[bool, str | None]:
+    """Pause signals for the Task 11 risk engine from catalyst events.
+
+    Returns ``(major_in_window, top_severity)``: ``major_in_window`` is True
+    when a MAJOR event was announced inside the 30D pause window at or
+    before ``as_of_ms`` (drives ``PAUSE_MAJOR_CATALYST``); ``top_severity``
+    is the highest recent severity (MAJOR > MATERIAL > INFO) or None when
+    no event sits in the window.
+    """
+    as_of = int(as_of_ms)
+    rank = {"INFO": 0, "MATERIAL": 1, "MAJOR": 2}
+    top: str | None = None
+    major = False
+    for event in events or []:
+        announced = _optional_int(_field(event, "announced_at_ms"))
+        if announced is None or not (as_of - CATALYST_PAUSE_WINDOW_MS <= announced <= as_of):
+            continue
+        severity = str(_field(event, "severity") or "INFO").upper()
+        if severity not in rank:
+            severity = "INFO"
+        if top is None or rank[severity] > rank[top]:
+            top = severity
+        if severity == "MAJOR":
+            major = True
+    return major, top
 
 
 def _dq_ok(field_id: str, ok: bool, fetched_at_ms: int | None, source: str,

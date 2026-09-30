@@ -54,8 +54,41 @@ try:  # DuckDB is a hard dependency (pyproject); keep module importable without 
 except Exception as _duckdb_import_error:  # pragma: no cover - import-time guard
     _duckdb = None  # type: ignore[assignment]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 SCHEMA_MIGRATION = "001_init.sql"
+
+# Ordered forward-only migrations. Phase 5 applies up to version 2
+# (``migrate(target_version=2)`` leaves the Phase 6 catalyst table
+# untouched); production applies every pending file in order.
+MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (1, "001_init.sql"),
+    (2, "002_unlock_social.sql"),
+    (3, "003_catalyst.sql"),
+)
+
+
+def schema_target_for_config(config: Any) -> int:
+    """Phase-gated migration target derived from the provider flags.
+
+    Catalyst enabled -> 3, else unlock/social enabled -> 2, else the V1
+    baseline 1 (so Phase 5 never runs ``003_catalyst.sql``). Key presence
+    is a registry concern, not a schema concern: tables may exist unused.
+    """
+    providers = getattr(config, "providers", None) or {}
+    try:
+        items = dict(providers) if not isinstance(providers, dict) else providers
+    except Exception:
+        return 1
+
+    def _enabled(name: str) -> bool:
+        entry = items.get(name)
+        return bool(getattr(entry, "enabled", False))
+
+    if _enabled("catalyst"):
+        return 3
+    if _enabled("unlock") or _enabled("social"):
+        return 2
+    return 1
 
 _JOB_TYPE_SCORE_REFRESH = "score_refresh"
 
@@ -293,6 +326,48 @@ class CandidatePage:
     offset: int
 
 
+@dataclass(frozen=True)
+class UnlockEventRecord:
+    """One row of ``sl_unlock_event`` (design 19.2, Phase 5)."""
+
+    event_id: str
+    canonical_id: str
+    known_at_ms: int
+    unlock_at_ms: int
+    amount_tokens: float
+    allocation_type: str
+    source: str
+    fetched_at_ms: int
+
+
+@dataclass(frozen=True)
+class SocialSnapshotRecord:
+    """One row of ``sl_social_snapshot`` (design 19.2, Phase 5)."""
+
+    snapshot_id: str
+    canonical_id: str
+    as_of_ms: int
+    fetched_at_ms: int
+    source: str
+    metrics: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class CatalystEventRecord:
+    """One row of ``sl_catalyst_event`` (design 19.2, Phase 6)."""
+
+    event_id: str
+    canonical_id: str
+    known_at_ms: int
+    announced_at_ms: int
+    effective_at_ms: int | None
+    event_type: str
+    severity: str
+    confidence: float
+    source_url: str | None
+    title: str
+
+
 def _split_statements(script: str) -> list[str]:
     cleaned_lines = []
     for line in script.splitlines():
@@ -416,12 +491,25 @@ class ShortLabRepository:
             )
 
     # -- migrate ----------------------------------------------------------
-    async def migrate(self) -> int:
-        """Apply 001_init.sql once; returns the schema version. Never exits."""
-        return await self._run(self._migrate_sync)
+    async def migrate(self, target_version: int = 1) -> int:
+        """Apply pending migrations up to ``target_version`` (inclusive).
 
-    def _migrate_sync(self) -> int:
+        The default (``1``) preserves the frozen Task 2 contract: a fresh
+        database gets the V1 baseline only. Phase 5 passes ``2`` (adds
+        ``sl_unlock_event`` / ``sl_social_snapshot`` and never touches the
+        Phase 6 catalyst table); Phase 6 passes ``3``. Repeat calls are a
+        no-op returning the current version; failures raise
+        :class:`MigrationError` and never exit the process.
+        """
+        return await self._run(self._migrate_sync, int(target_version))
+
+    def _migrate_sync(self, target_version: int = 1) -> int:
         con = self._require_con()
+        want = int(target_version)
+        if want < 1 or want > SCHEMA_VERSION:
+            raise MigrationError(
+                f"target_version={target_version!r} is outside 1..{SCHEMA_VERSION}"
+            )
         try:
             con.execute(
                 "CREATE TABLE IF NOT EXISTS sl_schema_version ("
@@ -429,34 +517,38 @@ class ShortLabRepository:
             )
             cur = con.execute("SELECT max(version) AS v FROM sl_schema_version")
             current = cur.fetchone()[0]
-            if current is not None and int(current) >= SCHEMA_VERSION:
-                return int(current)
-            migration_file = Path(__file__).resolve().parent / "migrations" / SCHEMA_MIGRATION
-            try:
-                script = migration_file.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise MigrationError(
-                    f"cannot read migration {SCHEMA_MIGRATION}: {exc}"
-                ) from exc
-            con.execute("BEGIN TRANSACTION")
-            try:
-                for statement in _split_statements(script):
-                    con.execute(statement)
-                applied_at_ms = time.time_ns() // 1_000_000
-                con.execute(
-                    "INSERT INTO sl_schema_version(version, applied_at_ms) "
-                    "SELECT 1, ? WHERE NOT EXISTS "
-                    "(SELECT 1 FROM sl_schema_version WHERE version = 1)",
-                    [applied_at_ms],
-                )
-                con.execute("COMMIT")
-            except Exception:
+            current_n = int(current) if current is not None else 0
+            if current_n >= want:
+                return current_n
+            base = Path(__file__).resolve().parent / "migrations"
+            for version, filename in MIGRATIONS:
+                if version <= current_n or version > want:
+                    continue
                 try:
-                    con.execute("ROLLBACK")
+                    script = (base / filename).read_text(encoding="utf-8")
+                except OSError as exc:
+                    raise MigrationError(
+                        f"cannot read migration {filename}: {exc}"
+                    ) from exc
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    for statement in _split_statements(script):
+                        con.execute(statement)
+                    applied_at_ms = time.time_ns() // 1_000_000
+                    con.execute(
+                        "INSERT INTO sl_schema_version(version, applied_at_ms) "
+                        "SELECT ?, ? WHERE NOT EXISTS "
+                        "(SELECT 1 FROM sl_schema_version WHERE version = ?)",
+                        [version, applied_at_ms, version],
+                    )
+                    con.execute("COMMIT")
                 except Exception:
-                    pass
-                raise
-            return SCHEMA_VERSION
+                    try:
+                        con.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+            return want
         except RepositoryError:
             raise
         except Exception as exc:
@@ -1085,6 +1177,209 @@ class ShortLabRepository:
             [score_snapshot_id],
         )
         return tuple(OutcomeRecord(**row) for row in self._rows_to_dicts(cur))
+
+    # -- unlock / social / catalyst (Task 17, design 19.2) -----------------------
+    @staticmethod
+    def _unlock_raw(record: UnlockEventRecord) -> dict[str, Any]:
+        return {
+            "event_id": record.event_id,
+            "canonical_id": record.canonical_id,
+            "known_at_ms": record.known_at_ms,
+            "unlock_at_ms": record.unlock_at_ms,
+            "amount_tokens": record.amount_tokens,
+            "allocation_type": record.allocation_type,
+            "source": record.source,
+            "fetched_at_ms": record.fetched_at_ms,
+        }
+
+    @staticmethod
+    def _catalyst_raw(record: CatalystEventRecord) -> dict[str, Any]:
+        return {
+            "event_id": record.event_id,
+            "canonical_id": record.canonical_id,
+            "known_at_ms": record.known_at_ms,
+            "announced_at_ms": record.announced_at_ms,
+            "effective_at_ms": record.effective_at_ms,
+            "event_type": record.event_type,
+            "severity": record.severity,
+            "confidence": record.confidence,
+            "source_url": record.source_url,
+            "title": record.title,
+        }
+
+    async def save_unlock_events(
+        self, events: Sequence[UnlockEventRecord]
+    ) -> int:
+        """Idempotent unlock-event save (re-saving identical rows is a no-op)."""
+        return await self._run(self._save_unlock_events_sync, list(events))
+
+    def _save_unlock_events_sync(self, events: list[UnlockEventRecord]) -> int:
+        con = self._require_con()
+        for event in events:
+            if not event.event_id or not event.canonical_id:
+                raise ValidationError("unlock event requires event_id/canonical_id")
+            if event.unlock_at_ms <= 0 or event.known_at_ms < 0:
+                raise ValidationError("unlock event has a bad unlock_at_ms/known_at_ms")
+            if not event.amount_tokens > 0:
+                raise ValidationError("unlock event amount_tokens must be positive")
+            raw = self._unlock_raw(event)
+            self._insert_immutable(
+                con, "sl_unlock_event", "event_id = ? AND known_at_ms = ?",
+                [event.event_id, event.known_at_ms], raw,
+            )
+        return len(events)
+
+    async def list_unlock_events(
+        self,
+        canonical_id: str,
+        start_ms: int,
+        end_ms: int,
+        known_at_ms: int,
+    ) -> tuple[UnlockEventRecord, ...]:
+        """Unlock events vesting in ``[start_ms, end_ms]`` known no later
+        than ``known_at_ms`` (point-in-time replay excludes the future),
+        deduped by ``event_id`` keeping the latest visible ``known_at_ms``.
+        """
+        return await self._run(
+            self._list_unlock_events_sync, canonical_id, start_ms, end_ms, known_at_ms
+        )
+
+    def _list_unlock_events_sync(
+        self, canonical_id: str, start_ms: int, end_ms: int, known_at_ms: int
+    ) -> tuple[UnlockEventRecord, ...]:
+        con = self._require_con()
+        cur = con.execute(
+            "SELECT * FROM sl_unlock_event WHERE canonical_id = ? "
+            "AND unlock_at_ms >= ? AND unlock_at_ms <= ? AND known_at_ms <= ? "
+            "ORDER BY unlock_at_ms ASC, known_at_ms ASC",
+            [canonical_id, start_ms, end_ms, known_at_ms],
+        )
+        best: dict[str, dict[str, Any]] = {}
+        for row in self._rows_to_dicts(cur):
+            best[row["event_id"]] = row  # ascending known_at: last wins
+        return tuple(
+            UnlockEventRecord(
+                event_id=row["event_id"],
+                canonical_id=row["canonical_id"],
+                known_at_ms=row["known_at_ms"],
+                unlock_at_ms=row["unlock_at_ms"],
+                amount_tokens=row["amount_tokens"],
+                allocation_type=row["allocation_type"],
+                source=row["source"],
+                fetched_at_ms=row["fetched_at_ms"],
+            )
+            for row in sorted(best.values(), key=lambda r: (r["unlock_at_ms"], r["event_id"]))
+        )
+
+    async def save_social_snapshot(self, snapshot: SocialSnapshotRecord) -> str:
+        return await self._run(self._save_social_snapshot_sync, snapshot)
+
+    def _save_social_snapshot_sync(self, snapshot: SocialSnapshotRecord) -> str:
+        con = self._require_con()
+        if not snapshot.snapshot_id or not snapshot.canonical_id:
+            raise ValidationError("social snapshot requires snapshot_id/canonical_id")
+        raw = {
+            "snapshot_id": snapshot.snapshot_id,
+            "canonical_id": snapshot.canonical_id,
+            "as_of_ms": snapshot.as_of_ms,
+            "fetched_at_ms": snapshot.fetched_at_ms,
+            "source": snapshot.source,
+            "metrics_json": _canonical_json(dict(snapshot.metrics)),
+        }
+        self._insert_immutable(
+            con, "sl_social_snapshot", "snapshot_id = ?", [snapshot.snapshot_id], raw
+        )
+        return snapshot.snapshot_id
+
+    async def get_social_before(
+        self, canonical_id: str, as_of_ms: int
+    ) -> SocialSnapshotRecord | None:
+        """Latest social snapshot with ``as_of_ms`` at or before the cutoff
+        (point-in-time replay never reads the future)."""
+        return await self._run(self._get_social_before_sync, canonical_id, as_of_ms)
+
+    def _get_social_before_sync(
+        self, canonical_id: str, as_of_ms: int
+    ) -> SocialSnapshotRecord | None:
+        con = self._require_con()
+        cur = con.execute(
+            "SELECT * FROM sl_social_snapshot WHERE canonical_id = ? "
+            "AND as_of_ms <= ? ORDER BY as_of_ms DESC LIMIT 1",
+            [canonical_id, as_of_ms],
+        )
+        rows = self._rows_to_dicts(cur)
+        if not rows:
+            return None
+        raw = rows[0]
+        return SocialSnapshotRecord(
+            snapshot_id=raw["snapshot_id"],
+            canonical_id=raw["canonical_id"],
+            as_of_ms=raw["as_of_ms"],
+            fetched_at_ms=raw["fetched_at_ms"],
+            source=raw["source"],
+            metrics=_parse_json_dict(raw["metrics_json"], "metrics_json"),
+        )
+
+    async def save_catalyst_events(
+        self, events: Sequence[CatalystEventRecord]
+    ) -> int:
+        """Idempotent catalyst-event save (re-saving identical rows is a no-op)."""
+        return await self._run(self._save_catalyst_events_sync, list(events))
+
+    def _save_catalyst_events_sync(self, events: list[CatalystEventRecord]) -> int:
+        con = self._require_con()
+        for event in events:
+            if not event.event_id or not event.canonical_id:
+                raise ValidationError("catalyst event requires event_id/canonical_id")
+            if event.announced_at_ms <= 0 or event.known_at_ms < 0:
+                raise ValidationError(
+                    "catalyst event has a bad announced_at_ms/known_at_ms"
+                )
+            raw = self._catalyst_raw(event)
+            self._insert_immutable(
+                con, "sl_catalyst_event", "event_id = ? AND known_at_ms = ?",
+                [event.event_id, event.known_at_ms], raw,
+            )
+        return len(events)
+
+    async def list_catalyst_events(
+        self, canonical_id: str, known_at_ms: int
+    ) -> tuple[CatalystEventRecord, ...]:
+        """Catalyst events known no later than ``known_at_ms``, deduped by
+        ``event_id`` keeping the latest visible ``known_at_ms``."""
+        return await self._run(
+            self._list_catalyst_events_sync, canonical_id, known_at_ms
+        )
+
+    def _list_catalyst_events_sync(
+        self, canonical_id: str, known_at_ms: int
+    ) -> tuple[CatalystEventRecord, ...]:
+        con = self._require_con()
+        cur = con.execute(
+            "SELECT * FROM sl_catalyst_event WHERE canonical_id = ? "
+            "AND known_at_ms <= ? ORDER BY announced_at_ms ASC, known_at_ms ASC",
+            [canonical_id, known_at_ms],
+        )
+        best: dict[str, dict[str, Any]] = {}
+        for row in self._rows_to_dicts(cur):
+            best[row["event_id"]] = row  # ascending known_at: last wins
+        return tuple(
+            CatalystEventRecord(
+                event_id=row["event_id"],
+                canonical_id=row["canonical_id"],
+                known_at_ms=row["known_at_ms"],
+                announced_at_ms=row["announced_at_ms"],
+                effective_at_ms=row["effective_at_ms"],
+                event_type=row["event_type"],
+                severity=row["severity"],
+                confidence=row["confidence"],
+                source_url=row["source_url"],
+                title=row["title"],
+            )
+            for row in sorted(
+                best.values(), key=lambda r: (r["announced_at_ms"], r["event_id"])
+            )
+        )
 
     # -- introspection ------------------------------------------------------------------
     async def index_names(self) -> list[str]:
