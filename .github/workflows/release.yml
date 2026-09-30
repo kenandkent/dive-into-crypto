@@ -1,12 +1,14 @@
-# Release pipeline for dive-into-crypto.
+# Release pipeline for short-lab (desktop) and dive-into-crypto (Android).
 #
-#   release          — triggered ONLY by pushing a `v*` tag. Builds the signed
-#                      Android release APK + AAB and publishes a GitHub Release
-#                      with both attached.
-#   package-desktop  — manual only (workflow_dispatch with the `package_desktop`
-#                      input ticked). Packages the desktop backend into a
-#                      standalone onedir folder with PyInstaller. It deliberately
-#                      does NOT run on tags.
+# Tag contract (design section 40):
+#   `v*`           — Android ONLY. Builds the signed Android release APK + AAB
+#                    and publishes a GitHub Release with both attached.
+#   `short-lab-v*` — Desktop ONLY. Packages the desktop backend with
+#                    PyInstaller (short-lab.spec -> dist/short-lab/), zips it
+#                    as short-lab-windows-x64.zip and attaches it to the
+#                    GitHub Release for that tag.
+#   workflow_dispatch with the `package_desktop` input ticked — Desktop
+#                    packaging to a workflow artifact ONLY (no GitHub Release).
 #
 # Signing degrades gracefully: when the KEYSTORE_BASE64 secret is absent, the
 # release build is still produced and uploaded, just UNSIGNED (the signing
@@ -18,7 +20,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "short-lab-v*"]
   workflow_dispatch:
     inputs:
       package_desktop:
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   release:
     name: Android release (signed APK + AAB)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -101,7 +103,7 @@ jobs:
             echo "- the attached \`.apk\` is the installable release build (R8-minified)"
             echo "- the attached \`.aab\` is the Play-store bundle"
             echo
-            echo "The desktop edition is packaged separately on demand — see docs/packaging.md."
+            echo "The desktop edition (short-lab) ships on separate \`short-lab-v*\` tags — see docs/packaging.md."
           } > release-notes.md
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
@@ -120,10 +122,14 @@ jobs:
 
   package-desktop:
     name: Desktop package (PyInstaller onedir)
-    # Manual only — never on tag pushes.
-    if: github.event_name == 'workflow_dispatch' && inputs.package_desktop == true
+    # Desktop ONLY: short-lab-v* tags publish to a GitHub Release; manual
+    # dispatch (package_desktop ticked) uploads a workflow artifact instead.
+    # Never on `v*` (Android) tags.
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/short-lab-v')) || (github.event_name == 'workflow_dispatch' && inputs.package_desktop == true)
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: write # create the GitHub Release and upload the desktop zip (tag builds)
     steps:
       - uses: actions/checkout@v4
 
@@ -142,19 +148,20 @@ jobs:
 
       # PyInstaller must run inside the project environment (`uv run --with`),
       # NOT an isolated `uv tool run` env — Analysis needs to import
-      # pandas/fastapi/uvicorn/crypcodile from the synced venv to bundle them.
-      # `--with pyinstaller` adds the packager ephemerally on top of the locked
-      # dependency set. Same command as documented in dive.spec / docs.
-      - name: Package backend (dive.spec)
+      # pandas/fastapi/uvicorn/duckdb/crypcodile from the synced venv to bundle
+      # them. `--with pyinstaller` adds the packager ephemerally on top of the
+      # locked dependency set. Same command as documented in short-lab.spec /
+      # docs and desktop/backend/requirements-freeze.md.
+      - name: Package backend (short-lab.spec)
         working-directory: desktop/backend
-        run: uv run --with pyinstaller pyinstaller dive.spec --noconfirm
+        run: uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
 
       # api/app.py resolves the UI via parents[4]/ui/dist. From the frozen
-      # module (dist/dive-desktop/_internal/...) that points one level ABOVE the
+      # module (dist/short-lab/_internal/...) that points one level ABOVE the
       # app folder, i.e. <dist>/ui/dist. Mirror the UI bundle there so the
       # legacy resolution finds it too (the spec already placed a copy at
-      # _internal/ui/dist for the sys._MEIPASS fallback). See the dive.spec
-      # header for the full path math.
+      # _internal/ui/dist for the sys._MEIPASS fallback). See the
+      # short-lab.spec header for the full path math.
       - name: Mirror UI bundle for the legacy _UI_DIST path
         working-directory: desktop/backend
         shell: pwsh
@@ -166,12 +173,42 @@ jobs:
         working-directory: desktop/backend
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\dive-desktop, dist\ui -DestinationPath dive-desktop-windows-x64.zip -Force
+          Compress-Archive -Path dist\short-lab, dist\ui -DestinationPath short-lab-windows-x64.zip -Force
+
+      # Tag builds publish the zip to the GitHub Release for this tag.
+      # Desktop-only, research build: not an automated trader; provider keys
+      # stay in env, never in the bundle. The Android version does not move
+      # with Desktop tags.
+      - name: Publish desktop zip to the GitHub Release (tag builds only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/short-lab-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: desktop/backend
+        run: |
+          {
+            echo "# short-lab ${GITHUB_REF_NAME} (Desktop-only)"
+            echo
+            echo "Research build — not an automated trader, places no orders."
+            echo "Unzip and run \`short-lab/short-lab.exe\` (serves 127.0.0.1:8780)."
+            echo "Provider keys are read from the environment, never bundled."
+            echo
+            echo "Upgrading in the same Python environment: uninstall the old"
+            echo "\`diveintocrypto-desktop\` distribution first, then install"
+            echo "\`short-lab-desktop\`. Do not install both side by side."
+          } > desktop-release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "short-lab ${GITHUB_REF_NAME}" \
+            --notes-file desktop-release-notes.md \
+            --verify-tag
+          gh release upload "$GITHUB_REF_NAME" \
+            --clobber \
+            short-lab-windows-x64.zip
 
       - name: Upload desktop package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dive-desktop-windows-x64
-          path: desktop/backend/dive-desktop-windows-x64.zip
+          name: short-lab-windows-x64
+          path: desktop/backend/short-lab-windows-x64.zip
           if-no-files-found: error
           retention-days: 14

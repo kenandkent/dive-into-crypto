@@ -218,7 +218,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"ok": True, "service": "dive-into-crypto-desktop", "version": VERSION, "ui_built": _UI_DIST.exists()}
+        return {"ok": True, "service": "dive-into-crypto-desktop", "product": "short-lab", "version": VERSION, "ui_built": _UI_DIST.exists()}
 
     @app.get("/api/universe")
     async def universe(limit: int = 60) -> list[dict]:

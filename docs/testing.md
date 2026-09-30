@@ -57,6 +57,31 @@ The 7 tracked features: Zero-Lag EMA (ZLEMA), Bessel's correction (N−1 varianc
 two-pointer data alignment, regex `swapKeywords` GC optimization, Binance WebSocket + local
 cache, secure-keystore env fallback, and client–server parity (Z-Score thresholds / ADX regimes).
 
+## Short-Lab acceptance tests
+
+The Short-Lab contract tests live in `desktop/backend/tests/test_shortlab_*.py` (config,
+repository, funding, quote volume, identity, spot, liquidity, lifecycle, providers,
+scoring, status, entry, runtime, API, evidence, FULL) plus, for naming/packaging/release:
+
+| File | What it pins |
+|---|---|
+| `test_shortlab_packaging.py` | distribution `short-lab-desktop` with both `short-lab` and `dive-desktop` scripts on one entry; UI package `short-lab-desktop-ui`; `/api/health` keeps `service` and gains `product: "short-lab"`; `short-lab.spec` EXE/COLLECT names, DuckDB + `default.yaml` + UI dist, fixed build command, no stale product paths; frozen read-only boots share one writable `shortlab.duckdb` home |
+| `test_shortlab_release_workflow.py` | `v*` = Android-only, `short-lab-v*` = Desktop-only, ticked manual dispatch = Desktop artifact only; tag Desktop builds publish `short-lab-windows-x64.zip` to the Release |
+
+Release acceptance (design §35–36) additionally runs, offline where possible:
+
+```bash
+cd desktop/backend && uv run --offline pytest -q          # backend incl. Short-Lab (full)
+uv run --offline --project desktop/backend pytest tests/ -q  # root E2E (from repo root)
+cd desktop/ui && npm test && npm run build                # UI tests + committed bundle
+```
+
+Record the command, exit code and commit for every row of the §35 matrix; a row without
+evidence is not marked done. Real PyInstaller bundling (`uv run --with pyinstaller
+pyinstaller short-lab.spec --noconfirm`) and the read-only extraction smoke need a
+networked Windows runner, so in an offline sandbox they stay statically covered and are
+reported as not-executed — never as passed.
+
 ## Offline by default; live tests are opt-in
 
 Everything above runs **offline**: the backend and root suites mock/stub the network layer, and

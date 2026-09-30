@@ -1,8 +1,10 @@
 # Requirements freeze (packaging note)
 
 The authoritative dependency set for the desktop backend is **`uv.lock`**. Every
-packaging build (PyInstaller via `dive.spec`) and every release must be produced
-from the locked environment — never from a fresh resolution.
+packaging build (PyInstaller via `short-lab.spec`) and every release must be produced
+from the locked environment — never from a fresh resolution. The lock includes the
+DuckDB runtime (`duckdb`) that the frozen bundle ships via the spec's
+`collect_dynamic_libs("duckdb")`.
 
 ## Reproduce the locked environment
 
@@ -36,7 +38,7 @@ library versions than the ones CI tested. Always:
 ```bash
 cd desktop/backend
 uv sync
-uv run --with pyinstaller pyinstaller dive.spec --noconfirm
+uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
 ```
 
 (`--with pyinstaller` overlays the packager onto the locked env — PyInstaller's

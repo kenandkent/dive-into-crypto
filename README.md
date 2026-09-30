@@ -1,9 +1,10 @@
 ```
-┌─ DIVE INTO CRYPTO ─────────────────────────────────────────────┐
+┌─ SHORT-LAB ────────────────────────────────────────────────────┐
 │                                                                │
 │   Binance USDT-M perpetual-futures scanner.                    │
 │   60 indicators · 12 timeframes · whale-divergence filter ·    │
 │   one confidence-scored consensus verdict per symbol.          │
+│   Plus the Short-Lab long-horizon short research layer.        │
 │                                                                │
 │   No account. No API keys. No sign-up. Public data only.       │
 └────────────────────────────────────────────────────────────────┘
@@ -115,8 +116,14 @@ needed to run it.
 git clone https://github.com/nazmiefearmutcu/dive-into-crypto.git
 cd dive-into-crypto/desktop/backend
 uv sync
-uv run dive-desktop          # serves 127.0.0.1:8780 and opens the terminal UI
+uv run short-lab          # serves 127.0.0.1:8780 and opens the terminal UI
 ```
+
+`uv run dive-desktop` stays as a compat alias for the same entry. The desktop Python
+distribution is `short-lab-desktop` (uninstall the old `diveintocrypto-desktop` first —
+never install both side by side); the UI package is `short-lab-desktop-ui`. The Python
+import path `diveintocrypto_desktop` is unchanged, and `/api/health` keeps
+`service: "dive-into-crypto-desktop"` while adding `product: "short-lab"`.
 
 Nothing leaves your machine except public Binance requests. Details:
 **[desktop/README.md](desktop/README.md)**. Android: **[android/README.md](android/README.md)**.
@@ -134,11 +141,15 @@ Nothing leaves your machine except public Binance requests. Details:
 
 ## Releases
 
-Tagged releases are built by CI: pushing a `v*` tag produces the Android release **APK +
-AAB** and attaches them to a GitHub Release — signed when the release-keystore secrets
-are configured, unsigned (but still published) otherwise. The desktop edition can be
-packaged on demand into a standalone folder. Secret names, the keystore how-to and the
-packaging details: **[docs/packaging.md](docs/packaging.md)** and
+Tagged releases are built by CI with independent tags per edition: pushing a `v*` tag
+produces the Android release **APK + AAB** and attaches them to a GitHub Release — signed
+when the release-keystore secrets are configured, unsigned (but still published)
+otherwise. Pushing a `short-lab-v*` tag packages the **short-lab desktop** edition
+(`dist/short-lab/`, shipped as `short-lab-windows-x64.zip`) and attaches it to a
+Desktop-only GitHub Release (research build — not an automated trader). The desktop
+edition can also be packaged on demand (manual dispatch uploads an artifact only).
+Secret names, the keystore how-to and the packaging details:
+**[docs/packaging.md](docs/packaging.md)** and
 [CONTRIBUTING.md](CONTRIBUTING.md#release-process).
 
 ---
