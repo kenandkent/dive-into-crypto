@@ -54,6 +54,7 @@ __all__ = [
     "FieldCredit",
     "DQBreakdown",
     "data_quality",
+    "full_tier_field_states",
     "round_half_up_1",
     "group_weights",
     "is_ready_required",
@@ -255,6 +256,85 @@ def is_ready_required(field_id: str, tier: str) -> bool:
     if key == "FULL":
         return field_id in READY_REQUIRED_FIELDS_FULL
     return field_id in READY_REQUIRED_FIELDS_LITE
+
+
+def _result_status_of(result: Any) -> str:
+    status = getattr(result, "status", None)
+    text = str(status).upper() if status is not None else "UNAVAILABLE"
+    if text not in ("OK", "PARTIAL", "NOT_APPLICABLE", "UNAVAILABLE", "ERROR"):
+        return "UNAVAILABLE"
+    return text
+
+
+def full_tier_field_states(
+    unlock_result: Any = None,
+    social_result: Any = None,
+    catalyst_result: Any = None,
+    *,
+    as_of_ms: int = 0,
+) -> list[FieldState]:
+    """Map Task 17 provider outcomes to FULL DQ field states (pure).
+
+    One :class:`FieldState` per fixed section-18 field of the ``unlock`` /
+    ``social`` / ``catalyst`` groups (3 + 4 + 2). ``OK`` fetches mark every
+    field of the group ``OK`` (an ``OK`` fetch *is* the coverage -- a known
+    empty unlock schedule or a quiet catalyst feed scores normally); any
+    other status marks the group's fields with that same status and reason
+    so DQ drops with no reweighting. ``None`` results (provider never
+    queried, e.g. LITE path) yield no states at all.
+    """
+    states: list[FieldState] = []
+    groups: tuple[tuple[Any, tuple[str, ...], str], ...] = (
+        (unlock_result, ("unlock_30d", "unlock_90d", "unlock_allocation"), "unlock"),
+        (
+            social_result,
+            (
+                "social_volume",
+                "social_contributors",
+                "social_dominance",
+                "social_window",
+            ),
+            "social",
+        ),
+        (
+            catalyst_result,
+            ("catalyst_coverage", "catalyst_dedup"),
+            "catalyst",
+        ),
+    )
+    for result, field_ids, source in groups:
+        if result is None:
+            continue
+        status = _result_status_of(result)
+        fetched = getattr(result, "fetched_at_ms", None)
+        try:
+            fetched_ms: int | None = None if fetched is None else int(fetched)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            fetched_ms = None
+        reason = getattr(result, "reason_code", None)
+        origin = getattr(result, "source", None) or source
+        for field_id in field_ids:
+            if status == "OK":
+                states.append(
+                    FieldState(
+                        field_id=field_id,
+                        status="OK",
+                        fetched_at_ms=fetched_ms,
+                        source=str(origin),
+                    )
+                )
+            else:
+                states.append(
+                    FieldState(
+                        field_id=field_id,
+                        status=status,
+                        fetched_at_ms=fetched_ms,
+                        reason_code=str(reason) if reason is not None else "DATA_MISSING",
+                        source=str(origin),
+                    )
+                )
+    _ = as_of_ms  # freshness is evaluated inside data_quality against as_of_ms
+    return states
 
 
 def round_half_up_1(value: float) -> float:

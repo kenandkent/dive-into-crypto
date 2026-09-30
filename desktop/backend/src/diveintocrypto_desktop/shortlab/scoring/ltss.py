@@ -13,7 +13,12 @@ Design contract: sections 8.2 / 8.3 / 9.1 / 10.3 / 11.1 / 13 / 13.1 / 14.
 - :func:`score_full` pre-buries the FULL synthesis for Task 17
   (``valuation_supply_raw = valuation_raw_10 + unlock_raw_15`` over 25 and
   ``narrative_raw_15`` over 15) so the three FULL profiles hit exactly 100
-  on all-max fixtures.
+  on all-max fixtures. Task 17 feeds it: ``features/supply.py`` owns
+  ``unlock_raw_15`` (forward 30/90D vesting windows), ``features/narrative.py``
+  owns ``narrative_raw_15`` (two aligned 30D attention windows), and the
+  service injects both into the inputs below -- missing raws contribute 0
+  with no reweighting, and a missing critical LITE input still forces
+  ``ltss=None`` in either tier.
 
 ``lifecycle.min_age_days`` does not exist: listing-age risk uses only
 ``veto.new_token_days`` (Task 11).
@@ -42,6 +47,8 @@ __all__ = [
     "FEATURE_VERSION",
     "SCORE_VERSION_FULL",
     "SCORE_VERSION_LITE",
+    "FULL_MODULE_MAX",
+    "LITE_MODULE_MAX",
     "ScoreBreakdown",
     "extract_features",
     "score_full",
@@ -49,6 +56,23 @@ __all__ = [
     "select_profile",
     "round_half_up_1",
 ]
+
+#: Fixed raw maxima per tier (design 8.2). Missing data never resizes them.
+LITE_MODULE_MAX: dict[str, int] = {
+    "lifecycle": 25,
+    "carry": 25,
+    "valuation": 10,
+    "tradeability": 10,
+}
+
+#: FULL maxima: Valuation/Supply fuses valuation_raw_10 + unlock_raw_15.
+FULL_MODULE_MAX: dict[str, int] = {
+    "lifecycle": 25,
+    "carry": 25,
+    "valuation": 25,
+    "narrative": 15,
+    "tradeability": 10,
+}
 
 
 def round_half_up_1(value: float) -> float:
@@ -452,7 +476,7 @@ def score_lite(
     if weights is None:
         raise KeyError(f"unknown LITE profile {profile_key!r}")
     feats, factor_scores, raw_values, reasons = _collect_breakdown_inputs(features)
-    module_max = {"lifecycle": 25, "carry": 25, "valuation": 10, "tradeability": 10}
+    module_max = dict(LITE_MODULE_MAX)
     module_raws: dict[str, int] = {}
     module_scores: dict[str, float] = {}
     for module, maximum in module_max.items():
@@ -538,13 +562,7 @@ def score_full(
         narrative_group, dict
     ) else None
 
-    module_max = {
-        "lifecycle": 25,
-        "carry": 25,
-        "valuation": 25,
-        "narrative": 15,
-        "tradeability": 10,
-    }
+    module_max = dict(FULL_MODULE_MAX)
     module_raws = {
         "lifecycle": int(feats.get("lifecycle", {}).get("raw", 0) or 0),
         "carry": int(feats.get("carry", {}).get("raw", 0) or 0),

@@ -30,28 +30,75 @@ from diveintocrypto_desktop.shortlab.service import (
 log = logging.getLogger(__name__)
 
 
-def build_default_registry(config: ShortLabConfig, *, clock: Callable[[], int] | None = None) -> Any:
-    """Default provider registry: CoinGecko when enabled, nothing else.
+def _provider_api_key(
+    provider_cfg: Any, env: Mapping[str, str] | None
+) -> str | None:
+    """Resolve the configured key env var (name only in config); ``None``
+    when the provider needs no key or the variable is unset/empty."""
+    api_key_env = getattr(provider_cfg, "api_key_env", None)
+    if not api_key_env:
+        return None
+    if env is not None and str(api_key_env) in env:
+        value = env[str(api_key_env)]
+    else:
+        import os as _os
 
-    Phase 5/6 providers (``unlock`` / ``social`` / ``catalyst``) stay
-    unregistered until Task 17 wires them on this same runtime -- and this
-    module never imports those future modules. Unregistered names resolve
-    to the shared ``NullProvider`` (explicit ``UNAVAILABLE``), which keeps
-    the effective tier at ``LITE``.
+        value = _os.environ.get(str(api_key_env))
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def build_default_registry(
+    config: ShortLabConfig,
+    *,
+    clock: Callable[[], int] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Any:
+    """Default provider registry: CoinGecko when enabled, plus the Task 17
+    Phase 5/6 providers (``unlock`` / ``social`` / ``catalyst``) when each
+    is enabled *and* its key (if any) resolves.
+
+    Future provider modules are imported lazily and only on the enabled
+    branch, so a LITE-only runtime never imports them. Anything
+    unregistered resolves to the shared ``NullProvider`` (explicit
+    ``UNAVAILABLE``), which keeps the effective tier at ``LITE`` with
+    ``FULL_PREREQUISITE_MISSING``.
     """
     from diveintocrypto_desktop.shortlab.providers.base import ProviderRegistry
 
     registry = ProviderRegistry(clock=clock)
     providers = getattr(config, "providers", {}) or {}
-    coingecko_cfg = providers.get("coingecko") if isinstance(providers, Mapping) else None
-    enabled = bool(getattr(coingecko_cfg, "enabled", False)) if coingecko_cfg is not None else False
-    if enabled:
+
+    def _enabled(name: str) -> bool:
+        cfg = providers.get(name) if isinstance(providers, Mapping) else None
+        return bool(getattr(cfg, "enabled", False))
+
+    if _enabled("coingecko"):
         from diveintocrypto_desktop.shortlab.providers.coingecko import CoinGeckoProvider
 
         registry.register(
             "coingecko",
             CoinGeckoProvider(market_ttl_sec=config.refresh.fundamental_sec, clock=clock),
         )
+    if _enabled("unlock"):
+        from diveintocrypto_desktop.shortlab.providers.unlock import UnlockProvider
+
+        key = _provider_api_key(providers.get("unlock"), env)
+        if key is not None:
+            registry.register("unlock", UnlockProvider(api_key=key, clock=clock))
+    if _enabled("social"):
+        from diveintocrypto_desktop.shortlab.providers.social import SocialProvider
+
+        key = _provider_api_key(providers.get("social"), env)
+        if key is not None:
+            registry.register("social", SocialProvider(api_key=key, clock=clock))
+    if _enabled("catalyst"):
+        from diveintocrypto_desktop.shortlab.providers.catalyst import CatalystProvider
+
+        key = _provider_api_key(providers.get("catalyst"), env)
+        # Catalyst needs no key (api_key_env null): enabled alone registers.
+        registry.register("catalyst", CatalystProvider(api_key=key, clock=clock))
     return registry
 
 
@@ -136,7 +183,10 @@ class ShortLabRuntime:
         self._config = config
 
         try:
-            from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
+            from diveintocrypto_desktop.shortlab.repository import (
+                ShortLabRepository,
+                schema_target_for_config,
+            )
 
             if self._repository is None:
                 if self._db_path is not None:
@@ -148,13 +198,15 @@ class ShortLabRuntime:
                         frozen=self._frozen, env=self._env
                     )
                 self._owns_repository = True
-            version = await self._repository.migrate()
+            version = await self._repository.migrate(
+                target_version=schema_target_for_config(config)
+            )
             log.info("shortlab database ready (schema version %s)", version)
         except Exception as exc:  # noqa: BLE001 - design 19.3: unavailable, never fatal
             return self._mark_unavailable(f"migration: {type(exc).__name__}: {str(exc)[:160]}")
 
         if self._registry is None:
-            self._registry = build_default_registry(config, clock=self._clock)
+            self._registry = build_default_registry(config, clock=self._clock, env=self._env)
         if self._service is None:
             self._service = ShortLabService(
                 config=config,
