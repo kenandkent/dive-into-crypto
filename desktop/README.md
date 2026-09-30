@@ -1,10 +1,11 @@
-# Dive Into Crypto — Desktop
+# short-lab — Desktop
 
 A single-window terminal for the Binance USDT-M perpetual-futures market. The **reference**
 consensus engine — 60 indicators across 12 timeframes, three futures-native overlays, and a
 whale-divergence filter — fed with highest-fidelity data through
 [**Crypcodile**](https://github.com/nazmiefearmutcu/Crypcodile), rendered in the **Depth Terminal**
-UI.
+UI, plus the **Short Lab** long-horizon short-research layer (LTSS scoring, Entry builder,
+7D/30D/90D forward evidence).
 
 | Scanner | Panel |
 | --- | --- |
@@ -22,11 +23,18 @@ Requires **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/). The UI ships p
 ```bash
 cd desktop/backend
 uv sync                  # backend + Crypcodile (pinned commit)
-uv run dive-desktop      # serves 127.0.0.1:8780 and opens the UI
+uv run short-lab         # serves 127.0.0.1:8780 and opens the UI
 
-uv run dive-desktop --no-open        # serve only
-uv run dive-desktop --port 8888      # custom port
+uv run short-lab --no-open              # serve only
+uv run short-lab --port 8888            # custom port
+uv run dive-desktop                     # legacy alias, same entry
 ```
+
+Everything runs locally; the only network traffic is **public** Binance market-data requests
+(plus the optional Short-Lab providers below, each with its own key).
+
+> Upgrading in the same Python environment: uninstall the old `diveintocrypto-desktop`
+> distribution first, then install `short-lab-desktop`. Never install both side by side.
 
 Everything runs locally; the only network traffic is **public** Binance market-data requests.
 
@@ -93,7 +101,34 @@ Mono / Newsreader. Four themes, switched live from the status strip (persisted l
 **Tarama** (ranked sweep · whale-divergence elimination) · **Panel** (active symbol: 12-TF heat,
 serif verdict, family-grouped 60-indicator table, and instrument gauges for the
 microstructure / regime / MTF overlays + whale divergence) · **OI · L/S** · **Sinyal** · **Ağ
-Günlüğü** (live request log) · **Ayarlar**. Deep-link a view with `#panel`, `#scan`, …
+Günlüğü** (live request log) · **Ayarlar** · **SHORT LAB** (LTSS ranking with READY ·
+LITE / READY FULL states, per-asset detail with Carry/Structure/Risks/Data Sources, STALE /
+UNAVAILABLE / VETO states, Evidence 7D/30D/90D). Deep-link a view with `#panel`, `#scan`,
+`#shortlab`, …
+
+### Short-Lab configuration & data states
+
+- Default config ships as `backend/src/diveintocrypto_desktop/shortlab/default.yaml`
+  (override one file path via `SHORTLAB_CONFIG_PATH`); asset identity overrides live in
+  `shortlab/identity/asset_overrides.yaml`. No secrets in the repo — provider keys only
+  via environment (e.g. CoinGecko), never logged or returned by the API.
+- Writable state defaults to `desktop/backend/runtime/` in source runs and to the
+  per-user data directory (`%LOCALAPPDATA%/short-lab`, `shortlab.duckdb`) in packaged
+  runs (override via `SHORTLAB_DATA_DIR`).
+- Missing data renders as null + reason (`N/A` vs `UNAVAILABLE` are distinct); a stale
+  READY snapshot projects to `CANDIDATE`/`NOT_READY` with `stale: true` without rewriting
+  history. See `docs/api.md` for the `/api/short/*` parameters and error codes.
+
+### Packaged run
+
+```bash
+cd desktop/backend
+uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
+dist/short-lab/short-lab.exe     # serves 127.0.0.1:8780, user data under %LOCALAPPDATA%/short-lab
+```
+
+Details: [docs/packaging.md](../docs/packaging.md). Desktop releases ship from
+`short-lab-v*` tags; `v*` tags stay Android-only.
 
 ---
 
@@ -116,7 +151,8 @@ The UI is bundled with esbuild into a single offline `bundle.js` (no CDN). Sourc
 
 ## Troubleshooting
 
-- **"Backend'e bağlanılamadı"** — the service isn't running; `uv run dive-desktop`.
+- **"Backend'e bağlanılamadı"** — the service isn't running; `uv run short-lab` (legacy
+  `uv run dive-desktop` still works).
 - **Empty scan / symbol errors** — Binance futures data is geo-restricted in some regions; a network
   condition, not a bug. Try a region where Binance Futures is reachable.
 - **Rate limits** — the scan caches briefly and bounds the expensive futures-data calls; rapid manual

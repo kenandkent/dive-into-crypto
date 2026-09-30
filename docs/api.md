@@ -1,7 +1,7 @@
 # HTTP & WebSocket API reference
 
-The desktop backend is a localhost-only FastAPI service (started by `uv run dive-desktop`,
-serving **127.0.0.1:8780**). Source of truth:
+The desktop backend is a localhost-only FastAPI service (started by `uv run short-lab` —
+`uv run dive-desktop` stays as a compat alias — serving **127.0.0.1:8780**). Source of truth:
 `desktop/backend/src/diveintocrypto_desktop/api/app.py`, with response assembly in
 `scan/symbol_builder.py` and `scan/scanner.py`; depth features live in `scan/evidence.py`
 (grading archive, v2 stats), `scan/structure.py` (BTC-beta / clusters / vol),
@@ -34,15 +34,89 @@ serving **127.0.0.1:8780**). Source of truth:
 Liveness probe. No parameters.
 
 ```json
-{ "ok": true, "service": "dive-into-crypto-desktop", "version": "0.3.0", "ui_built": true }
+{ "ok": true, "service": "dive-into-crypto-desktop", "product": "short-lab", "version": "0.3.0", "ui_built": true }
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `ok` | bool | always `true` when the process answers |
-| `service` | string | service identifier |
+| `service` | string | legacy service identifier, kept for compatibility |
+| `product` | string | product name (`short-lab`) |
 | `version` | string | backend version (`0.3.0`) |
 | `ui_built` | bool | whether the committed UI bundle (`desktop/ui/dist/`) was found at startup |
+
+## Short-Lab (`/api/short/*`)
+
+Source of truth: `desktop/backend/src/diveintocrypto_desktop/api/shortlab.py` (router) on the
+same FastAPI process. Short-Lab failures stay Short-Lab errors — they never break the legacy
+`/api/scan` family above. Provider-partial rows still return 200 with null metrics; missing
+data is null + reason, never 0.
+
+### GET /api/short/health
+
+Service probe: `{ok, available, analysisTier: LITE|FULL, scoreVersion, generationId,
+generatedAtMs}`. 503 `{"error": "shortlab_unavailable"}` when the runtime is down.
+
+### GET /api/short/candidates
+
+Ranked candidates of the latest SUCCEEDED generation (`generation_id` pins pagination).
+
+| Param | Meaning |
+|---|---|
+| `status` | `READY` / `CANDIDATE` / `WATCH` / `EXCLUDED` / `PAUSED` / `BLOCKED` |
+| `candidate_status` | `EXCLUDED` / `WATCH` / `CANDIDATE` |
+| `execution_status` | `NOT_READY` / `READY` / `PAUSED` / `BLOCKED` |
+| `category` | category filter |
+| `profile` | `MEME_LITE` / `GENERAL_LITE` / `LOW_FLOAT_VC_LITE` / `MEME_FULL` / `GENERAL_FULL` / `LOW_FLOAT_VC_FULL` |
+| `min_ltss` / `min_entry` / `min_data_quality` | 0–100 thresholds |
+| `min_funding_30d` | funding ratio floor — `0.005` means 0.5% |
+| `ath_drawdown_min` / `ath_drawdown_max` | ATH drawdown window, each −1…0; min must be ≤ max |
+| `sort` | `ltss` / `entry` / `funding30d` / `dataQuality` |
+| `order` | `asc` / `desc` (default `desc`); nulls always sort last |
+| `generation_id` / `generationId` | pin a generation — required when `offset > 0` |
+| `limit` / `offset` | 1–200 (default 50) / ≥ 0 |
+
+Each item carries `candidateStatus` / `executionStatus` / `status` plus `tier`, score version
+and provider/data timestamps. Default order is READY > CANDIDATE > WATCH > PAUSED > BLOCKED >
+EXCLUDED, then score desc, then `symbol ASC, snapshot_id ASC`; two pages share one
+`generationId` so a concurrent refresh never shifts page two.
+
+### GET /api/short/symbol/{symbol}
+
+Candidate detail for one symbol (404 `{"error": "short_symbol_not_found"}` when unknown).
+
+### GET /api/short/symbol/{symbol}/history
+
+Score history for one symbol.
+
+### GET /api/short/providers
+
+Provider states: `{providers: [{name, enabled, registered, status, reasonCode}],
+generatedAtMs}`. Only the enabled flag is exposed — never key material.
+
+### POST /api/short/refresh → GET /api/short/refresh/{job_id}
+
+Enqueue a refresh; answers 202 `{jobId, jobType, existing}` (`existing: true` when a run
+is already in flight — re-entrant). Unknown job types → 422
+`{"error": "short_unknown_job_type"}`; unknown job ids → 404
+`{"error": "short_job_not_found"}`.
+
+### GET /api/short/evidence/summary
+
+Forward-evidence aggregation (7D/30D/90D) once the grader is wired; before that, 503
+`{"error": "short_evidence_unavailable"}`.
+
+### Short-Lab error codes
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `shortlab_unavailable` | 503 | runtime/DB down — retry later |
+| `short_evidence_unavailable` | 503 | grader not wired yet |
+| `short_invalid_filter` | 422 | unknown enum value, inverted ATH window, bad `min_funding_30d`, or `offset > 0` without `generation_id` |
+| `short_unknown_job_type` | 422 | unknown refresh job type |
+| `short_symbol_not_found` | 404 | unknown symbol |
+| `short_job_not_found` | 404 | unknown refresh job id |
+| `short_generation_not_found` | 404 | unknown or not-yet-SUCCEEDED generation |
 
 ## GET /api/universe
 

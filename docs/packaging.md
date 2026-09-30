@@ -1,9 +1,13 @@
 # Packaging & releases
 
 How the two editions ship. The **Android** edition is built and published by CI from a
-`v*` tag; the **desktop** edition is packaged on demand with PyInstaller. All of this is
-automated in [`.github/workflows/release.yml`](../.github/workflows/release.yml); the
-per-push gates live in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+`v*` tag; the **short-lab desktop** edition is packaged by CI from a `short-lab-v*` tag
+(and on demand via manual dispatch). All of this is automated in
+[`.github/workflows/release.yml`](../.github/workflows/release.yml); the per-push gates
+live in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
+Tag contract: `v*` is Android-only, `short-lab-v*` is Desktop-only. The Android version
+does not move with Desktop tags.
 
 ## Android releases (tag → signed APK)
 
@@ -59,17 +63,19 @@ base64 -w0 release.keystore.jks > keystore.b64
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("release.keystore.jks")) | Set-Content -NoNewline keystore.b64
 ```
 
-## Desktop packaging (PyInstaller)
+## Desktop packaging (PyInstaller) and Desktop releases
 
 From `desktop/backend`:
 
 ```bash
 uv sync
-uv run --with pyinstaller pyinstaller dive.spec --noconfirm
+uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
 ```
 
-- Produces **`dist/dive-desktop/`**, an *onedir* bundle — start it with
-  `dist/dive-desktop/dive-desktop.exe` (serves `127.0.0.1:8780` and opens the UI).
+- Produces **`dist/short-lab/`**, an *onedir* bundle — start it with
+  `dist/short-lab/short-lab.exe` (serves `127.0.0.1:8780` and opens the UI).
+  Both console scripts (`short-lab` and the legacy `dive-desktop` alias) map to
+  the same `diveintocrypto_desktop.__main__:main` entry.
 - **Why not onefile:** single-exe self-extractors are a classic antivirus
   false-positive trigger and pay a temp-dir extraction cost on every launch. The onedir
   layout avoids both.
@@ -78,8 +84,16 @@ uv run --with pyinstaller pyinstaller dive.spec --noconfirm
   used by the frozen-build fallback in `api/app.py`) and — via the packaging job's mirror
   step — at `<dist-root>/ui/dist`, which is where `api/app.py`'s original `_UI_DIST` path
   math (`parents[4]/ui/dist`) resolves inside a frozen tree. Extract/release the whole
-  `dist/` tree together and both resolvers work. See the `dive.spec` header for the full
-  path math.
+  `dist/` tree together and both resolvers work. See the `short-lab.spec` header for the
+  full path math.
+- The spec also bundles the DuckDB native libraries and `shortlab/default.yaml`
+  (overridable at runtime via `SHORTLAB_CONFIG_PATH`).
+- **Writable data:** the frozen app never writes next to its resources. Short-Lab state
+  lives in the per-user data directory (`%LOCALAPPDATA%/short-lab` on Windows, holding
+  `shortlab.duckdb`), so launching from a read-only extraction directory works and data
+  survives restarts. Smoke: extract to a read-only directory, launch twice, confirm the
+  same user DB is read/written and the old `/api/scan`, the Short Lab page and the cache
+  survive the restart.
 - **Size honesty: expect roughly 150–250 MB unzipped.** pandas + numpy + FastAPI/uvicorn
   dominate; that is the price of shipping the full reference engine, not a packaging bug.
   The zip the packaging job uploads is smaller, but still comfortably in the
@@ -87,9 +101,19 @@ uv run --with pyinstaller pyinstaller dive.spec --noconfirm
 - Dependencies come from the locked env — see
   [`desktop/backend/requirements-freeze.md`](../desktop/backend/requirements-freeze.md).
 
-Manual runs: GitHub → **Actions → Release → Run workflow** → tick `package_desktop`. It
-runs on `windows-latest` and uploads `dive-desktop-windows-x64.zip` as a workflow
-artifact. It never runs on tags.
+Desktop CI (`package-desktop` job in `release.yml`):
+
+- Push a `short-lab-v*` tag → packages on `windows-latest`, creates the GitHub Release
+  for the tag (Desktop-only, research build — not an automated trader) and attaches
+  `short-lab-windows-x64.zip`.
+- Manual runs: GitHub → **Actions → Release → Run workflow** → tick `package_desktop`.
+  Uploads `short-lab-windows-x64.zip` as a workflow artifact only (no GitHub Release).
+- A `short-lab-v*` tag never starts the Android job; a `v*` tag never starts the Desktop
+  job — see the routing matrix in
+  `desktop/backend/tests/test_shortlab_release_workflow.py`.
+
+Upgrading in the same Python environment: uninstall the old `diveintocrypto-desktop`
+distribution first, then install `short-lab-desktop`. Do not install both side by side.
 
 ## This machine: `git push` over 1 MB is broken
 
@@ -100,7 +124,8 @@ must therefore be creatable **via the REST API or CI**, not a local push:
 - Create the tag on GitHub without pushing:
   `POST /repos/{owner}/{repo}/git/refs` with
   `{"ref": "refs/tags/v0.x.y", "sha": "<commit sha already on GitHub>"}` — the `push`
-  event fires and `release.yml` takes over.
+  event fires and `release.yml` takes over. Same for Desktop tags with
+  `{"ref": "refs/tags/short-lab-v0.x.y", ...}`.
 - Or create tag + release in one call:
   `gh release create v0.x.y --target <branch-or-sha> --title ... --notes ...` creates
   the tag server-side; the workflow then attaches the built artefacts.
