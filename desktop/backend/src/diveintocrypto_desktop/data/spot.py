@@ -18,6 +18,8 @@ Perp-only listings are the NORMAL state here, not an error: the snapshot is
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import logging
 import math
 import os
@@ -25,6 +27,11 @@ import time
 from typing import Any
 
 from diveintocrypto_desktop.data.http import FAPI_V1, get_json
+from diveintocrypto_desktop.shortlab.request_budget import (
+    RequestContext,
+    get_current_request_context,
+    scoped_request_context,
+)
 
 logger = logging.getLogger("trading_bot.data.spot")
 
@@ -44,7 +51,39 @@ def reset_cache() -> None:
 
 
 async def _spot_json(path: str, params: dict[str, Any]) -> Any:
-    return await get_json(f"{SPOT_V3}{path}", params)
+    """GET one Spot document, forwarding the ambient request context.
+
+    ``snapshot`` / ``spot_history`` install their (explicit or ambient)
+    ``RequestContext`` for the duration of the fetch via
+    :func:`_maybe_scope`, so this two-argument shape -- relied on by legacy
+    test doubles -- never changes. ``request_context`` is always forwarded
+    (possibly None); budgeted sends resolve the ``spot``/``exchangeInfo``
+    families from the shared F03 weights fixture, and a denied send raises
+    :class:`BudgetExhausted` for the caller to encapsulate as UNAVAILABLE.
+    """
+    return await get_json(
+        f"{SPOT_V3}{path}", params, request_context=get_current_request_context()
+    )
+
+
+def _resolve_spot_context(request_context: RequestContext | None) -> RequestContext | None:
+    """Explicit context wins over ambient; a budgeted context without a
+    family defaults to the versioned ``spot`` family (exchangeInfo resolves
+    to ``exchangeInfo`` by URL)."""
+    ctx = request_context if request_context is not None else get_current_request_context()
+    if ctx is not None and ctx.budget is not None and ctx.endpoint_family is None:
+        ctx = dataclasses.replace(ctx, endpoint_family="spot")
+    return ctx
+
+
+@contextlib.contextmanager
+def _maybe_scope(ctx: RequestContext | None):
+    """Install ``ctx`` as the ambient request context (no-op when None)."""
+    if ctx is None:
+        yield
+    else:
+        with scoped_request_context(ctx):
+            yield
 
 
 def log_returns(closes: list[float]) -> list[float]:
@@ -126,23 +165,34 @@ def spot_perp_block(spot_closes: list[float], spot_price: float | None,
     }
 
 
-async def snapshot(symbol: str, perp_price: float, perp_closes: list[float]) -> dict:
+async def snapshot(
+    symbol: str,
+    perp_price: float,
+    perp_closes: list[float],
+    *,
+    request_context: RequestContext | None = None,
+) -> dict:
     """Cached ``spot_perp`` block for ``symbol`` (60s TTL on SUCCESS only).
 
     ``{"unavailable": "no_spot_market"}`` for perp-only listings (normal state);
     other failures report their reason. Errors and unavailable states are never
     cached — every call after a failure re-attempts upstream (so a listing that
     gains a spot market is picked up on the very next call, not an hour later).
+
+    ``request_context`` (F04, additive) travels to ``get_json`` for budget /
+    trace propagation; ``None`` preserves the legacy unbounded path.
     """
     now = time.monotonic()
     cached = _cache.get(symbol)
     if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
+    ctx = _resolve_spot_context(request_context)
     try:
-        klines, ticker = await asyncio.gather(
-            _spot_json("/klines", {"symbol": symbol, "interval": "1h", "limit": KLINE_LIMIT}),
-            _spot_json("/ticker/24hr", {"symbol": symbol}),
-        )
+        with _maybe_scope(ctx):
+            klines, ticker = await asyncio.gather(
+                _spot_json("/klines", {"symbol": symbol, "interval": "1h", "limit": KLINE_LIMIT}),
+                _spot_json("/ticker/24hr", {"symbol": symbol}),
+            )
         closes = parse_kline_closes(klines)
         spot_price = None
         try:
@@ -186,6 +236,7 @@ async def snapshot(symbol: str, perp_price: float, perp_closes: list[float]) -> 
 import re
 from dataclasses import dataclass
 
+from diveintocrypto_desktop.shortlab import observations as _obs
 from diveintocrypto_desktop.shortlab.models import ProviderResult, sanitize_error_message
 
 DAY_MS = 86_400_000
@@ -406,7 +457,9 @@ def _verified_multiplier(identity: Any) -> float | None:
     return value
 
 
-async def spot_history(identity: Any, as_of_ms: int) -> ProviderResult[SpotHistory]:
+async def spot_history(
+    identity: Any, as_of_ms: int, *, request_context: RequestContext | None = None
+) -> ProviderResult[SpotHistory]:
     """60D Spot history for a verified identity at the same UTC-day cutoff.
 
     ``identity`` is duck-typed (Task 1 ``shortlab.models.AssetIdentity`` or
@@ -416,9 +469,14 @@ async def spot_history(identity: Any, as_of_ms: int) -> ProviderResult[SpotHisto
     ``identity.binance_spot_symbol`` — the futures symbol is never stripped or
     guessed. ``as_of_ms`` is a UTC epoch-ms truncation point; only the 60 UTC
     days closed before it are used.
+
+    ``request_context`` (F04, additive) travels to ``get_json`` for budget /
+    trace propagation; a denied send is encapsulated as UNAVAILABLE (never
+    NOT_APPLICABLE, never raised). ``None`` preserves legacy behaviour.
     """
     as_of_ms = int(as_of_ms)
     now_ms = int(time.time() * 1000)
+    ctx = _resolve_spot_context(request_context)
     raw_spot = getattr(identity, "binance_spot_symbol", None)
     spot_symbol = raw_spot.strip().upper() if isinstance(raw_spot, str) else None
     if not spot_symbol:
@@ -454,7 +512,8 @@ async def spot_history(identity: Any, as_of_ms: int) -> ProviderResult[SpotHisto
         )
 
     try:
-        symbols = await _cached_spot_symbols()
+        with _maybe_scope(ctx):
+            symbols = await _cached_spot_symbols()
     except Exception as e:  # noqa: BLE001 — encapsulated as UNAVAILABLE
         return ProviderResult(
             status="UNAVAILABLE",
@@ -482,15 +541,16 @@ async def spot_history(identity: Any, as_of_ms: int) -> ProviderResult[SpotHisto
         )
 
     try:
-        spot_rows = await _spot_json(
-            "/klines",
-            {
-                "symbol": spot_symbol,
-                "interval": "1d",
-                "limit": SPOT_DAILY_LIMIT,
-                "endTime": window_end - 1,
-            },
-        )
+        with _maybe_scope(ctx):
+            spot_rows = await _spot_json(
+                "/klines",
+                {
+                    "symbol": spot_symbol,
+                    "interval": "1d",
+                    "limit": SPOT_DAILY_LIMIT,
+                    "endTime": window_end - 1,
+                },
+            )
     except Exception as e:  # noqa: BLE001 — encapsulated as UNAVAILABLE
         kind = _classify_spot_error(e)
         return ProviderResult(
@@ -609,3 +669,187 @@ async def spot_history(identity: Any, as_of_ms: int) -> ProviderResult[SpotHisto
         reason_code=reason,
         error_message=sanitize_error_message(message),
     )
+
+
+# ---------------------------------------------------------------------------
+# F02 observation wrappers (design A4.1/A4.2/A4.3; plan F02.1/F02.2).
+#
+# Legacy entry points above keep their exact signatures and return types.
+# The ``*_observed`` adapters below wrap the same results in
+# ``shortlab.observations.Observed``: ``value`` is the legacy return object
+# itself (``to_legacy`` returns the identical object/type),
+# ``meta.known_at_ms`` is the response-completion time, and an unknown
+# source time stays ``None``. Volumes stay quote-notional (Binance raw
+# index 7) and are never scaled by ``contract_multiplier`` -- only the
+# decimal ``premium`` is multiplier-normalised (see :func:`spot_history`).
+# ---------------------------------------------------------------------------
+
+_SPOT_SNAPSHOT_SOURCE = "binance-spot-snapshot"
+_SPOT_HISTORY_SOURCE = "binance-spot-history"
+
+# Observed-level mirror of the 60s snapshot cache: symbol -> (mono, Observed).
+# A hit returns the identical Observed (original known_at/source_as_of).
+_snapshot_observed_cache: dict[str, tuple[float, _obs.Observed[dict]]] = {}
+
+
+def reset_observation_cache() -> None:
+    """Drop the F02 snapshot ``Observed`` cache (test hook)."""
+    _snapshot_observed_cache.clear()
+
+
+async def snapshot_observed(
+    symbol: str,
+    perp_price: float,
+    perp_closes: list[float],
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
+) -> _obs.Observed[dict]:
+    """Cached ``spot_perp`` block wrapped as an ``Observed`` (F02).
+
+    Mirrors the 60s success-only TTL: a cache hit returns the identical
+    ``Observed`` with its original ``known_at_ms``. ``as_of_ms`` is
+    accepted for the downstream cutoff check only.
+    """
+    _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
+    now_mono = time.monotonic()
+    hit = _snapshot_observed_cache.get(symbol)
+    if hit is not None and now_mono - hit[0] < CACHE_TTL:
+        return hit[1]
+    block = await snapshot(symbol, perp_price, perp_closes, request_context=request_context)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    observed = _obs.make_observation(
+        block,
+        source=_SPOT_SNAPSHOT_SOURCE,
+        source_as_of_ms=None,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        status="OK" if "unavailable" not in block else "NOT_APPLICABLE",
+        reason_code=None if "unavailable" not in block else block.get("unavailable"),
+        units=_obs.ObservationUnits(quote_asset="USDT"),
+        identity_snapshot_id=identity_snapshot_id,
+    )
+    if "unavailable" not in block:
+        _snapshot_observed_cache[symbol] = (time.monotonic(), observed)
+    return observed
+
+
+async def spot_history_observed(
+    identity: Any,
+    as_of_ms: int,
+    *,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
+) -> _obs.Observed[ProviderResult[SpotHistory]]:
+    """60D Spot history wrapped as an ``Observed`` (F02).
+
+    ``value`` is the very ``ProviderResult`` :func:`spot_history` returns
+    (status/reason/data preserved); ``meta.known_at_ms`` is this response's
+    completion time. History results are not cached -- every call is fresh
+    (the underlying exchangeInfo list cache never refreshes a history
+    observation's ``known_at``). ``meta.source_as_of_ms`` is the UTC-midnight
+    window end; ``complete`` mirrors the ``OK`` window.
+    """
+    result = await spot_history(identity, as_of_ms, request_context=request_context)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    data = result.data
+    if data is not None:
+        window_start = data.window_start_ms
+        window_end = data.window_end_ms
+    else:
+        window_start, window_end = _spot_window_ms(int(as_of_ms))
+    return _obs.make_observation(
+        result,
+        source=_SPOT_HISTORY_SOURCE,
+        source_as_of_ms=window_end,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        status=result.status,
+        reason_code=result.reason_code,
+        window_start_ms=window_start,
+        window_end_ms=window_end,
+        complete=(result.status == "OK"),
+        coverage_fraction=1.0 if result.status == "OK" else 0.0,
+        units=_obs.ObservationUnits(
+            quote_asset="USDT",
+            multiplier_source=getattr(identity, "multiplier_source", None),
+        ),
+        identity_snapshot_id=identity_snapshot_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# H02 Hedge market-data helpers (design B10/B16.1; plan H02.1).
+#
+# The Hedge venue (`shortlab/hedge/venues/binance_spot.py`) reuses this Spot
+# client -- no duplicate Binance Spot client exists. Helpers below expose
+# exactly what Hedge needs on top of the historical `snapshot`/`spot_history`
+# paths (which stay untouched):
+#
+# - `fetch_spot_exchange_entry`: one exchangeInfo symbol entry (raw `filters`
+#   + `orderTypes` + `status`) for the shared `data/trading_rules.py` parser;
+# - `fetch_spot_book_ticker`: best bid/ask for the reference mid;
+# - `fetch_spot_depth`: raw bids/asks (price/qty verbatim) for level VWAP.
+#
+# Identity rule: callers pass the venue instrument ID that came from
+# `identity.binance_spot_symbol` (upper-cased, never 1000-prefix-stripped,
+# never derived from the futures symbol). Transport failures (451/403/429,
+# timeouts, budget denials) propagate to the venue, which maps them to
+# UNAVAILABLE (`VENUE_REGION_UNAVAILABLE`/`RATE_LIMITED`) -- never N/A.
+# Only an exchangeInfo-confirmed absence (entry None) may become
+# NOT_APPLICABLE upstream.
+# ---------------------------------------------------------------------------
+
+#: Hedge depth escalation budget (Spot limits 100/500/1000).
+SPOT_HEDGE_DEPTH_LIMITS: tuple[int, ...] = (100, 500, 1000)
+
+
+async def fetch_spot_exchange_entry(
+    symbol: str, *, request_context: RequestContext | None = None
+) -> dict | None:
+    """One Spot exchangeInfo symbol entry, or None when the list lacks it.
+
+    Returns the raw entry dict (with ``filters``/``orderTypes``/``status``)
+    for ``symbol`` (case-insensitive match). Raises on transport failure so
+    the venue can map 451/403/429 to UNAVAILABLE instead of N/A.
+    """
+    cleaned = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not cleaned:
+        raise ValueError("fetch_spot_exchange_entry requires a non-empty symbol")
+    ctx = _resolve_spot_context(request_context)
+    with _maybe_scope(ctx):
+        payload = await _spot_json("/exchangeInfo", {})
+    rows = payload.get("symbols", []) if isinstance(payload, dict) else []
+    for entry in rows:
+        if isinstance(entry, dict) and str(entry.get("symbol", "")).upper() == cleaned:
+            return entry
+    return None
+
+
+async def fetch_spot_book_ticker(
+    symbol: str, *, request_context: RequestContext | None = None
+) -> dict:
+    """Best bid/ask for ``symbol`` (``/ticker/bookTicker``)."""
+    cleaned = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not cleaned:
+        raise ValueError("fetch_spot_book_ticker requires a non-empty symbol")
+    ctx = _resolve_spot_context(request_context)
+    with _maybe_scope(ctx):
+        return await _spot_json("/ticker/bookTicker", {"symbol": cleaned})
+
+
+async def fetch_spot_depth(
+    symbol: str, limit: int = 100, *, request_context: RequestContext | None = None
+) -> dict:
+    """Raw Spot depth for ``symbol`` (``/depth``; bids/asks verbatim)."""
+    cleaned = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not cleaned:
+        raise ValueError("fetch_spot_depth requires a non-empty symbol")
+    if int(limit) not in (5, 10, 20, 50, 100, 500, 1000, 5000):
+        raise ValueError(f"spot depth limit must be a Binance limit, got {limit!r}")
+    ctx = _resolve_spot_context(request_context)
+    with _maybe_scope(ctx):
+        return await _spot_json("/depth", {"symbol": cleaned, "limit": int(limit)})

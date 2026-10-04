@@ -40,7 +40,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
+import re
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -107,6 +109,207 @@ class CoinGeckoNotFound(Exception):
 
 class CoinGeckoBadResponse(Exception):
     """Upstream 2xx payload is not a parseable coin document. Not retried."""
+
+
+class CoinGeckoUnconfigured(Exception):
+    """No API key / bad plan: the network directory is unavailable (UNCONFIGURED)."""
+
+
+# ---------------------------------------------------------------------------
+# F04: identity-directory routes and parsing (design A6.3).
+#
+# The ``/coins/list`` directory is fetched with ``include_platform=false``
+# (id/symbol/name only); platform/address enrichment for at most 50 bound
+# assets goes through per-coin documents. DEMO and PRO each pin a host AND
+# its key parameter together -- :func:`coingecko_route` returns both from
+# the single ``api_plan`` so the same key can never be sent to the other
+# host. Keys travel as query parameters because the shared ``data.http``
+# layer carries no header support (F03-frozen); every stored/logged URL is
+# passed through :func:`redact_coins_list_url` first.
+# ---------------------------------------------------------------------------
+
+#: Strict host + key-parameter pairs selected by ``api_plan``.
+COINGECKO_DEMO_BASE_URL = "https://api.coingecko.com"
+COINGECKO_PRO_BASE_URL = "https://pro-api.coingecko.com"
+COINGECKO_DEMO_KEY_PARAM = "x_cg_demo_api_key"
+COINGECKO_PRO_KEY_PARAM = "x_cg_pro_api_key"
+
+#: Expanded-response ceiling for the directory payload (design A6.3).
+COINGECKO_LIST_MAX_BYTES = 32 * 1024 * 1024
+
+#: Directory freshness (design A7.3 / default.yaml identity_profile).
+COINGECKO_DIRECTORY_TTL_SEC = 86400
+COINGECKO_DIRECTORY_GRACE_SEC = 259200
+
+#: Max bound assets enriched with platform/address per refresh (A6.3).
+COINGECKO_MAX_PLATFORM_DETAIL = 50
+
+IDENTITY_DIRECTORY_UNCONFIGURED = "UNCONFIGURED"
+
+
+@dataclass(frozen=True)
+class CoinDirectoryEntry:
+    """One validated ``/coins/list`` row (id/symbol/name only)."""
+
+    coin_id: str
+    symbol: str
+    name: str | None = None
+
+
+def coingecko_route(api_plan: str | None, api_key: str | None) -> tuple[str, str]:
+    """Return ``(base_url, key_param)`` for ``api_plan`` (``"demo"``/``"pro"``).
+
+    Raises :class:`CoinGeckoUnconfigured` (UNCONFIGURED, key-free message)
+    when the key is missing/blank, and ``ValueError`` for an unknown plan --
+    both before any HTTP is attempted.
+    """
+    plan = str(api_plan or "demo").strip().lower()
+    key = api_key.strip() if isinstance(api_key, str) else ""
+    if plan == "demo":
+        route = (COINGECKO_DEMO_BASE_URL, COINGECKO_DEMO_KEY_PARAM)
+    elif plan == "pro":
+        route = (COINGECKO_PRO_BASE_URL, COINGECKO_PRO_KEY_PARAM)
+    else:
+        raise ValueError(f"unknown coingecko api_plan: {api_plan!r}")
+    if not key:
+        raise CoinGeckoUnconfigured(
+            f"{IDENTITY_DIRECTORY_UNCONFIGURED}: no CoinGecko API key for "
+            f"plan={plan!r}; only the local verified set is available"
+        )
+    return route
+
+
+def build_coins_list_request(
+    base_url: str,
+    api_key: str,
+    api_plan: str | None,
+    *,
+    include_platform: bool = False,
+) -> tuple[str, dict[str, str]]:
+    """Build the ``(url, params)`` pair for the directory list.
+
+    Pure function (no I/O): the key parameter name always matches the host
+    implied by ``api_plan`` (strict pairing enforced by
+    :func:`coingecko_route`).
+    """
+    route_base, key_param = coingecko_route(api_plan, api_key)
+    base = (base_url or route_base).rstrip("/")
+    if base != route_base:
+        # A custom base must still pair with the plan's host family; refuse
+        # to send a demo key at the pro host and vice versa.
+        raise ValueError(
+            f"coingecko base_url {base_url!r} does not match api_plan={api_plan!r}"
+        )
+    url = f"{base}/api/v3/coins/list"
+    params = {
+        "include_platform": "true" if include_platform else "false",
+        key_param: api_key,
+    }
+    return url, params
+
+
+def build_coin_detail_request(
+    base_url: str, api_key: str, api_plan: str | None, coin_id: str
+) -> tuple[str, dict[str, str]]:
+    """Build the ``(url, params)`` pair for one per-coin platform document."""
+    route_base, key_param = coingecko_route(api_plan, api_key)
+    base = (base_url or route_base).rstrip("/")
+    if base != route_base:
+        raise ValueError(
+            f"coingecko base_url {base_url!r} does not match api_plan={api_plan!r}"
+        )
+    slug = urllib.parse.quote(str(coin_id).strip(), safe="")
+    return f"{base}/api/v3/coins/{slug}", {
+        "localization": "false",
+        "tickers": "false",
+        "market_data": "false",
+        "community_data": "false",
+        "developer_data": "false",
+        "sparkline": "false",
+        key_param: api_key,
+    }
+
+
+def redact_coins_list_url(url: str, params: Mapping[str, Any] | None = None) -> str:
+    """Render a log-safe URL with key-parameter values replaced by ``***``."""
+    text = str(url)
+    for param in (COINGECKO_DEMO_KEY_PARAM, COINGECKO_PRO_KEY_PARAM):
+        text = re.sub(rf"([?&]{param}=)[^&\s]*", r"\1***", text)
+    if params:
+        query = urllib.parse.urlencode(
+            sorted(
+                (k, ("***" if k in (COINGECKO_DEMO_KEY_PARAM, COINGECKO_PRO_KEY_PARAM) else v))
+                for k, v in params.items()
+            )
+        )
+        text = f"{text}?{query}" if query else text
+    return text
+
+
+def coins_list_size_bytes(payload: Any) -> int:
+    """Expanded size of a directory payload (canonical JSON, UTF-8)."""
+    try:
+        return len(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    except (TypeError, ValueError):
+        return COINGECKO_LIST_MAX_BYTES + 1
+
+
+def parse_coins_list(
+    payload: Any, *, max_bytes: int = COINGECKO_LIST_MAX_BYTES
+) -> tuple[CoinDirectoryEntry, ...]:
+    """Validate a ``/coins/list`` payload into directory entries.
+
+    Raises :class:`CoinGeckoBadResponse` when the payload is not a list of
+    ``{id, symbol, name}`` objects or exceeds ``max_bytes`` -- the caller
+    keeps the previous cache on any such failure (atomic replace only after
+    this check passes).
+    """
+    if coins_list_size_bytes(payload) > max_bytes:
+        raise CoinGeckoBadResponse(
+            f"coins/list payload exceeds {max_bytes} bytes; refusing to cache"
+        )
+    if not isinstance(payload, list):
+        raise CoinGeckoBadResponse("coins/list payload must be a list")
+    entries: list[CoinDirectoryEntry] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            raise CoinGeckoBadResponse("coins/list row must be an object")
+        coin_id = row.get("id")
+        symbol = row.get("symbol")
+        name = row.get("name")
+        if not isinstance(coin_id, str) or not coin_id.strip():
+            raise CoinGeckoBadResponse("coins/list row misses string id")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise CoinGeckoBadResponse("coins/list row misses string symbol")
+        if name is not None and not isinstance(name, str):
+            raise CoinGeckoBadResponse("coins/list row has non-string name")
+        entries.append(
+            CoinDirectoryEntry(coin_id=coin_id.strip(), symbol=symbol.strip(), name=name)
+        )
+    return tuple(entries)
+
+
+def parse_coin_platforms(payload: Any) -> dict[str, str]:
+    """Extract ``{platform: address}`` from one per-coin document.
+
+    Non-empty string addresses only; unknown/missing ``platforms`` yields
+    ``{}`` (the coin simply carries no chain binding yet).
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for platform, address in platforms.items():
+        if (
+            isinstance(platform, str)
+            and platform.strip()
+            and isinstance(address, str)
+            and address.strip()
+        ):
+            out[platform.strip().lower()] = address.strip()
+    return out
 
 
 @dataclass(frozen=True)
@@ -299,6 +502,7 @@ class CoinGeckoProvider:
         sleep: _Sleeper | None = None,
         limiter: AsyncLimiter | None = None,
         fetcher: _Fetcher | None = None,
+        transport_verified: bool | None = None,
     ) -> None:
         self._base_url = base_url
         self._timeout_sec = timeout_sec
@@ -308,6 +512,12 @@ class CoinGeckoProvider:
         self._sleep = sleep
         self._limiter_override = limiter
         self._fetcher = fetcher or self._default_fetcher
+        # Only a real network transport counts as verified (F04.4): injected
+        # test doubles stay unverified unless explicitly flagged, so FULL
+        # skeletons can never register as READY-capable.
+        self.transport_verified = (fetcher is None) if transport_verified is None else bool(
+            transport_verified
+        )
         self._cache: dict[str, _CacheEntry] = {}
 
     @property
@@ -522,22 +732,40 @@ __all__ = [
     "COINGECKO_BAD_RESPONSE",
     "COINGECKO_BASE_URL",
     "COINGECKO_CLIENT_ERROR",
+    "COINGECKO_DEMO_BASE_URL",
+    "COINGECKO_DEMO_KEY_PARAM",
+    "COINGECKO_DIRECTORY_GRACE_SEC",
+    "COINGECKO_DIRECTORY_TTL_SEC",
+    "COINGECKO_LIST_MAX_BYTES",
     "COINGECKO_MAX_PER_MIN",
+    "COINGECKO_MAX_PLATFORM_DETAIL",
     "COINGECKO_NETWORK_ERROR",
     "COINGECKO_PERIOD_SEC",
+    "COINGECKO_PRO_BASE_URL",
+    "COINGECKO_PRO_KEY_PARAM",
     "COINGECKO_RATE_LIMITED",
     "COINGECKO_TIMEOUT",
     "COINGECKO_UNKNOWN_ID",
     "COINGECKO_UPSTREAM_ERROR",
+    "IDENTITY_DIRECTORY_UNCONFIGURED",
     "IDENTITY_NOT_MAPPED",
     "MARKET_TTL_SEC",
     "PROVIDER_NAME",
     "SUPPLY_GRACE_SEC",
     "SUPPLY_TTL_SEC",
+    "CoinDirectoryEntry",
     "CoinGeckoBadResponse",
     "CoinGeckoNotFound",
     "CoinGeckoProvider",
+    "CoinGeckoUnconfigured",
     "Fundamentals",
+    "build_coin_detail_request",
     "build_coin_request",
+    "build_coins_list_request",
+    "coingecko_route",
+    "coins_list_size_bytes",
     "parse_coin_document",
+    "parse_coin_platforms",
+    "parse_coins_list",
+    "redact_coins_list_url",
 ]

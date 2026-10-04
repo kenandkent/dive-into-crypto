@@ -79,6 +79,7 @@ shortlab:
     coingecko:
       enabled: true
       api_key_env: DIVE_COINGECKO_API_KEY
+      api_plan: DEMO
     unlock:
       enabled: false
       api_key_env: DIVE_TOKENOMIST_API_KEY
@@ -88,3 +89,290 @@ shortlab:
     catalyst:
       enabled: false
       api_key_env: null
+
+  identity:
+    catalog_ttl_sec: 86400
+    overrides_path_env: SHORTLAB_IDENTITY_OVERRIDES_PATH
+    catalog_grace_sec: 259200
+    catalog_include_platform: false
+    catalog_max_bytes: 33554432
+    platform_detail_batch_size: 50
+
+  ingestion:
+    market_concurrency: 4
+    max_source_future_skew_sec: 2
+    contract_refresh_sec: 1800
+    funding_backfill_sec: 300
+    funding_repair_overlap_intervals: 1
+    monitor_reserved_fraction: 0.2
+    scanner_reserved_fraction: 0.3
+    db_queue_limit: 256
+    db_persist_timeout_sec: 5
+    db_priority_aging_sec: 30
+
+  evidence:
+    default_history_days: 180
+    grader_batch_size: 100
+    sample_policy: first_eligible_per_symbol_profile_utc_day
+
+  maintenance:
+    retention_sec: 86400
+    snapshot_min_days: 180
+    batch_delete_limit: 1000
+
+  funding_capture:
+    enabled: false
+    fcs_version: fcs_v1
+    reference_notional_usd: 10000
+    entry_gate:
+      require_current_positive: true
+      require_last_settled_positive: true
+      min_funding_7d: 0.0
+      min_funding_30d: 0.0
+      min_positive_ratio_30d: 0.75
+      min_positive_ratio_90d: 0.6
+      min_30d_coverage: 0.9
+      min_90d_coverage: 0.8
+    exit:
+      negative_settlement_streak: 2
+      weakening_7d_vs_30d_ratio: 0.3
+    statistics:
+      std_reference_hours: 8
+      std_ddof: 0
+      rolling_window_days: 7
+      p25_method: LINEAR_N_MINUS_1
+      min_windows_30d: 20
+      min_windows_90d: 60
+      window_boundary: LEFT_OPEN_RIGHT_CLOSED
+    score_rules:
+      module_weights:
+        funding_yield: 25
+        funding_persistence: 25
+        funding_stability: 15
+        hedge_venue_quality: 15
+        basis_quality: 10
+        operational_safety: 10
+      yield_30d:
+        positive_fallback: 3
+        min_inclusive_bins:
+        - - 0.04
+          - 25
+        - - 0.025
+          - 20
+        - - 0.015
+          - 15
+        - - 0.0075
+          - 8
+        non_positive: 0
+      positive_ratio_30d:
+        min_inclusive_bins:
+        - - 0.9
+          - 15
+        - - 0.8
+          - 12
+        - - 0.75
+          - 9
+        - - 0.65
+          - 5
+        fallback: 0
+      positive_ratio_90d:
+        min_inclusive_bins:
+        - - 0.9
+          - 10
+        - - 0.8
+          - 8
+        - - 0.7
+          - 5
+        - - 0.6
+          - 2
+        fallback: 0
+        not_applicable_score: 0
+      std_30d:
+        max_inclusive_bins:
+        - - 0.0003
+          - 8
+        - - 0.0008
+          - 5
+        - - 0.0015
+          - 2
+        fallback: 0
+      negative_streak:
+        exact_bins:
+        - - 0
+          - 7
+        - - 1
+          - 6
+        - - 2
+          - 3
+        - - 3
+          - 1
+        fallback: 0
+      venue:
+        min_coverage_bins:
+        - - 1.0
+          - 7
+        - - 0.75
+          - 4
+        - - 0.5
+          - 2
+        coverage_fallback: 0
+        roundtrip_cost_max_bins:
+        - - 0.003
+          - 5
+        - - 0.006
+          - 3
+        - - 0.01
+          - 1
+        cost_fallback: 0
+        exit_scores:
+          CONFIRMED: 3
+          PARTIAL: 1
+          UNKNOWN: 0
+          'NO': 0
+      basis:
+        nonnegative_max_bins:
+        - - 0.005
+          - 10
+        - - 0.015
+          - 8
+        - - 0.03
+          - 5
+        positive_above: 2
+        negative_floor: -0.005
+        negative_at_or_above: 3
+        negative_below: 0
+      operational:
+        trading: 2
+        no_delisting: 2
+        identity: 2
+        multiplier: 2
+        quote_fresh: 1
+        funding_time: 1
+  hedge:
+    enabled: false
+    ratio:
+      drift_warn_pct: 0.02
+      drift_critical_pct: 0.05
+    execution:
+      max_price_impact_bps: 30
+      max_manual_chunk_usd: 5000
+    liquidation:
+      warning_distance: 0.2
+      critical_distance: 0.1
+      emergency_distance: 0.05
+      user_price_max_age_sec: 86400
+    basis:
+      warning_vs_accrued_funding: 0.5
+      exit_vs_accrued_funding: 1.0
+      warning_min_usd: 10
+      warning_min_notional_ratio: 0.001
+      exit_min_usd: 20
+      exit_min_notional_ratio: 0.002
+      fresh_max_skew_sec: 5
+      reference_max_skew_sec: 30
+    liquidity_monitor:
+      max_exit_slippage_bps: 100
+      min_exit_coverage_ratio: 1.0
+    freshness:
+      futures_mark:
+        ttl: 20
+        grace: 60
+      spot_quote:
+        ttl: 20
+        grace: 60
+      spot_depth:
+        ttl: 60
+        grace: 180
+      alpha_quote:
+        ttl: 20
+        grace: 60
+      funding_current:
+        ttl: 120
+        grace: 300
+      onchain_quote:
+        ttl: 90
+        grace: 180
+      contract_status:
+        ttl: 900
+        grace: 1800
+    refresh:
+      opportunity_sec: 1800
+      active_mark_sec: 10
+      active_basis_sec: 10
+      active_funding_sec: 60
+      active_depth_sec: 30
+      active_onchain_quote_sec: 30
+      active_alpha_quote_sec: 10
+      contract_status_sec: 600
+      funding_settlement_check_sec: 30
+      monitor_persist_sec: 60
+    costs:
+      futures_entry_fee_rate: 0.0005
+      futures_exit_fee_rate: 0.0005
+      spot_entry_fee_rate: 0.001
+      spot_exit_fee_rate: 0.001
+      alpha_entry_fee_rate: 0.001
+      alpha_exit_fee_rate: 0.001
+      onchain_extra_buffer_bps: 20
+    providers:
+      binance_spot:
+        enabled: true
+      binance_alpha:
+        enabled: false
+      onchain:
+        enabled: false
+        provider: ETHEREUM_0X_PRICE_V2
+        chain_id: 1
+        base_url: https://api.0x.org
+        api_key_env: SHORTLAB_0X_API_KEY
+        api_version: v2
+        quote_kind: INDICATIVE
+        quote_asset: USDC
+        quote_ttl_sec: 30
+        requests_per_sec: 1
+        concurrency: 1
+    runtime:
+      max_active_symbols: 10
+      db_queue_limit: 256
+      db_persist_timeout_sec: 5
+      monitor_priority: 0
+      background_priority: 3
+      retention_priority: 4
+    fx:
+      policy: OBSERVED_QUOTE_TO_USD
+      max_age_sec: 60
+      historical_policy: AT_EVENT_NO_INTERPOLATION
+    quality:
+      group_weights:
+        funding: 30
+        futures: 20
+        spot_venue: 25
+        identity_units: 15
+        contract_time: 10
+      field_shares:
+        funding:
+          current_rate_time: 20
+          next_time_interval: 10
+          history_7d: 10
+          history_30d: 30
+          history_90d: 20
+          std_rolling: 10
+        futures:
+          mark_time: 25
+          exit_depth_vwap: 40
+          trading_rules: 25
+          symbol_status: 10
+        spot_venue:
+          buy_quote: 25
+          sell_quote: 35
+          rules_decimals: 20
+          cost_fee_gas: 20
+        identity_units:
+          asset_identity: 50
+          multiplier: 30
+          quote_usd_fx: 20
+        contract_time:
+          lifecycle: 50
+          source_time: 10
+          time_alignment: 20
+          heartbeat: 20

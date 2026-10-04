@@ -15,8 +15,8 @@ Kotlin with matching unit tests.
 
 ```bash
 uv sync
-uv run short-lab                            # starts the service and opens the UI (127.0.0.1:8780)
-uv run short-lab --no-open --port 8780
+uv run short-lab                            # starts the service and opens the UI (127.0.0.1:46408)
+uv run short-lab --no-open --port 46408
 uv run dive-desktop                         # legacy alias, same __main__:main entry
 ```
 

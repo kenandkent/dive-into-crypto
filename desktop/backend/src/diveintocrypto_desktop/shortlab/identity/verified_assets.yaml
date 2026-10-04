@@ -1,0 +1,56 @@
+# short-lab verified asset directory, layer 1 (F04, design A6.3).
+#
+# - Human-verified canonical/provider IDs, chain/address and multiplier
+#   provenance for the ordinary 1x set and the 1000-denomination test set.
+#   Startup loads this file first and never waits on the network directory.
+# - Entries overlapping `asset_overrides.yaml` MUST agree field-for-field
+#   (canonical_id, coingecko_id, binance_spot_symbol, contract_multiplier,
+#   chain, contract_address); the catalog test suite asserts this.
+# - `contract_multiplier` needs an explicit `multiplier_source` (MANUAL here:
+#   every row below was verified by a human). A bare `1000` prefix never
+#   verifies a multiplier.
+# - Native assets (BTC, ETH) carry no contract address; ETH records its
+#   settlement chain without an address so nothing lowercases a guess.
+version: 1
+assets:
+  "BTCUSDT":
+    canonical_id: "bitcoin"
+    display_symbol: "BTC"
+    name: "Bitcoin"
+    binance_spot_symbol: "BTCUSDT"
+    contract_multiplier: 1
+    multiplier_source: "MANUAL"
+    coingecko_id: "bitcoin"
+    categories: ["layer-1"]
+  "ETHUSDT":
+    canonical_id: "ethereum"
+    display_symbol: "ETH"
+    name: "Ethereum"
+    binance_spot_symbol: "ETHUSDT"
+    contract_multiplier: 1
+    multiplier_source: "MANUAL"
+    coingecko_id: "ethereum"
+    chain: "ethereum"
+    categories: ["layer-1", "smart-contract-platform"]
+  "1000PEPEUSDT":
+    canonical_id: "pepe"
+    display_symbol: "PEPE"
+    name: "Pepe"
+    binance_spot_symbol: "PEPEUSDT"
+    contract_multiplier: 1000
+    multiplier_source: "MANUAL"
+    coingecko_id: "pepe"
+    chain: "ethereum"
+    contract_address: "0x6982508145454ce325ddbe47a25d4ec3d2311933"
+    categories: ["meme"]
+  "1000SHIBUSDT":
+    canonical_id: "shiba-inu"
+    display_symbol: "SHIB"
+    name: "Shiba Inu"
+    binance_spot_symbol: "SHIBUSDT"
+    contract_multiplier: 1000
+    multiplier_source: "MANUAL"
+    coingecko_id: "shiba-inu"
+    chain: "ethereum"
+    contract_address: "0x95ad61b0a150d79219dcf64e1e6ccfad2e6e7f3af"
+    categories: ["meme"]

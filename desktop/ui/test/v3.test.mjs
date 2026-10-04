@@ -39,6 +39,7 @@ async function loadData(store = new Map()) {
 /* ── 1. Wilson display formatter ─────────────────────────────────────────── */
 test("sgsHitLabel renders the Wilson interval, gated and suppressed states", async () => {
   await loadData();
+  globalThis.localStorage.setItem("dive_lang", "tr");   // loadData store is Map-backed
   // healthy: "57% [45–89] · n=214"
   assert.equal(
     window.sgsHitLabel({ n: 214, hit_rate: 0.57, wilson_lo: 0.45, wilson_hi: 0.89 }),
@@ -290,6 +291,9 @@ const mkEvidence = () => ({
 
 test("KANIT v2 renders Wilson labels, gated warnings and every v2 panel", async () => {
   const app = await loadBundle();
+  globalThis.localStorage = { _m: new Map([["dive_lang", "tr"]]),
+    getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
+    setItem(k, v) { this._m.set(k, String(v)); } };   // legacy TR chrome pins
   const { renderToStaticMarkup } = await import("react-dom/server");
   window.SGS_EVIDENCE = mkEvidence();
   const html = renderToStaticMarkup(React.createElement(app.Evidence, { horizon: "4h", setHorizon: () => {} }));
@@ -348,13 +352,17 @@ test("reliability diagram: empty-bin dash sits at the bucket center, not its low
   assert.ok(html.includes('class="rd-empty"'), "absence dash keeps its honest-empty class");
 });
 
-test("gated-sample label is routed through L(): TR default verbatim, EN translated", async () => {
+test("gated-sample label is routed through L(): ZH default, TR/EN explicit", async () => {
   const app = await loadBundle();
   const { renderToStaticMarkup } = await import("react-dom/server");
   window.SGS_EVIDENCE = mkEvidence();
+  const zh = renderToStaticMarkup(React.createElement(app.Evidence, { horizon: "4h", setHorizon: () => {} }));
+  assert.ok(zh.includes("样本不足 (n=9 &lt; 20)") || zh.includes("样本不足 (n=9 < 20)"),
+    "ZH is the default");
+  globalThis.localStorage = { getItem: (k) => (k === "dive_lang" ? "tr" : null), setItem: () => {} };
   const tr = renderToStaticMarkup(React.createElement(app.Evidence, { horizon: "4h", setHorizon: () => {} }));
   assert.ok(tr.includes("yetersiz örnek (n=9 &lt; 20)") || tr.includes("yetersiz örnek (n=9 < 20)"),
-    "TR stays the verbatim default");
+    "TR stays verbatim when explicitly selected");
   globalThis.localStorage = { getItem: (k) => (k === "dive_lang" ? "en" : null), setItem: () => {} };
   const en = renderToStaticMarkup(React.createElement(app.Evidence, { horizon: "4h", setHorizon: () => {} }));
   assert.ok(en.includes("insufficient sample (n=9 &lt; 20)") || en.includes("insufficient sample (n=9 < 20)"),
@@ -364,6 +372,9 @@ test("gated-sample label is routed through L(): TR default verbatim, EN translat
 
 test("PANEL renders the v0.3 depth cards and every unavailable block stays honest", async () => {
   const app = await loadBundle();
+  globalThis.localStorage = { _m: new Map([["dive_lang", "tr"]]),
+    getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
+    setItem(k, v) { this._m.set(k, String(v)); } };   // legacy TR chrome pins
   const { renderToStaticMarkup } = await import("react-dom/server");
   window.SGS_EVIDENCE = mkEvidence();
   window.SGS_STABILITY = [{ s: "BTCUSDT", agree_frac: 0.875, k: 8, median_gap_min: 30, last_ts: 1 }];
@@ -396,6 +407,9 @@ test("PANEL renders the v0.3 depth cards and every unavailable block stays hones
 
 test("HARİTA/PORTFÖY/YAPI render honest tiles, ledger and cluster explorer", async () => {
   const app = await loadBundle();
+  globalThis.localStorage = { _m: new Map([["dive_lang", "tr"]]),
+    getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
+    setItem(k, v) { this._m.set(k, String(v)); } };   // legacy TR chrome pins
   const { renderToStaticMarkup } = await import("react-dom/server");
   // HARİTA (TARAMA default): tiles from scan survivors
   window.SGS_SCAN = { survivors: [{ d: mkSymbol(), rank: 1 }], eliminated: [], scanned: 60, universeCount: 437 };
@@ -405,7 +419,7 @@ test("HARİTA/PORTFÖY/YAPI render honest tiles, ledger and cluster explorer", a
   assert.ok(map.includes("BTC"), "survivor tile");
   // PORTFÖY: rows from localStorage render with honest totals
   globalThis.localStorage = {
-    _m: new Map(),
+    _m: new Map([["dive_lang", "tr"]]),
     getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
     setItem(k, v) { this._m.set(k, String(v)); },
   };

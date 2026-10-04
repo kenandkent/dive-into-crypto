@@ -34,34 +34,39 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
   const [detail, setDetail] = React.useState(initial && initial.data ? initial.data : null);
   const [err, setErr] = React.useState(initial && initial.error ? initial.error : null);
   const [loading, setLoading] = React.useState(!(initial && (initial.data || initial.error)));
+  const seqRef = React.useRef(0);
 
   React.useEffect(() => {
     if (initial && (initial.data || initial.error)) return;  // deterministic test path
+    const seq = ++seqRef.current;
     let live = true;
+    const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     setLoading(true); setErr(null);
-    window.DIVE.shortDetail(symbol, generationId ? { generationId } : {})
-      .then((d) => { if (live) { setDetail(d); setLoading(false); } })
-      .catch((e) => { if (live) { setErr((e && e.message) || String(e)); setLoading(false); } });
-    return () => { live = false; };
-  }, [symbol]);
+    // Read-only pinned generation: the backend serves SUCCEEDED generations only.
+    window.DIVE.shortDetail(symbol, { generationId, ...(ctrl ? { signal: ctrl.signal } : {}) })
+      .then((d) => { if (live && seq === seqRef.current) { setDetail(d); setLoading(false); } })
+      .catch((e) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        if (live && seq === seqRef.current) { setErr((e && e.message) || String(e)); setLoading(false); }
+      });
+    return () => { live = false; if (ctrl) { try { ctrl.abort(); } catch (e) {} } };
+  }, [symbol, generationId]);
 
   if (loading) {
     return <div className="state" style={{ height: 220 }} data-testid="shortlab-detail-loading">
-      <div className="spin" /><div>Short-Lab detayı yükleniyor…</div></div>;
+      <div className="spin" /><div>{L("sl_detail_loading")}</div></div>;
   }
   if (err) {
     const unavailable = /503|shortlab_unavailable/i.test(String(err));
     return (
       <div className="state src-down" role="alert"
         data-testid={unavailable ? "shortlab-detail-unavailable" : "shortlab-detail-error"}>
-        <div className="sd-title">SHORT LAB {unavailable ? "KULLANILAMIYOR · UNAVAILABLE" : "HATASI · ERROR"}</div>
-        <div className="sd-body">{unavailable
-          ? "Short-Lab servisi şu an yanıt vermiyor. Başka sayfalar çalışmaya devam eder — bu görünüm veri uydurmaz."
-          : "Detay yüklenemedi."}</div>
+        <div className="sd-title">SHORT LAB {unavailable ? L("sl_unavailable_title") : L("sl_error_title")}</div>
+        <div className="sd-body">{unavailable ? L("sl_detail_unavailable_body") : L("sl_detail_error_body")}</div>
         <div className="sd-err">{String(err)}</div>
         <div style={{ display: "flex", gap: 8 }}>
-          {onBack && <button className="cta" style={{ background: "transparent", color: "var(--dim)", border: "1px solid var(--line2)" }} onClick={onBack}>← LİSTE</button>}
-          <button className="cta" onClick={() => window.DIVE.shortDetail(symbol, generationId ? { generationId } : {}).then(setDetail).catch((e) => setErr((e && e.message) || String(e)))}>TEKRAR DENE · RETRY</button>
+          {onBack && <button className="cta" style={{ background: "transparent", color: "var(--dim)", border: "1px solid var(--line2)" }} onClick={onBack}>{L("sl_back_list")}</button>}
+          <button className="cta" onClick={() => window.DIVE.shortDetail(symbol, generationId ? { generationId } : {}).then(setDetail).catch((e) => setErr((e && e.message) || String(e)))}>{L("sl_retry")}</button>
         </div>
       </div>
     );
@@ -88,21 +93,21 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
   return (
     <div className="sl-detail" data-testid="shortlab-detail">
       <div className="vhead">
-        <span className="kicker">SHORT LAB · DETAY</span><h1>{d.symbol || symbol}</h1>
+        <span className="kicker">{L("sl_detail_kicker")}</span><h1>{d.symbol || symbol}</h1>
         <div className="meta">{d.profile || "—"} · {slTierTag(d.analysisTier)} · {d.scoreVersion || ""}</div>
       </div>
       <div className="scanbar sl-bar">
-        {onBack && <button className="chip" onClick={onBack}>← LİSTE</button>}
+        {onBack && <button className="chip" onClick={onBack}>{L("sl_back_list")}</button>}
         <span className={"pill " + (status === "READY" ? "b" : status === "BLOCKED" ? "s" : "n")}>
           <span className="g" />{slStatusLabel(status, d.analysisTier)}</span>
-        {d.stale && <span className="tag hot" title="score TTL aşıldı ya da READY girdisi bayatladı — salt okunur projeksiyon, yeniden hesap yok">STALE</span>}
+        {d.stale && <span className="tag hot" title={L("sl_stale_title")}>STALE</span>}
         <span className="sbcap">as-of {slFmtMs(d.asOfMs)} · generation {(d.generationId || "").slice(0, 18)}</span>
       </div>
 
       <div className="grid2">
         <div className="panel"><div className="ph"><span className="tick">▸</span>SUMMARY</div><div className="pb" style={{ padding: 0 }}>
           <SlStat k="LTSS" v={slFmtScore(d.ltss)} />
-          <SlStat k="ENTRY" v={slFmtEntry(d.entryScore)} sub={entry ? ("entry " + (entry.entryVersion || "")) : "not computed"} />
+          <SlStat k="ENTRY" v={slFmtEntry(d.entryScore)} sub={entry ? ("entry " + (entry.entryVersion || "")) : L("sl_entry_not_computed_short")} />
           <SlStat k="DATA QUALITY" v={slFmtDQ(d.dataQuality)} sub={d.snapshotDataQuality != null ? ("snapshot " + slFmtDQ(d.snapshotDataQuality)) : null} />
           <SlStat k="CANDIDATE" v={d.candidateStatus || "—"} />
           <SlStat k="EXECUTION" v={d.executionStatus || "—"} />
@@ -114,7 +119,7 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
             .map((c) => <SlStat key={"r" + c} k={"NOT_READY · " + c} v={slReasonText(c)} />)}
           {(d.warnings || []).map((c) => <SlStat key={"w" + c} k={"WARN · " + c} v={slReasonText(c)} />)}
           {!(d.vetoes || []).length && !(d.pauses || []).length && !(d.reasons || []).length && !(d.warnings || []).length &&
-            <div className="reason">Kural tetiklenmedi · no risk codes on this snapshot.</div>}
+            <div className="reason">{L("sl_no_risk")}</div>}
         </div></div>
       </div>
 
@@ -127,7 +132,7 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
         </div></div>
         <div className="panel"><div className="ph"><span className="tick">▸</span>CARRY</div><div className="pb" style={{ padding: 0 }}>
           <SlStat k="30D FUNDING" v={m.funding30d != null ? slFmtFundingDecimal(m.funding30d) : valOrNa([["features", "_inputs", "funding_30d"]], (v) => slFmtFundingDecimal(v), ["funding_30d"])} />
-          <SlStat k="30D FUNDING APR" v={m.funding30d != null ? slFmtFundingDecimal(m.funding30d * 365 / 30) : "—"} sub="tarihsel basit yıllıklandırma · hist. simple annual." />
+          <SlStat k="30D FUNDING APR" v={m.funding30d != null ? slFmtFundingDecimal(m.funding30d * 365 / 30) : "—"} sub={L("sl_apr_sub")} />
           <SlStat k="30D POSITIVE RATIO" v={slFmtShare(m.positiveFundingRatio30d)} />
           <SlStat k="OI / MC" v={m.oiMarketCapRatio != null ? slFmtRatio(m.oiMarketCapRatio) : valOrNa([["features", "_inputs", "oi_mc"]], (v) => slFmtRatio(v), ["oi_usd", "market_cap"])} />
           <SlStat k="FUTURES / SPOT" v={slFieldText(m.futuresSpotVolumeRatio, (v) => slFmtRatio(v), avail.spot)} />
@@ -140,15 +145,15 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
           <SlStat k="FDV" v={valOrNa([["features", "_inputs", "fdv_usd"]], (v) => "$" + slFmtUsd(v), ["fdv"])} />
           <SlStat k="FDV / MC" v={valOrNa([["features", "_inputs", "fdv_mc"], ["features", "valuation", "factors", "fdv_mc", "value"]], (v) => slFmtRatio(v), ["market_cap", "fdv"])} />
           <SlStat k="FLOAT RATIO" v={valOrNa([["features", "_inputs", "float_ratio"]], (v) => slFmtShare(v), ["supply_float"])} />
-          <div className="gcap">Kullanılamayan alan N/A (piyasa yok) ya da — (veri yok) gösterir · unavailable fields show N/A or —, never 0.</div>
+          <div className="gcap">{L("sl_gcap_valuation")}</div>
         </div></div>
         <div className="panel mute"><div className="ph"><span className="tick">▸</span>TOKENOMICS · NARRATIVE</div><div className="pb" style={{ padding: 0 }}>
-          <div className="reason">Phase 5 — unlock/social provider bağlı değil · not wired in LITE, no fabricated values.</div>
+          <div className="reason">{L("sl_tokenomics_placeholder")}</div>
         </div></div>
       </div>
 
       <div className="panel"><div className="ph"><span className="tick">▸</span>EXISTING DIVE · ENTRY REFERENCE</div><div className="pb" style={{ padding: 0 }}>
-        {!entry && <div className="reason">Entry hesaplanmadı — entryScore null (nedenler yukarıda) · entry not computed.</div>}
+        {!entry && <div className="reason">{L("sl_entry_not_computed")}</div>}
         {entry && (
           <div>
             <SlStat k="ENTRY SCORE" v={slFmtEntry(entry.entryScore)} sub={entry.entryVersion || ""} />
@@ -171,7 +176,7 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
       <div className="panel"><div className="ph"><span className="tick">▸</span>DATA SOURCES · fetchedAt / stale / unavailable</div>
         <div className="pb" style={{ padding: 0 }}>
           <table className="itbl"><tbody>
-            {Object.keys(sources).length === 0 && <tr><td className="nm">kaynak meta yok · no source meta on snapshot</td></tr>}
+            {Object.keys(sources).length === 0 && <tr><td className="nm">{L("sl_no_source_meta")}</td></tr>}
             {Object.entries(sources).map(([field, meta]) => (
               <tr key={field}>
                 <td className="nm">{field}</td>
@@ -182,7 +187,7 @@ function ShortLabDetail({ symbol, onBack, generationId, initial }) {
               </tr>
             ))}
           </tbody></table>
-          <div className="gcap">N/A = teyitli yokluk (örn. spot piyasası yok) · UNAVAILABLE = geçici erişilemezlik. İkisi ayrı gösterilir.</div>
+          <div className="gcap">{L("sl_gcap_na")}</div>
         </div></div>
     </div>
   );

@@ -14,11 +14,67 @@ DTOs live in ``shortlab.models`` (frozen by Task 1); this module imports
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from diveintocrypto_desktop.shortlab.models import ProviderResult
 
 PROVIDER_NOT_CONFIGURED = "PROVIDER_NOT_CONFIGURED"
+
+#: A provider without a verified real-HTTP transport (skeleton, ``.example``
+#: fixture or injected fake without an explicit opt-in) must never register
+#: as a READY-capable provider (F04.4 / design A6.3: FULL needs real request,
+#: schema, identity, time and cost-limit contract verification).
+PROVIDER_TRANSPORT_UNVERIFIED = "PROVIDER_TRANSPORT_UNVERIFIED"
+
+
+@dataclass(frozen=True)
+class ProviderCapability:
+    """READY-eligibility of one provider instance (F04).
+
+    ``ready`` is True only for a registered, non-``.example`` provider whose
+    ``transport_verified`` flag confirms a real HTTP transport. ``reason_code``
+    is ``None`` when ready, otherwise ``PROVIDER_NOT_CONFIGURED`` or
+    ``PROVIDER_TRANSPORT_UNVERIFIED``.
+    """
+
+    name: str
+    ready: bool
+    reason_code: str | None = None
+    detail: str | None = None
+
+
+def provider_capability(provider: Any) -> ProviderCapability:
+    """Describe whether ``provider`` may register as a verified capability.
+
+    Never raises: unknown shapes report not-ready. ``transport_verified``
+    is opt-in on each provider (only a real network fetcher sets it by
+    default); test doubles stay silent unless explicitly flagged.
+    """
+    name = getattr(provider, "name", None)
+    name = str(name) if isinstance(name, str) and name else "unknown"
+    if isinstance(provider, NullProvider) or name == "null":
+        return ProviderCapability(
+            name=name,
+            ready=False,
+            reason_code=PROVIDER_NOT_CONFIGURED,
+            detail="no provider registered under this name",
+        )
+    if name.endswith(".example"):
+        return ProviderCapability(
+            name=name,
+            ready=False,
+            reason_code=PROVIDER_TRANSPORT_UNVERIFIED,
+            detail=".example skeletons never carry a verified transport",
+        )
+    if not bool(getattr(provider, "transport_verified", False)):
+        return ProviderCapability(
+            name=name,
+            ready=False,
+            reason_code=PROVIDER_TRANSPORT_UNVERIFIED,
+            detail="provider has no verified HTTP transport (skeleton/no-fetcher)",
+        )
+    return ProviderCapability(name=name, ready=True)
 
 
 class Provider(Protocol):

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://short-lab.local/contracts/ownership.schema.json",
+  "title": "Short-Lab task ownership manifest",
+  "description": "Manifest consumed by scripts/check_shortlab_owner.py (design C3.2). The runtime-generated ownership.json lives under gitignored desktop/backend/runtime/verification/<build-id>/ and is never committed; this schema only validates its shape.",
+  "type": "object",
+  "required": [
+    "task_id",
+    "branch",
+    "baseline_sha",
+    "prerequisite_commits",
+    "handoffs",
+    "allowed_paths"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^[FH][0-9]{2}$",
+      "description": "Current owner task, e.g. F01."
+    },
+    "branch": {
+      "type": "string",
+      "description": "Working branch; must match the policy branch_pattern (codex/fNN- or codex/hNN-)."
+    },
+    "baseline_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Baseline commit the task started from; must be an ancestor of head-ref."
+    },
+    "prerequisite_commits": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+      "description": "Merge commits of prerequisite tasks; each must be an ancestor of head-ref."
+    },
+    "handoffs": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["task_id"],
+            "properties": {
+              "task_id": { "type": "string" },
+              "report": { "type": "string" }
+            }
+          }
+        ]
+      },
+      "description": "Completed upstream task handoffs covering the policy prerequisites."
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Path/glob allow-list for this task; every changed file must match one entry."
+    }
+  },
+  "additionalProperties": true
+}

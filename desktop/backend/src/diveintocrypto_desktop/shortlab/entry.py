@@ -32,7 +32,7 @@ import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping
 
 from diveintocrypto_desktop.data import binance_klines as klines_mod
@@ -40,6 +40,13 @@ from diveintocrypto_desktop.data import funding as funding_mod
 from diveintocrypto_desktop.data import open_interest as oi_mod
 from diveintocrypto_desktop.data import ratios as ratios_mod
 from diveintocrypto_desktop.data.http import TransientUpstreamError
+from diveintocrypto_desktop.shortlab.request_budget import (
+    BudgetExhausted as RequestBudgetExhausted,
+    ObservedCache,
+    Denied,
+    RequestContext,
+    UnbudgetedEndpointError,
+)
 from diveintocrypto_desktop.engine.loader import load_config as load_engine_config
 from diveintocrypto_desktop.scan import evidence as evidence_mod
 from diveintocrypto_desktop.scan import symbol_builder as symbol_builder_mod
@@ -99,9 +106,11 @@ _KLINE_LIMIT = 300
 _SERIES_PERIOD = "5m"
 _SERIES_LIMIT = 48
 
-# Entry-level retries after the first attempt (mirrors data/http _MAX_RETRIES;
-# the inner data clients already back off, so no extra sleep is added here).
-_MAX_ATTEMPTS = 3
+# F03: Entry no longer retries. The single retry layer lives in
+# ``data/http.py`` (unique send point, honoring Retry-After); ``guarded``
+# only checks the (shared) cache and calls the factory once, so one logical
+# leaf is one budget spend and HTTP retries/pages are counted by the shared
+# ``RequestBudget`` instead of a second Entry loop.
 
 _CONSENSUS_TIMEFRAME_MISSING = "CONSENSUS_TIMEFRAME_MISSING"
 _CONSENSUS_ASSEMBLE_FAILED = "CONSENSUS_ASSEMBLE_FAILED"
@@ -332,15 +341,64 @@ def score_entry(
 # ---------------------------------------------------------------------------
 
 
+class _RoundPermit:
+    def __init__(self, bridge, permit):
+        self.bridge, self.permit, self.state = bridge, permit, "reserved"
+
+    def mark_sent(self):
+        if self.state == "sent":
+            return
+        if self.state != "reserved":
+            raise RuntimeError("released Entry permit cannot send")
+        self.permit.mark_sent()
+        self.bridge.reserved -= 1
+        self.bridge.owner.used_calls += 1
+        self.state = "sent"
+
+    def release_unsent(self):
+        if self.state == "reserved":
+            self.permit.release_unsent()
+            self.bridge.reserved -= 1
+            self.state = "released"
+
+
+class _RoundSendBudget:
+    """Compose shared host limits with one Entry round's actual-send cap."""
+    def __init__(self, owner, shared):
+        self.owner, self.shared, self.reserved = owner, shared, 0
+
+    def __getattr__(self, name):
+        return getattr(self.shared, name)
+
+    def try_acquire(self, host, weight, job_type, endpoint_family):
+        if self.owner.used_calls + self.reserved >= self.owner.max_calls:
+            return Denied(reason_code=ENTRY_BUDGET_EXHAUSTED,
+                          message="Entry round final-send budget exhausted",
+                          job_type=job_type, endpoint_family=endpoint_family)
+        permit = self.shared.try_acquire(host, weight, job_type, endpoint_family)
+        if isinstance(permit, Denied) or permit is False:
+            return permit
+        self.reserved += 1
+        return _RoundPermit(self, permit)
+
+
 class EntryBudget:
     """Per-round upstream budget for the lightweight Entry path.
 
     Defaults mirror the packaged Short-Lab config (``refresh``:
     ``entry_max_upstream_calls_per_run=240``, ``entry_concurrency=2``,
-    ``entry_cache_ttl_sec=3600``). Every real upstream attempt — including an
-    entry-level retry after a transient 429/5xx — consumes one call; cache
-    hits consume none. All fetches still travel the shared data-client path
-    (and its shared limiters); the budget only counts, it never bypasses.
+    ``entry_cache_ttl_sec=3600``). Each ``guarded`` miss consumes one logical
+    call; cache hits consume none. All fetches still travel the shared
+    data-client path (and its shared limiters); the budget only counts, it
+    never bypasses.
+
+    F03 wiring (additive): ``shared_cache`` is the long-lived
+    :class:`ObservedCache` held by the runtime (F06) — counts reset per
+    round but the cache persists across rounds, preserving source times.
+    ``request_context`` carries the shared :class:`RequestBudget` for real
+    HTTP sends (funding pages/retries count there). ``guarded`` only checks
+    cache / calls the factory once — it never retries (the unique retry
+    lives in ``data/http.py``).
     """
 
     def __init__(
@@ -350,6 +408,9 @@ class EntryBudget:
         ttl_sec: int = 3600,
         *,
         clock: Callable[[], int] | None = None,
+        shared_cache: ObservedCache | None = None,
+        request_context: RequestContext | None = None,
+        identity_snapshot_id: str | None = None,
     ) -> None:
         if isinstance(max_calls, bool) or int(max_calls) < 1:
             raise ValueError(f"max_calls must be an int >= 1, got {max_calls!r}")
@@ -364,9 +425,20 @@ class EntryBudget:
         self.used_calls = 0
         self.cache_hits = 0
         self._cache: dict[Any, tuple[Any, int]] = {}
+        self.observation_times: dict[Any, tuple[int, int]] = {}
         self._semaphores: dict[Any, asyncio.Semaphore] = {}
         self.inflight = 0
         self.peak_inflight = 0
+        self.shared_cache = shared_cache
+        self.request_context = (replace(request_context, budget=_RoundSendBudget(self, request_context.budget))
+                                if request_context is not None and request_context.budget is not None
+                                else request_context)
+        if identity_snapshot_id is not None:
+            self.identity_snapshot_id: str | None = str(identity_snapshot_id)
+        elif request_context is not None and request_context.identity_snapshot_id is not None:
+            self.identity_snapshot_id = request_context.identity_snapshot_id
+        else:
+            self.identity_snapshot_id = None
 
     def now_ms(self) -> int:
         """Current time in UTC epoch milliseconds (injectable for tests)."""
@@ -427,35 +499,74 @@ class EntryBudget:
         """Cache a fetched value for ``ttl_sec``."""
         self._cache[key] = (value, self.now_ms() + self.ttl_sec * 1000)
 
-    async def guarded(
-        self, key: Any, factory: Callable[[], Awaitable[Any]]
-    ) -> Any:
-        """Run one cached, budgeted upstream fetch with transient retries.
+    def _shared_key(self, key: Any) -> Any:
+        """Shared-cache key: leaf key + identity version (A7.2)."""
+        try:
+            return (key, self.identity_snapshot_id)
+        except TypeError:
+            return (repr(key), self.identity_snapshot_id)
 
-        Cache hits return without spending budget. Each real attempt spends
-        one call; a :class:`TransientUpstreamError` is retried (up to
-        ``_MAX_ATTEMPTS`` total attempts, each spent) through the same shared
-        data-client path. Any other error propagates to the caller, which
-        degrades that block instead of failing the symbol.
+    async def guarded(
+        self,
+        key: Any,
+        factory: Callable[[], Awaitable[Any]],
+        *,
+        cutoff_ms: int | None = None,
+    ) -> Any:
+        """Run one cached, budgeted upstream fetch (no retry).
+
+        Cache hits (shared :class:`ObservedCache` first, then the round-local
+        TTL) return without spending budget. Each miss spends exactly one
+        logical call and invokes ``factory`` once; a
+        :class:`TransientUpstreamError` is *not* retried here — the unique
+        retry lives in ``data/http.py`` (honoring ``Retry-After``), and HTTP
+        retries/pages are counted by the shared ``RequestBudget``. Any error
+        propagates to the caller, which degrades that block instead of
+        failing the symbol. Already-spent calls are never refunded, including
+        on cancellation.
         """
-        hit, value = self.cache_lookup(key)
-        if hit:
-            return value
-        attempts = 0
-        while True:
-            if not self.try_acquire():
-                raise BudgetExhausted(
-                    f"{ENTRY_BUDGET_EXHAUSTED}: spent {self.used_calls}/{self.max_calls}"
-                )
-            attempts += 1
+        now = self.now_ms()
+        cutoff = int(cutoff_ms) if cutoff_ms is not None else now
+        if self.shared_cache is not None:
             try:
-                value = await factory()
-            except TransientUpstreamError:
-                if attempts >= _MAX_ATTEMPTS:
-                    raise
-                continue
-            self.cache_store(key, value)
+                observed = self.shared_cache.get(self._shared_key(key), cutoff)
+            except Exception:
+                observed = None
+            if observed is not None:
+                self.cache_hits += 1
+                self.observation_times[key] = (int(observed.meta.fetched_at_ms or 0), int(observed.meta.known_at_ms or 0))
+                return observed.value
+        hit, value = self.cache_lookup(key)
+        if hit and self.observation_times.get(key, (0, 0))[1] <= cutoff:
             return value
+        if (self.request_context is None or self.request_context.budget is None) and not self.try_acquire():
+            raise BudgetExhausted(
+                f"{ENTRY_BUDGET_EXHAUSTED}: spent {self.used_calls}/{self.max_calls}"
+            )
+        # Single attempt: no Entry-level retry (F03.1).
+        value = await factory()
+        completed_ms = self.now_ms()
+        self.observation_times[key] = (completed_ms, completed_ms)
+        self.cache_store(key, value)
+        if self.shared_cache is not None:
+            try:
+                from diveintocrypto_desktop.shortlab import observations as _obs_mod
+
+                observed_new = _obs_mod.make_observation(
+                    value,
+                    source="entry-leaf",
+                    source_as_of_ms=None,
+                    fetched_at_ms=completed_ms,
+                    known_at_ms=completed_ms,
+                )
+                self.shared_cache.put(
+                    self._shared_key(key),
+                    observed_new,
+                    completed_ms + self.ttl_sec * 1000,
+                )
+            except Exception:
+                pass
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -551,13 +662,20 @@ async def _guarded_or_missing(
 ) -> tuple[Any, str | None]:
     """Fetch through the budget; degrade to ``missing_value`` on data errors.
 
-    :class:`BudgetExhausted` is re-raised (it aborts the symbol); every other
-    failure becomes ``(missing_value, "FETCH_FAILED")`` so one bad block
-    never fails its siblings.
+    :class:`BudgetExhausted` (Entry logical budget) and the shared
+    :class:`RequestBudget` exhaustion are re-raised (they abort the symbol
+    and queue the remainder); an unknown-weight endpoint is also re-raised
+    (fail fast, never silent). Every other failure becomes
+    ``(missing_value, "FETCH_FAILED")`` so one bad block never fails its
+    siblings.
     """
     try:
         return await budget.guarded(key, factory), None
     except BudgetExhausted:
+        raise
+    except RequestBudgetExhausted as exc:
+        raise BudgetExhausted(str(exc)) from exc
+    except UnbudgetedEndpointError:
         raise
     except TransientUpstreamError:
         return missing_value, "FETCH_FAILED"
@@ -603,6 +721,18 @@ async def _fetch_symbol_inputs(
             klines_errors[timeframe] = "EMPTY_TIMEFRAME"
 
     window_start = as_of_ms - _FUNDING_LOOKBACK_MS
+    funding_ctx = getattr(budget, "request_context", None)
+    _use_funding_ctx = funding_ctx is not None and funding_ctx.budget is not None
+
+    def _funding_factory() -> Any:
+        # Preserve legacy fake signatures (fake(symbol, start, end, limit))
+        # when no shared budget is wired; only pass request_context for the
+        # F03 budgeted path.
+        if _use_funding_ctx:
+            return funding_mod.funding_history_range(
+                symbol, window_start, as_of_ms, request_context=funding_ctx
+            )
+        return funding_mod.funding_history_range(symbol, window_start, as_of_ms)
     oi_res, glob_res, acc_res, pos_res, taker_res, funding_res = await asyncio.gather(
         _guarded_or_missing(
             budget,
@@ -637,7 +767,7 @@ async def _fetch_symbol_inputs(
         _guarded_or_missing(
             budget,
             ("funding", symbol, window_start, as_of_ms),
-            lambda: funding_mod.funding_history_range(symbol, window_start, as_of_ms),
+            _funding_factory,
             missing_value=[],
         ),
         return_exceptions=False,
@@ -847,6 +977,11 @@ async def build_entry_snapshot(
     except BudgetExhausted:
         return exhausted_result()
 
+    leaf_times = [times for key, times in own_budget.observation_times.items()
+                  if isinstance(key, tuple) and len(key) > 1 and key[1] == name]
+    collection_completed_ms = max([clock_ms] + [t[1] for t in leaf_times])
+    fetched_completed_ms = max([clock_ms] + [t[0] for t in leaf_times])
+
     missing_timeframes = [
         timeframe
         for timeframe in klines_mod.TF_LIST
@@ -933,6 +1068,11 @@ async def build_entry_snapshot(
             "as_of_ms": observed_ms,
             "shortlab_config_hash": shortlab_hash,
             "entry_version": ENTRY_VERSION,
+            "leaf_observations": [
+                {"key": list(key), "fetched_at_ms": times[0], "known_at_ms": times[1]}
+                for key, times in own_budget.observation_times.items()
+                if isinstance(key, tuple) and len(key) > 1 and key[1] == name
+            ],
         },
     }
 
@@ -959,7 +1099,7 @@ async def build_entry_snapshot(
     source_meta = {
         block: _meta_block(
             "OK" if block not in missing else "UNAVAILABLE",
-            clock_ms,
+            fetched_completed_ms,
             observed_ms,
             block_sources[block],
             block_reasons.get(block),
@@ -968,9 +1108,13 @@ async def build_entry_snapshot(
         for block in ENTRY_REQUIRED_BLOCKS
     }
 
+    for meta in source_meta.values():
+        meta["known_at_ms"] = collection_completed_ms
+        meta["query_cutoff_ms"] = observed_ms
+
     stored_components = dict(components)
     stored_components["total"] = total
-    return EntryResult(
+    result = EntryResult(
         symbol=name,
         as_of_ms=observed_ms,
         primary_tf=primary_tf,
@@ -985,9 +1129,38 @@ async def build_entry_snapshot(
         dive_config_hash=dive_config_hash_value,
         shortlab_config_hash=shortlab_hash,
         snapshot_id=f"entry-{name}-{observed_ms}-{ENTRY_VERSION}",
-        fetched_at_ms=clock_ms,
+        fetched_at_ms=fetched_completed_ms,
         created_at_ms=own_budget.now_ms(),
     )
+    return result
+
+
+def finalize_entry_snapshot(result: EntryResult, cutoff_ms: int) -> EntryResult:
+    """Freeze already derived Entry at a later decision boundary.
+
+    This retains every source/query timestamp. A UTC-day change invalidates
+    the daily/funding window; the caller must recollect instead of relabelling
+    yesterday's package as today. Historical replay remains unchanged.
+    """
+    cutoff = int(cutoff_ms)
+    known = max([result.fetched_at_ms] + [int(m.get("known_at_ms") or 0)
+                for m in result.source_meta.values()])
+    if cutoff < max(result.as_of_ms, known):
+        raise ValueError("Entry cutoff precedes frozen input availability")
+    inputs = dict(result.inputs)
+    inputs["_meta"] = {**inputs.get("_meta", {}), "as_of_ms": cutoff}
+    changed_day = cutoff // 86400000 != result.as_of_ms // 86400000
+    result = replace(result, as_of_ms=cutoff, inputs=inputs,
+                     snapshot_id=f"entry-{result.symbol}-{cutoff}-{ENTRY_VERSION}")
+    if changed_day:
+        inputs["consensus"] = {"reason": "ENTRY_WINDOW_ROLLOVER"}
+        return replace(result, entry_score=None, reason_code="ENTRY_WINDOW_ROLLOVER",
+                       missing_blocks=ENTRY_REQUIRED_BLOCKS,
+                       components={**dict.fromkeys(ENTRY_REQUIRED_BLOCKS), "total": None})
+    recomputed = recompute_entry_from_record(result.to_record())
+    return replace(result, entry_score=recomputed["entry_score"],
+                   missing_blocks=recomputed["missing_blocks"],
+                   components={**recomputed["components"], "total": recomputed["entry_score"]})
 
 
 async def save_entry_snapshot(repo: Any, result: EntryResult) -> str:
@@ -1033,7 +1206,7 @@ def recompute_entry_from_record(
     # A stored snapshot whose consensus fetch failed stays null even if the
     # frozen payload happens to look complete: the fetch-time verdict wins.
     consensus_reason = consensus.get("reason")
-    if consensus_reason in (_CONSENSUS_TIMEFRAME_MISSING, _CONSENSUS_ASSEMBLE_FAILED):
+    if consensus_reason in (_CONSENSUS_TIMEFRAME_MISSING, _CONSENSUS_ASSEMBLE_FAILED, "ENTRY_WINDOW_ROLLOVER"):
         if "consensus" not in missing:
             missing = ("consensus",) + tuple(missing)
         total = None
@@ -1069,6 +1242,7 @@ async def run_entry_batch(
     primary_tf: str = "1h",
     now_ms: int | None = None,
     as_of_ms: int | None = None,
+    as_of_by_symbol: Mapping[str, int] | None = None,
     max_symbols: int | None = 10,
 ) -> EntryBatchResult:
     """Run one budgeted Entry round over shortlist symbols.
@@ -1132,7 +1306,7 @@ async def run_entry_batch(
                     next_symbol,
                     primary_tf,
                     budget=own_budget,
-                    as_of_ms=as_of_ms,
+                    as_of_ms=(as_of_by_symbol or {}).get(next_symbol, as_of_ms),
                     now_ms=now_ms,
                 )
                 results[next_symbol] = result

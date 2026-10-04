@@ -319,7 +319,10 @@ let _evSeq = 0;  // guards against an older horizon response overwriting a newer
 window.SGS_SHORT = null;        // GET /api/short/candidates body (success only)
 window.SGS_SHORT_DETAIL = {};   // symbol → GET /api/short/symbol/{symbol} body
 window.SGS_SHORT_JOB = null;    // POST /api/short/refresh body (success only)
-window.__diveShortQuery = null; // last candidates query (App poll loop reuses it)
+window.SGS_SHORT_HEALTH = null; // GET /api/short/health body (success only)
+window.SGS_SHORT_EVIDENCE = null; // GET /api/short/evidence/summary body (success only)
+window.SGS_SHORT_JOB_STATUS = null; // GET /api/short/refresh/{jobId} body (success only)
+window.__diveShortQuery = null; // last candidates query (page-owned; App never reuses it)
 
 /* UI key → API query key. Unknown keys are dropped, never forwarded. */
 const SHORTLAB_QUERY_MAP = {
@@ -332,8 +335,25 @@ const SHORTLAB_QUERY_MAP = {
   limit: "limit", offset: "offset",
 };
 
-async function _shortGet(path) {
-  const r = await fetch(API + path, { headers: { Accept: "application/json" } });
+/* Evidence query map (F08 · design A8): UI keys → /api/short/evidence/summary
+   params. Unknown keys are dropped. F07-owned grader symbols are NOT assumed
+   here — only the F06a-frozen service.evidence_summary filters surface. */
+const SHORT_EVIDENCE_QUERY_MAP = {
+  horizon: "horizon", horizons: "horizons",
+  symbol: "symbol", profile: "profile",
+  generationId: "generation_id", generation_id: "generation_id",
+  featureVersion: "feature_version", feature_version: "feature_version",
+  entryVersion: "entry_version", entry_version: "entry_version",
+  costConfigHash: "cost_config_hash", cost_config_hash: "cost_config_hash",
+  formulaVersion: "formula_version", formula_version: "formula_version",
+  startMs: "start_ms", start_ms: "start_ms",
+  endMs: "end_ms", end_ms: "end_ms",
+};
+
+async function _shortGet(path, opts = {}) {
+  const init = { headers: { Accept: "application/json" } };
+  if (opts && opts.signal) init.signal = opts.signal;
+  const r = await fetch(API + path, init);
   if (!r.ok) {
     let info = "";
     try {
@@ -345,12 +365,14 @@ async function _shortGet(path) {
   return r.json();
 }
 
-async function _shortPost(path, body) {
-  const r = await fetch(API + path, {
+async function _shortPost(path, body, opts = {}) {
+  const init = {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
-  });
+  };
+  if (opts && opts.signal) init.signal = opts.signal;
+  const r = await fetch(API + path, init);
   if (!r.ok) {
     let info = "";
     try {
@@ -360,6 +382,85 @@ async function _shortPost(path, body) {
     throw new Error(`POST ${path} → ${r.status}${info}`);
   }
   return r.json();
+}
+
+async function _shortPatch(path, body, opts = {}) {
+  const init = {
+    method: "PATCH",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  };
+  if (opts && opts.signal) init.signal = opts.signal;
+  const r = await fetch(API + path, init);
+  if (!r.ok) {
+    let info = "";
+    try {
+      const b = await r.json();
+      if (b && (b.error || b.reason || b.detail)) info = ` · ${b.error || b.reason || ""}${b.detail ? " · " + b.detail : ""}`;
+    } catch (e) { /* opaque body */ }
+    throw new Error(`PATCH ${path} → ${r.status}${info}`);
+  }
+  return r.json();
+}
+
+/* ── Hedge adapter (H09 · design B32) ─────────────────────────────────────
+   Every method below talks ONLY to the local backend (/api/short/*) through
+   _shortGet/_shortPost/_shortPatch. Components never fetch Binance / Alpha /
+   on-chain directly. Query keys are snake_case aliases (camel inputs accepted
+   and mapped, unknown keys dropped). JSON bodies are camelCase and passed
+   VERBATIM — quantity decimal strings are never Number() converted here. */
+
+window.SGS_HEDGE_FUNDING = null;    // GET /api/short/funding-opportunities (success only)
+window.SGS_HEDGE_VENUES = {};       // symbol → GET /api/short/hedge/venues/{symbol}
+window.SGS_HEDGE_SIMULATION = null; // last POST /api/short/hedge/simulate body
+window.SGS_HEDGE_SIMULATIONS = {};  // simulationId → GET simulations/{id}
+window.SGS_HEDGE_PLANS = null;      // GET /api/short/hedge/plans page
+window.SGS_HEDGE_PLAN = {};         // planId → GET plans/{planId}
+window.SGS_HEDGE_MONITOR = {};      // planId → GET plans/{planId}/monitor
+window.SGS_HEDGE_ALERTS = null;     // GET /api/short/hedge/alerts page
+window.SGS_HEDGE_EVIDENCE = null;   // GET /api/short/hedge/evidence/summary (success only)
+
+const HEDGE_FUNDING_QUERY_MAP = {
+  minFcs: "min_fcs", min_fcs: "min_fcs",
+  minFunding30d: "min_funding_30d", min_funding_30d: "min_funding_30d",
+  minPositiveRatio30d: "min_positive_ratio_30d", min_positive_ratio_30d: "min_positive_ratio_30d",
+  venue: "venue", readiness: "readiness",
+  sort: "sort", order: "order", limit: "limit", offset: "offset",
+};
+
+const HEDGE_PLANS_QUERY_MAP = {
+  status: "status", symbol: "symbol", mode: "mode", venue: "venue",
+  limit: "limit", offset: "offset",
+};
+
+const HEDGE_ALERTS_QUERY_MAP = {
+  planId: "plan_id", plan_id: "plan_id",
+  state: "state", severity: "severity", code: "code",
+  limit: "limit", offset: "offset",
+};
+
+/* B32.13 hedge evidence summary filters. Unknown keys are dropped. */
+const HEDGE_EVIDENCE_QUERY_MAP = {
+  startMs: "start_ms", start_ms: "start_ms",
+  endMs: "end_ms", end_ms: "end_ms",
+  strategy: "strategy", horizon: "horizon", venue: "venue",
+  historyClass: "history_class", history_class: "history_class",
+  fcsVersion: "fcs_version", fcs_version: "fcs_version",
+  hedgeFormulaVersion: "hedge_formula_version", hedge_formula_version: "hedge_formula_version",
+  hedgeEvidenceVersion: "hedge_evidence_version", hedge_evidence_version: "hedge_evidence_version",
+  costConfigHash: "cost_config_hash", cost_config_hash: "cost_config_hash",
+  limit: "limit", offset: "offset",
+};
+
+function _hedgeQuery(map, filters) {
+  const p = new URLSearchParams();
+  const src = filters || {};
+  for (const [uiKey, apiKey] of Object.entries(map)) {
+    const v = src[uiKey];
+    if (v === undefined || v === null || v === "") continue;
+    p.set(apiKey, String(v));
+  }
+  return p.toString();
 }
 
 const DIVE = {
@@ -514,7 +615,7 @@ const DIVE = {
   async health() { return _get(`/api/health`); },
   /* ── Short-Lab (design §25): paged candidates, single-symbol detail,
         async refresh. Globals written ONLY on success. ─────────────────── */
-  async shortCandidates(query = {}) {
+  async shortCandidates(query = {}, opts = {}) {
     const p = new URLSearchParams();
     for (const [uiKey, apiKey] of Object.entries(SHORTLAB_QUERY_MAP)) {
       const v = query[uiKey];
@@ -522,7 +623,7 @@ const DIVE = {
       p.set(apiKey, String(v));
     }
     const qs = p.toString();
-    const res = await _shortGet(`/api/short/candidates${qs ? "?" + qs : ""}`);
+    const res = await _shortGet(`/api/short/candidates${qs ? "?" + qs : ""}`, opts);
     window.SGS_SHORT = res;
     window.__diveShortQuery = { ...query };
     _notify();
@@ -533,16 +634,187 @@ const DIVE = {
     if (!sym) throw new Error("shortDetail: empty symbol");
     const gid = opts.generationId || opts.generation_id;
     const qs = gid ? `?generation_id=${encodeURIComponent(String(gid))}` : "";
-    const res = await _shortGet(`/api/short/symbol/${encodeURIComponent(sym)}${qs}`);
+    const res = await _shortGet(`/api/short/symbol/${encodeURIComponent(sym)}${qs}`, opts);
     window.SGS_SHORT_DETAIL[sym] = res;
     _notify();
     return res;
   },
   /* Refresh accepts an in-flight job: the backend answers 202 + existing:true
      instead of starting a duplicate full-market run. */
-  async shortRefresh(jobType) {
-    const res = await _shortPost(`/api/short/refresh`, jobType ? { jobType: String(jobType) } : {});
+  async shortRefresh(jobType, opts = {}) {
+    let body = {};
+    let signal = opts && opts.signal ? opts.signal : undefined;
+    if (typeof jobType === "string" && jobType) body = { jobType };
+    else if (jobType && typeof jobType === "object" && !Array.isArray(jobType)) {
+      const tmp = { ...jobType };
+      if (tmp.signal && !signal) signal = tmp.signal;
+      delete tmp.signal;
+      body = tmp;
+    }
+    const res = await _shortPost(`/api/short/refresh`, body, signal ? { signal } : {});
     window.SGS_SHORT_JOB = res;
+    _notify();
+    return res;
+  },
+  /* F08: poll one refresh job until RUNNING→SUCCEEDED/FAILED. 202 is a task,
+     never completion — the page polls this every 2s. */
+  async shortRefreshStatus(jobId, opts = {}) {
+    const id = String(jobId || "").trim();
+    if (!id) throw new Error("shortRefreshStatus: empty jobId");
+    const res = await _shortGet(`/api/short/refresh/${encodeURIComponent(id)}`, opts);
+    window.SGS_SHORT_JOB_STATUS = res;
+    _notify();
+    return res;
+  },
+  /* F08: Short-Lab health (additive capabilities/jobs/schema_version).
+     The page reads the newest generation via lastSuccessfulGeneration. */
+  async shortHealth(opts = {}) {
+    const res = await _shortGet(`/api/short/health`, opts);
+    window.SGS_SHORT_HEALTH = res;
+    _notify();
+    return res;
+  },
+  /* F08: forward-evidence aggregate (F06a service.evidence_summary shape).
+     503 stays a throw with the backend reason — never mock. */
+  async shortEvidence(filters = {}, opts = {}) {
+    const p = new URLSearchParams();
+    for (const [uiKey, apiKey] of Object.entries(SHORT_EVIDENCE_QUERY_MAP)) {
+      const v = filters[uiKey];
+      if (v === undefined || v === null || v === "") continue;
+      p.set(apiKey, String(v));
+    }
+    const qs = p.toString();
+    const res = await _shortGet(`/api/short/evidence/summary${qs ? "?" + qs : ""}`, opts);
+    window.SGS_SHORT_EVIDENCE = res;
+    _notify();
+    return res;
+  },
+  /* ── H09 hedge (design B32): one DIVE method per endpoint. Bodies pass
+       through verbatim (quantity strings untouched); queries map to snake
+       aliases; globals populate ONLY on success; 503/absence never mocks. ── */
+  async fundingOpportunities(filters = {}, opts = {}) {
+    const qs = _hedgeQuery(HEDGE_FUNDING_QUERY_MAP, filters);
+    const res = await _shortGet(`/api/short/funding-opportunities${qs ? "?" + qs : ""}`, opts);
+    window.SGS_HEDGE_FUNDING = res;
+    _notify();
+    return res;
+  },
+  async hedgeVenues(symbol, queryOrOpts = {}, maybeOpts = {}) {
+    const sym = String(symbol || "").toUpperCase();
+    if (!sym) throw new Error("hedgeVenues: empty symbol");
+    let query = {};
+    let opts = {};
+    if (queryOrOpts && typeof queryOrOpts === "object" && ("signal" in queryOrOpts) && Object.keys(queryOrOpts).length === 1) {
+      opts = queryOrOpts;
+    } else if (queryOrOpts && typeof queryOrOpts === "object" && ("signal" in queryOrOpts)) {
+      const tmp = { ...queryOrOpts };
+      opts = { signal: tmp.signal };
+      delete tmp.signal;
+      query = tmp;
+    } else {
+      query = queryOrOpts || {};
+      opts = maybeOpts || {};
+    }
+    const p = new URLSearchParams();
+    const nusd = query.notionalUsd != null ? query.notionalUsd : query.notional_usd;
+    if (nusd !== undefined && nusd !== null && nusd !== "") p.set("notional_usd", String(nusd));
+    for (const [k, v] of Object.entries(query)) {
+      if (k === "notionalUsd" || k === "notional_usd" || k === "signal") continue;
+      if (v === undefined || v === null || v === "") continue;
+      p.set(k, String(v));
+    }
+    const qs = p.toString();
+    const res = await _shortGet(`/api/short/hedge/venues/${encodeURIComponent(sym)}${qs ? "?" + qs : ""}`, opts);
+    window.SGS_HEDGE_VENUES[sym] = res;
+    _notify();
+    return res;
+  },
+  async hedgeSimulate(body, opts = {}) {
+    const res = await _shortPost(`/api/short/hedge/simulate`, body || {}, opts);
+    window.SGS_HEDGE_SIMULATION = res;
+    if (res && (res.simulationId || res.simulation_id)) {
+      window.SGS_HEDGE_SIMULATIONS[res.simulationId || res.simulation_id] = res;
+    }
+    _notify();
+    return res;
+  },
+  async getHedgeSimulation(simulationId, opts = {}) {
+    const id = String(simulationId || "").trim();
+    if (!id) throw new Error("getHedgeSimulation: empty simulationId");
+    const res = await _shortGet(`/api/short/hedge/simulations/${encodeURIComponent(id)}`, opts);
+    window.SGS_HEDGE_SIMULATIONS[id] = res;
+    _notify();
+    return res;
+  },
+  async createHedgePlan(body, opts = {}) {
+    const res = await _shortPost(`/api/short/hedge/plans`, body || {}, opts);
+    const pid = res && (res.planId || res.plan_id || (res.plan && (res.plan.planId || res.plan.plan_id)));
+    if (pid) window.SGS_HEDGE_PLAN[pid] = res.plan || res;
+    _notify();
+    return res;
+  },
+  async hedgePlans(filters = {}, opts = {}) {
+    const qs = _hedgeQuery(HEDGE_PLANS_QUERY_MAP, filters);
+    const res = await _shortGet(`/api/short/hedge/plans${qs ? "?" + qs : ""}`, opts);
+    window.SGS_HEDGE_PLANS = res;
+    _notify();
+    return res;
+  },
+  async hedgePlan(planId, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("hedgePlan: empty planId");
+    const res = await _shortGet(`/api/short/hedge/plans/${encodeURIComponent(id)}`, opts);
+    window.SGS_HEDGE_PLAN[id] = res;
+    _notify();
+    return res;
+  },
+  async applyHedgeLegEvent(planId, eventBody, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("applyHedgeLegEvent: empty planId");
+    const res = await _shortPatch(`/api/short/hedge/plans/${encodeURIComponent(id)}/legs`, eventBody || {}, opts);
+    _notify();
+    return res;
+  },
+  async activateHedgePlan(planId, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("activateHedgePlan: empty planId");
+    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/activate`, {}, opts);
+    _notify();
+    return res;
+  },
+  async closeHedgePlan(planId, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("closeHedgePlan: empty planId");
+    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/close`, {}, opts);
+    _notify();
+    return res;
+  },
+  async hedgeMonitor(planId, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("hedgeMonitor: empty planId");
+    const res = await _shortGet(`/api/short/hedge/plans/${encodeURIComponent(id)}/monitor`, opts);
+    window.SGS_HEDGE_MONITOR[id] = res;
+    _notify();
+    return res;
+  },
+  async hedgeAlerts(filters = {}, opts = {}) {
+    const qs = _hedgeQuery(HEDGE_ALERTS_QUERY_MAP, filters);
+    const res = await _shortGet(`/api/short/hedge/alerts${qs ? "?" + qs : ""}`, opts);
+    window.SGS_HEDGE_ALERTS = res;
+    _notify();
+    return res;
+  },
+  async ackHedgeAlert(alertId, opts = {}) {
+    const id = String(alertId || "").trim();
+    if (!id) throw new Error("ackHedgeAlert: empty alertId");
+    const res = await _shortPost(`/api/short/hedge/alerts/${encodeURIComponent(id)}/ack`, {}, opts);
+    _notify();
+    return res;
+  },
+  async hedgeEvidenceSummary(filters = {}, opts = {}) {
+    const qs = _hedgeQuery(HEDGE_EVIDENCE_QUERY_MAP, filters);
+    const res = await _shortGet(`/api/short/hedge/evidence/summary${qs ? "?" + qs : ""}`, opts);
+    window.SGS_HEDGE_EVIDENCE = res;
     _notify();
     return res;
   },

@@ -11,9 +11,9 @@ Test counts are **approximate** — they move as features land. The CI workflow
 
 | # | Suite | Command (from repo root) | ~Tests | What it covers |
 |---|---|---|---|---|
-| 1 | Backend engine | `cd desktop/backend && uv sync && uv run pytest -q` | ~186 | The reference engine: all 60 indicators + 3 overlays, consensus/verdict logic, data parsers, cross-language parity fixtures, per-endpoint client behaviour (offline) |
+| 1 | Backend engine | `cd desktop/backend && uv sync && uv run pytest -q` | ~1300 | The reference engine: all 60 indicators + 3 overlays, consensus/verdict logic, data parsers, cross-language parity fixtures, per-endpoint client behaviour (offline), plus the Short-Lab/Hedge contract suites |
 | 2 | Root E2E | `uv run --project desktop/backend pytest tests/ -q` | ~95 | Opaque-box end-to-end behaviour against the packaged engine (offline: `tests/conftest.py` mocks the data layer), adversarial math, Gradle signing static analysis |
-| 3 | UI | `cd desktop/ui && npm ci && npm test` (then `node build.mjs`) | 5 | The "nothing is synthesised" guarantees of the React front-end: failed fetches never reach the demo generator, and demo mode always renders its banner + per-value markers |
+| 3 | UI | `cd desktop/ui && npm ci && npm test` (then `node build.mjs`) | ~49 | The "nothing is synthesised" guarantees of the React front-end: failed fetches never reach the demo generator, and demo mode always renders its banner + per-value markers; Short-Lab/hedge view contracts |
 | 4 | Android | `cd android && ./gradlew :app:test` (JDK 17) | ~129 | The Kotlin engine unit tests, including the fixture-verified parity mirror of the Python reference |
 
 CI additionally builds the debug APK (`:app:assembleDebug`) and enforces the **dist-drift
@@ -23,13 +23,13 @@ rebuilds it and fails if the committed bundle differs from a fresh build.
 ## Running every suite locally
 
 ```bash
-# 1 · Backend engine suite (~186 tests, offline)
+# 1 · Backend engine suite (~1300 tests, offline)
 cd desktop/backend && uv sync && uv run pytest -q
 
 # 2 · Root E2E suite (~95 tests, offline — data layer is mocked)
 uv run --project desktop/backend pytest tests/ -q
 
-# 3 · UI suite (5 tests) + rebuild the committed bundle
+# 3 · UI suite (~49 tests) + rebuild the committed bundle
 cd desktop/ui && npm ci && npm test && node build.mjs
 
 # 4 · Android unit tests (~129 tests, needs JDK 17)
@@ -67,17 +67,42 @@ scoring, status, entry, runtime, API, evidence, FULL) plus, for naming/packaging
 |---|---|
 | `test_shortlab_packaging.py` | distribution `short-lab-desktop` with both `short-lab` and `dive-desktop` scripts on one entry; UI package `short-lab-desktop-ui`; `/api/health` keeps `service` and gains `product: "short-lab"`; `short-lab.spec` EXE/COLLECT names, DuckDB + `default.yaml` + UI dist, fixed build command, no stale product paths; frozen read-only boots share one writable `shortlab.duckdb` home |
 | `test_shortlab_release_workflow.py` | `v*` = Android-only, `short-lab-v*` = Desktop-only, ticked manual dispatch = Desktop artifact only; tag Desktop builds publish `short-lab-windows-x64.zip` to the Release |
+| `test_shortlab_retention.py` | F09 base gate only (schema 4, no Hedge/005): `resources.read_resource_text` reads engine/default/identity/001–004 without a source checkout; spec lists exactly those resources with no 005 placeholder; read-only install + empty data dir boots twice consistently; `maintenance.maintain` (import `diveintocrypto_desktop.shortlab.maintenance`) only calls `maintain_retention` with 180-day TTL and limit ≤ 1000; tag mutual exclusion and argparse default `46408` (AST, not comments) |
 
-Release acceptance (design §35–36) additionally runs, offline where possible:
+Release acceptance (design §35–36, plan H11) runs, offline where possible:
 
 ```bash
-cd desktop/backend && uv run --offline pytest -q          # backend incl. Short-Lab (full)
-uv run --offline --project desktop/backend pytest tests/ -q  # root E2E (from repo root)
-cd desktop/ui && npm test && npm run build                # UI tests + committed bundle
+# backend全套件 (incl. Short-Lab + Hedge, offline default; live excluded)
+cd desktop/backend && uv run pytest -q
+
+# 根 tests/ E2E (from repo root)
+uv run --project desktop/backend pytest tests/ -q
+
+# UI四文件 + 全量UI + 重新构建 (dist重建后UI测试重跑)
+cd desktop/ui && node --test test/shortlab.test.mjs test/shortlab-refresh.test.mjs test/hedge.test.mjs test/v3.test.mjs
+npm test && npm run build
+
+# 成品smoke (只读安装目录 + 空用户数据, 真实进程health, 迁移到5,
+# engine资源, plan登记, 重启恢复; fixture stub, 非demo模式)
+desktop/backend/.venv/bin/python scripts/smoke_shortlab_packaged.py \
+  --output-dir desktop/backend/runtime/verification/<build-id>
 ```
 
 Record the command, exit code and commit for every row of the §35 matrix; a row without
-evidence is not marked done. Real PyInstaller bundling (`uv run --with pyinstaller
+evidence is not marked done. `desktop/backend/runtime/verification/<build-id>/`
+holds `manifest.json` (all 23 AC rows: task / source commit / AC line / command /
+exit code / artifact SHA; CI run/artifact URLs stay null until real CI produces
+them), `baseline-tests.txt`, `packaged-smoke.txt` (+`.json`) and
+`release-routing.txt`. Unconfigured providers (Alpha / 0x without keys) are
+recorded as `UNCONFIGURED`, and 451/unreachable live paths as `UNVERIFIED` —
+neither is counted as passed. Live tests are recorded separately and never
+merged into the offline gate:
+
+```bash
+cd desktop/backend && uv run pytest -m live -q   # network-gated, reported apart
+```
+
+Real PyInstaller bundling (`uv run --with pyinstaller
 pyinstaller short-lab.spec --noconfirm`) and the read-only extraction smoke need a
 networked Windows runner, so in an offline sandbox they stay statically covered and are
 reported as not-executed — never as passed.

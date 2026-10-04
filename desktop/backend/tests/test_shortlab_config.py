@@ -235,6 +235,13 @@ def test_default_yaml_top_level_keys_match_design_section_24():
         "veto",
         "refresh",
         "providers",
+        # F05 A10 base keys + H01 Hedge subtrees.
+        "identity",
+        "ingestion",
+        "evidence",
+        "maintenance",
+        "funding_capture",
+        "hedge",
     }
 
 
@@ -308,6 +315,129 @@ def test_cost_config_hash_tracks_evidence_cost_only(tmp_path):
         tmp_path, {"shortlab": {"evidence_cost": {"entry_fee": 0.001}}}
     )
     assert cost_config_hash(load_shortlab_config(cost_override)) != base
+
+
+# ---------------------------------------------------------------------------
+# F05: A10 base keys + frozen policy hash (legacy scoring hash untouched)
+# ---------------------------------------------------------------------------
+
+
+def test_f05_identity_ingestion_evidence_maintenance_defaults():
+    config = load_shortlab_config()
+    assert config.identity.catalog_ttl_sec == 86400
+    assert config.identity.overrides_path_env == "SHORTLAB_IDENTITY_OVERRIDES_PATH"
+    assert config.identity.catalog_grace_sec == 259200
+    assert config.identity.catalog_include_platform is False
+    assert config.identity.catalog_max_bytes == 33554432
+    assert config.identity.platform_detail_batch_size == 50
+    assert config.ingestion.market_concurrency == 4
+    assert config.ingestion.max_source_future_skew_sec == 2
+    assert config.ingestion.contract_refresh_sec == 1800
+    assert config.ingestion.funding_backfill_sec == 300
+    assert config.ingestion.funding_repair_overlap_intervals == 1
+    assert config.ingestion.monitor_reserved_fraction == pytest.approx(0.2)
+    assert config.ingestion.scanner_reserved_fraction == pytest.approx(0.3)
+    assert config.ingestion.db_queue_limit == 256
+    assert config.ingestion.db_persist_timeout_sec == 5
+    assert config.ingestion.db_priority_aging_sec == 30
+    assert config.evidence.default_history_days == 180
+    assert config.evidence.grader_batch_size == 100
+    assert (
+        config.evidence.sample_policy
+        == "first_eligible_per_symbol_profile_utc_day"
+    )
+    assert config.maintenance.retention_sec == 86400
+    assert config.maintenance.snapshot_min_days == 180
+    assert config.maintenance.batch_delete_limit == 1000
+    assert config.providers["coingecko"].api_plan == "DEMO"
+
+
+def test_f05_unknown_base_key_still_raises(tmp_path):
+    path = _write_user_yaml(tmp_path, {"shortlab": {"identity": {"nope": 1}}})
+    with pytest.raises(ShortLabConfigError):
+        load_shortlab_config(path)
+
+
+def test_f05_identity_grace_must_exceed_ttl(tmp_path):
+    path = _write_user_yaml(
+        tmp_path,
+        {"shortlab": {"identity": {"catalog_ttl_sec": 259200,
+                                   "catalog_grace_sec": 86400}}},
+    )
+    with pytest.raises(ShortLabConfigError):
+        load_shortlab_config(path)
+
+
+def test_f05_ingestion_reserves_capped_at_one(tmp_path):
+    path = _write_user_yaml(
+        tmp_path,
+        {"shortlab": {"ingestion": {"monitor_reserved_fraction": 0.6,
+                                    "scanner_reserved_fraction": 0.6}}},
+    )
+    with pytest.raises(ShortLabConfigError):
+        load_shortlab_config(path)
+
+
+def test_f05_evidence_sample_policy_is_fixed(tmp_path):
+    path = _write_user_yaml(
+        tmp_path, {"shortlab": {"evidence": {"sample_policy": "anything_goes"}}}
+    )
+    with pytest.raises(ShortLabConfigError):
+        load_shortlab_config(path)
+
+
+def test_f05_coingecko_plan_is_demo_or_pro(tmp_path):
+    path = _write_user_yaml(
+        tmp_path, {"shortlab": {"providers": {"coingecko": {"api_plan": "ENTERPRISE"}}}}
+    )
+    with pytest.raises(ShortLabConfigError):
+        load_shortlab_config(path)
+
+
+def test_f05_policy_hash_deterministic_and_canonical():
+    from diveintocrypto_desktop.shortlab.config import (
+        POLICY_VERSION,
+        policy_canonical_json,
+        policy_hash,
+    )
+
+    assert POLICY_VERSION == "policy-v1"
+    first = policy_hash(load_shortlab_config())
+    assert policy_hash(load_shortlab_config()) == first
+    assert len(first) == 64
+    # Canonical JSON: single line, no trailing newline, sorted keys.
+    blob = policy_canonical_json(load_shortlab_config())
+    assert "\n" not in blob
+    import json as _json
+
+    assert _json.loads(blob)["policy_version"] == "policy-v1"
+
+
+def test_f05_policy_hash_moves_with_policy_not_cadence(tmp_path):
+    from diveintocrypto_desktop.shortlab.config import policy_hash
+
+    base = policy_hash(load_shortlab_config())
+    veto_override = _write_user_yaml(
+        tmp_path, {"shortlab": {"veto": {"breakout_24h": 0.40}}}
+    )
+    assert policy_hash(load_shortlab_config(veto_override)) != base
+    identity_override = _write_user_yaml(
+        tmp_path, {"shortlab": {"identity": {"catalog_ttl_sec": 3600}}}
+    )
+    assert policy_hash(load_shortlab_config(identity_override)) != base
+    # Refresh cadence / provider capability never enter the frozen policy.
+    cadence = _write_user_yaml(
+        tmp_path, {"shortlab": {"refresh": {"jitter_sec": 0}}}
+    )
+    assert policy_hash(load_shortlab_config(cadence)) == base
+    capability = _write_user_yaml(
+        tmp_path, {"shortlab": {"providers": {"coingecko": {"enabled": False}}}}
+    )
+    assert policy_hash(load_shortlab_config(capability)) == base
+
+
+def test_f05_legacy_scoring_hash_still_golden():
+    assert config_hash(load_shortlab_config()) == GOLDEN_SCORING_HASH
 
 
 # ---------------------------------------------------------------------------

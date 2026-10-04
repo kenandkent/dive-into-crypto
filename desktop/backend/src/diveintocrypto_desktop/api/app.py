@@ -29,7 +29,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -106,6 +106,51 @@ class _PerKeyLocks:
 
 _scan_locks = _PerKeyLocks()
 logger = logging.getLogger("trading_bot.api")
+
+
+# F08 local write protection (design A9.2): same-origin is normal, supported
+# dev cross-origin is exactly http://localhost:<port> or
+# http://127.0.0.1:<port>. Anything else presenting an Origin on a Short-Lab
+# write is rejected; Host must stay local; JSON bodies must declare JSON.
+# No-Origin local CLI (curl/TestClient) stays allowed.
+# H08: the same guard covers all 14 B32 hedge writes
+# (POST simulate/plans/activate/close/ack, PATCH legs) because every hedge
+# route stays under /api/short/. Unknown JSON fields are rejected with 422
+# in api/shortlab.py (never silently dropped); a full write queue answers
+# 503 LOCAL_WRITE_BUSY without committing or reporting success. A 005
+# migration failure only disables Hedge (runtime.hedge_available False);
+# the legacy /api/scan family never imports Short-Lab and keeps serving.
+import re as _re
+
+_SHORT_WRITE_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
+_ALLOWED_ORIGIN_RE = _re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "testserver"})
+
+
+def _short_origin_allowed(origin: str | None) -> bool:
+    if not origin:
+        return True
+    return bool(_ALLOWED_ORIGIN_RE.match(origin.strip()))
+
+
+def _short_host_allowed(host: str | None) -> bool:
+    if not host:
+        return True
+    h = host.strip().lower()
+    # Strip port (and brackets for IPv6 loopback).
+    if h.startswith("["):
+        end = h.find("]")
+        hostname = h[1:end] if end != -1 else h
+    elif h.count(":") > 1 and h.count(".") == 0:
+        hostname = h  # bare IPv6 without port
+    else:
+        hostname = h.split(":")[0]
+    hostname = hostname.strip("[] ")
+    return hostname in _ALLOWED_HOSTS
+
+
+def _short_is_write(path: str, method: str) -> bool:
+    return path.startswith("/api/short/") and method.upper() in _SHORT_WRITE_METHODS
 
 
 def _log(msg: str, status: int = 200, ms: int = 0) -> None:
@@ -203,8 +248,40 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Dive Into Crypto — Desktop", version=VERSION, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware, allow_origins=["http://127.0.0.1", "http://localhost"],
-        allow_origin_regex=r"http://(127\.0\.0\.1|localhost):\d+", allow_methods=["GET", "POST"], allow_headers=["*"],
+        allow_origin_regex=r"http://(127\.0\.0\.1|localhost)(:\d+)?",
+        allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def shortlab_write_guard(request: Request, call_next):  # F08 A9.2
+        path = str(request.url.path or "")
+        method = str(request.method or "").upper()
+        if _short_is_write(path, method):
+            origin = request.headers.get("origin")
+            if not _short_origin_allowed(origin):
+                return JSONResponse(
+                    {"error": "short_forbidden_origin", "detail": "cross-site write rejected"},
+                    status_code=403,
+                )
+            host = request.headers.get("host")
+            if not _short_host_allowed(host):
+                return JSONResponse(
+                    {"error": "short_forbidden_host", "detail": "untrusted host"},
+                    status_code=403,
+                )
+            try:
+                content_length = int(request.headers.get("content-length") or "0")
+            except (TypeError, ValueError):
+                content_length = 0
+            if content_length > 0:
+                ctype = (request.headers.get("content-type") or "").lower()
+                if "application/json" not in ctype:
+                    return JSONResponse(
+                        {"error": "short_invalid_content_type",
+                         "detail": "writes require application/json"},
+                        status_code=415,
+                    )
+        return await call_next(request)
     # Task 14 (sole owner of this block): mount the Short-Lab router on the
     # same FastAPI process. No old path/schema is touched.
     try:
@@ -557,7 +634,11 @@ def create_app() -> FastAPI:
                     pass
                 await ws.send_json(await _live_snapshot(symbol))
                 await asyncio.sleep(5)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
+            # RuntimeError covers the send-after-disconnect race: the client
+            # may close between receive_text and send_json, and Starlette
+            # then raises "Cannot call send once disconnected" instead of
+            # WebSocketDisconnect. Both mean a clean session teardown.
             return
 
     if _UI_DIST.exists():

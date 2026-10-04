@@ -2,7 +2,7 @@
 # End-to-end smoke: launch the real service and verify it serves real data.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-PORT="${1:-8799}"
+PORT="${1:-52523}"
 BASE="http://127.0.0.1:${PORT}"
 
 uv run dive-desktop --no-open --port "$PORT" >/tmp/dive-desktop-e2e.log 2>&1 &

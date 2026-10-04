@@ -20,6 +20,37 @@ from typing import Any, Awaitable, Callable, TypeVar
 import aiohttp
 from aiolimiter import AsyncLimiter
 
+from diveintocrypto_desktop.shortlab.request_budget import (
+    ENDPOINT_WEIGHTS_VERSION,
+    UNBUDGETED_ENDPOINT,
+    BudgetExhausted,
+    Denied,
+    RequestContext,
+    UnbudgetedEndpointError,
+    endpoint_family_for_url,
+    endpoint_weight,
+    get_current_request_context,
+    host_from_url,
+)
+
+__all__ = [
+    "FAPI_BASE",
+    "FAPI_V1",
+    "FAPI_DATA",
+    "TransientUpstreamError",
+    "BudgetExhausted",
+    "UnbudgetedEndpointError",
+    "UNBUDGETED_ENDPOINT",
+    "ENDPOINT_WEIGHTS_VERSION",
+    "retry_delay",
+    "run_with_retries",
+    "get_json",
+    "get_session",
+    "close_session",
+    "endpoint_family_for_url",
+    "endpoint_weight",
+]
+
 # USDT-M futures REST roots (override the host via DIVE_FAPI_BASE if needed).
 FAPI_BASE = os.environ.get("DIVE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 FAPI_V1 = f"{FAPI_BASE}/fapi/v1"
@@ -109,24 +140,161 @@ def _retry_after_seconds(resp: aiohttp.ClientResponse) -> float | None:
         return None  # HTTP-date form: fall back to exponential backoff
 
 
-async def get_json(url: str, params: dict[str, Any] | None = None, *, rate_limited: bool = False) -> Any:
+async def get_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    *,
+    rate_limited: bool = False,
+    request_context: RequestContext | None = None,
+) -> Any:
     """GET a JSON document with transient-failure retries.
 
     Set ``rate_limited`` for futures/data endpoints (shared 40/60s limiter).
+
+    ``request_context`` is additive (F03): when it carries a
+    :class:`RequestBudget`, every real attempt (first try, retry, pagination
+    page) atomically reserves via ``try_acquire`` and is recorded by
+    ``Permit.mark_sent``; cancellation before the send releases, an
+    already-sent attempt is never refunded. Unknown endpoints (no weight
+    fixture) raise :class:`UnbudgetedEndpointError` without sending.
+    ``None`` preserves the legacy unbounded path (existing callers/tests).
     """
 
-    async def send() -> Any:
-        session = await get_session()
-        if rate_limited:
-            loop = asyncio.get_running_loop()
-            if loop not in _RATIO_LIMITERS:
-                _RATIO_LIMITERS[loop] = AsyncLimiter(max_rate=40, time_period=60)
-            limiter = _RATIO_LIMITERS[loop]
-            async with limiter:
-                return await _read_json(session, url, params)
-        return await _read_json(session, url, params)
+    ctx = request_context if request_context is not None else get_current_request_context()
+    budget = ctx.budget if ctx is not None else None
+    if budget is None:
+        async def send() -> Any:
+            session = await get_session()
+            if rate_limited:
+                loop = asyncio.get_running_loop()
+                if loop not in _RATIO_LIMITERS:
+                    _RATIO_LIMITERS[loop] = AsyncLimiter(max_rate=40, time_period=60)
+                limiter = _RATIO_LIMITERS[loop]
+                async with limiter:
+                    return await _read_json(session, url, params)
+            return await _read_json(session, url, params)
 
-    return await run_with_retries(send)
+        return await run_with_retries(send)
+
+    # -- budgeted path: unique send point, one retry loop (F03.1/F03.2) -------
+    family = endpoint_family_for_url(url) or (ctx.endpoint_family if ctx is not None else None)
+    if family is None:
+        raise UnbudgetedEndpointError(
+            f"{UNBUDGETED_ENDPOINT}: no family for url={url!r} "
+            f"(weights {ENDPOINT_WEIGHTS_VERSION}); refusing to send"
+        )
+    weight = endpoint_weight(family, params)
+    if weight is None:
+        raise UnbudgetedEndpointError(
+            f"{UNBUDGETED_ENDPOINT}: no weight fixture for family={family!r} "
+            f"params={params!r} (weights {ENDPOINT_WEIGHTS_VERSION}); refusing to send"
+        )
+    host = host_from_url(url)
+    job_type = ctx.job_type if ctx is not None else "entry"
+
+    last: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        permit = budget.try_acquire(host, weight, job_type, family)
+        if isinstance(permit, Denied) or permit is False:
+            denied = permit if isinstance(permit, Denied) else Denied()
+            raise BudgetExhausted(
+                denied.message,
+                reason_code=denied.reason_code,
+                next_allowed_at_ms=denied.next_allowed_at_ms,
+                job_type=denied.job_type or job_type,
+                endpoint_family=denied.endpoint_family or family,
+            )
+        marked = False
+
+        def _mark() -> None:
+            nonlocal marked
+            if not marked:
+                permit.mark_sent()
+                marked = True
+
+        try:
+            session = await get_session()
+            if rate_limited:
+                loop = asyncio.get_running_loop()
+                if loop not in _RATIO_LIMITERS:
+                    _RATIO_LIMITERS[loop] = AsyncLimiter(max_rate=40, time_period=60)
+                limiter = _RATIO_LIMITERS[loop]
+                async with limiter:
+                    try:
+                        cm = session.get(url, params=params)
+                    except asyncio.CancelledError:
+                        permit.release_unsent()
+                        raise
+                    except Exception:
+                        # get() itself failed before any send: release.
+                        permit.release_unsent()
+                        raise
+                    try:
+                        async with cm as resp:
+                            _mark()
+                            if resp.status in _RETRYABLE_STATUSES:
+                                raise TransientUpstreamError(
+                                    resp.status, _retry_after_seconds(resp)
+                                )
+                            resp.raise_for_status()
+                            return await resp.json()
+                    except asyncio.CancelledError:
+                        if not marked:
+                            permit.release_unsent()
+                        raise
+                    except TransientUpstreamError:
+                        if not marked:
+                            _mark()
+                        raise
+                    except Exception:
+                        if not marked:
+                            _mark()
+                        raise
+            else:
+                try:
+                    cm = session.get(url, params=params)
+                except asyncio.CancelledError:
+                    permit.release_unsent()
+                    raise
+                except Exception:
+                    permit.release_unsent()
+                    raise
+                try:
+                    async with cm as resp:
+                        _mark()
+                        if resp.status in _RETRYABLE_STATUSES:
+                            raise TransientUpstreamError(
+                                resp.status, _retry_after_seconds(resp)
+                            )
+                        resp.raise_for_status()
+                        return await resp.json()
+                except asyncio.CancelledError:
+                    if not marked:
+                        permit.release_unsent()
+                    raise
+                except TransientUpstreamError:
+                    if not marked:
+                        _mark()
+                    raise
+                except Exception:
+                    if not marked:
+                        _mark()
+                    raise
+        except BudgetExhausted:
+            raise
+        except UnbudgetedEndpointError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except TransientUpstreamError as exc:
+            last = exc
+            if attempt >= _MAX_RETRIES:
+                raise
+            await asyncio.sleep(retry_delay(attempt, getattr(exc, "retry_after", None)))
+            continue
+        except Exception:
+            raise
+    raise last  # pragma: no cover - loop always returns or raises
 
 
 async def _read_json(session: aiohttp.ClientSession, url: str, params: dict[str, Any] | None) -> Any:

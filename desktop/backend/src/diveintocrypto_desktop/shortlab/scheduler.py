@@ -52,6 +52,49 @@ class UnknownJobError(KeyError):
     """A manual trigger named a job_type the scheduler never registered."""
 
 
+#: F06a base-run defaults (design A7.3): ordinary jobs share the 300s jitter
+#: budget; H08 high-frequency jobs register separately with jitter 0.
+F06A_BASE_JOBS: tuple[str, ...] = (
+    "score_refresh",
+    "funding_backfill",
+    "contract_refresh",
+    "metadata",
+)
+#: F06b callback jobs (design A8/A9.4): grader (F07 ``run_due``) + retention
+#: (F09 ``maintain``) on the single shared service. Strings must match
+#: ``service.JOB_TYPE_GRADER`` / ``service.JOB_TYPE_MAINTENANCE`` so the
+#: runtime scheduler registration and ``service.run_refresh`` stay consistent.
+JOB_TYPE_GRADER = "grader"
+JOB_TYPE_MAINTENANCE = "maintenance"
+F06B_CALLBACK_JOBS: tuple[str, ...] = (
+    JOB_TYPE_GRADER,
+    JOB_TYPE_MAINTENANCE,
+)
+#: Full F06 default wiring: base-run + callbacks (F06b steady state).
+F06_DEFAULT_JOBS: tuple[str, ...] = F06A_BASE_JOBS + F06B_CALLBACK_JOBS
+ORDINARY_JITTER_MAX_SEC = 300.0
+#: H08 hedge jobs (design B30): opportunity + venue refresh plus the
+#: high-frequency active monitor + settlement check. The active pair must be
+#: registered with ``jitter_max_sec=0`` (never inherit the ordinary 300s
+#: jitter); per-asset collection is shared (one fetch per symbol per tick)
+#: with quantity-keyed VWAP, deep-quote cap 10, fair rotation and
+#: MONITOR_CAPACITY_LIMITED honesty. Lifecycle recovery / stop-await is owned
+#: by ``ShortLabRuntime.stop`` (scheduler.stop + service.shutdown before DB
+#: close).
+JOB_TYPE_HEDGE_OPPORTUNITY = "funding_capture_refresh"
+JOB_TYPE_HEDGE_VENUE = "hedge_venue_refresh"
+JOB_TYPE_HEDGE_MONITOR = "hedge_monitor"
+JOB_TYPE_HEDGE_SETTLEMENT = "hedge_settlement_check"
+H08_HEDGE_JOBS: tuple[str, ...] = (
+    JOB_TYPE_HEDGE_OPPORTUNITY,
+    JOB_TYPE_HEDGE_VENUE,
+    JOB_TYPE_HEDGE_MONITOR,
+    JOB_TYPE_HEDGE_SETTLEMENT,
+)
+#: High-frequency pair that must stay jitter 0 (B30 10s/30s).
+H08_JITTER_ZERO_JOBS: frozenset[str] = frozenset({JOB_TYPE_HEDGE_MONITOR, JOB_TYPE_HEDGE_SETTLEMENT})
+
+
 @dataclass
 class PeriodicJob:
     """One registered periodic job (mutable run counters, fixed schedule)."""
@@ -86,7 +129,18 @@ class _LoopLocks:
 
 
 class ShortLabScheduler:
-    """Process-local periodic task runner for Short-Lab refresh jobs."""
+    """Process-local periodic task runner for Short-Lab refresh jobs (F06b/A7.3).
+
+    One asyncio task per registered job; a per-job async lock guarantees a
+    single running instance per ``job_type`` so a manual refresh and its
+    scheduled twin reuse/serialize instead of scanning twice. Ordinary jobs
+    (``F06_DEFAULT_JOBS``: base-run plus F06b grader/retention callbacks)
+    draw ``jitter_fn(jitter_max_sec)`` before every planned execution
+    (default 0..300s from ``refresh.jitter_sec``); manual triggers skip
+    jitter but take the same per-job lock. High-frequency monitor / hedge
+    settlement checks (H08) register with ``jitter_max_sec=0`` and never
+    inherit the ordinary 300s jitter.
+    """
 
     def __init__(
         self,
@@ -139,6 +193,10 @@ class ShortLabScheduler:
 
     def job_types(self) -> tuple[str, ...]:
         return tuple(self._jobs)
+
+    def has_job(self, job_type: str) -> bool:
+        """Whether ``job_type`` is registered (F06a default-wiring check)."""
+        return job_type in self._jobs
 
     def lock_for(self, job_type: str) -> asyncio.Lock:
         """The single-instance lock for ``job_type`` (shared with manual triggers)."""

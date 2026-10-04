@@ -63,6 +63,9 @@ OUTCOME_STATUSES = ("PENDING", "COMPLETE", "CENSORED", "UNAVAILABLE")
 
 PENDING_NOT_DUE = "PENDING_NOT_DUE"
 NOT_GRADED = "NOT_GRADED"
+#: Due but never graded (F07/A8): metrics reports it as UNAVAILABLE with this
+#: reason and a queue depth; run_due grades the missing row on its next pass.
+NOT_GRADED_DUE = "NOT_GRADED_DUE"
 NO_ENTRY_BAR = "NO_ENTRY_BAR"
 NO_EXIT_BAR = "NO_EXIT_BAR"
 EXIT_BAR_INCOMPLETE = "EXIT_BAR_INCOMPLETE"
@@ -457,6 +460,21 @@ async def grade(
         await repository.save_outcome(record)
         return record
 
+    # Idempotent re-grade: the outcome key (score, horizon, formula, cost)
+    # is write-once (F01 immutability). A stored row is returned as-is so a
+    # retried run_due batch never raises SnapshotImmutableError. In
+    # particular run_due never mints PENDING rows (see below), so a stored
+    # PENDING row can only come from an explicit pre-maturity grade and is
+    # left for the metrics queue count instead of being overwritten here.
+    try:
+        existing = await repository.get_outcome(
+            score_snapshot_id, horizon, FORMULA_VERSION, cost_hash
+        )
+    except Exception:  # noqa: BLE001 - a failed read never blocks grading
+        existing = None
+    if existing is not None:
+        return existing
+
     # Best-effort audit read of the point-in-time feature snapshot. It proves
     # the score existed with archived inputs; grading never falls back to
     # live data when it is absent.
@@ -483,7 +501,11 @@ async def grade(
     )
 
     if as_of_ms < due_ms and not delisted_before_due:
-        return await _persist(_store())
+        # F07/A8: PENDING is virtual until maturity. It is returned without a
+        # DB write so a later terminal grade for the same key never hits the
+        # F01 write-once guard; metrics counts missing rows as PENDING and
+        # run_due only grades once due.
+        return _store()
 
     klines = klines_fn or _default_klines_fn
     funding = funding_fn or _default_funding_fn

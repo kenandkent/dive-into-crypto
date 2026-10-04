@@ -23,10 +23,10 @@ Requires **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/). The UI ships p
 ```bash
 cd desktop/backend
 uv sync                  # backend + Crypcodile (pinned commit)
-uv run short-lab         # serves 127.0.0.1:8780 and opens the UI
+uv run short-lab         # serves 127.0.0.1:46408 and opens the UI
 
 uv run short-lab --no-open              # serve only
-uv run short-lab --port 8888            # custom port
+uv run short-lab --port 45477           # custom port
 uv run dive-desktop                     # legacy alias, same entry
 ```
 
@@ -124,7 +124,7 @@ UNAVAILABLE / VETO states, Evidence 7D/30D/90D). Deep-link a view with `#panel`,
 ```bash
 cd desktop/backend
 uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
-dist/short-lab/short-lab.exe     # serves 127.0.0.1:8780, user data under %LOCALAPPDATA%/short-lab
+dist/short-lab/short-lab.exe     # serves 127.0.0.1:46408, user data under %LOCALAPPDATA%/short-lab
 ```
 
 Details: [docs/packaging.md](../docs/packaging.md). Desktop releases ship from

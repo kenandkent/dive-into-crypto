@@ -169,6 +169,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/ui | Out-Null
           Copy-Item -Recurse -Force ..\ui\dist dist\ui\dist
 
+      - name: Verify real frozen product (two boots, schema 005, UI and writable data)
+        working-directory: desktop/backend
+        shell: pwsh
+        run: uv run python ../../scripts/smoke_shortlab_packaged.py --executable dist/short-lab/short-lab.exe --fixture --output-dir runtime/verification/packaged-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Zip the packaged tree
         working-directory: desktop/backend
         shell: pwsh
@@ -189,7 +194,7 @@ jobs:
             echo "# short-lab ${GITHUB_REF_NAME} (Desktop-only)"
             echo
             echo "Research build — not an automated trader, places no orders."
-            echo "Unzip and run \`short-lab/short-lab.exe\` (serves 127.0.0.1:8780)."
+            echo "Unzip and run \`short-lab/short-lab.exe\` (serves 127.0.0.1:46408)."
             echo "Provider keys are read from the environment, never bundled."
             echo
             echo "Upgrading in the same Python environment: uninstall the old"
@@ -206,9 +211,24 @@ jobs:
             short-lab-windows-x64.zip
 
       - name: Upload desktop package artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: short-lab-windows-x64
           path: desktop/backend/short-lab-windows-x64.zip
           if-no-files-found: error
           retention-days: 14
+
+      # H11 delivery gate (design C3.4): the same verification tree the smoke
+      # and packaging tests write locally (desktop/backend/runtime/
+      # verification/) is uploaded as its own artifact — even when an
+      # earlier step failed — so every C3 row stays downloadable. Android
+      # job untouched.
+      - name: Upload desktop verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-lab-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/backend/runtime/verification/
+          if-no-files-found: error
+          retention-days: 30

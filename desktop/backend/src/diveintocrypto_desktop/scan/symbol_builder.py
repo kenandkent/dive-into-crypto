@@ -297,17 +297,29 @@ async def build_symbol(
     the truncated window (labeled via ``price_note``); ``ch`` is omitted — a
     24h change measured NOW says nothing about the past window; ``cvd`` ships
     as the explicit ``{"unavailable": "historical_view"}`` marker.
+
+    F07/A8 live-pollution guard: OI / long-short ratios / funding history have
+    no point-in-time cutoff in these adapters (they would read the CURRENT
+    series for a PAST ``end_ms``). Historical views therefore never fetch
+    them: the OI/ratio/funding/micro blocks are returned as the explicit
+    ``{"unavailable": "HISTORICAL_INPUT_UNAVAILABLE"}`` marker while the
+    K-line indicators (multiTf/indicators/regime/vol) still compute from the
+    truncated candles. Restoring full history requires stored historical
+    inputs or an adapter with proven historical cutoff -- never the live
+    series. In particular historical Entry must never be rebuilt from
+    ``build_symbol(end_ms)``; Short-Lab reads archived Entry snapshots.
     """
     historical = end_ms is not None
     if historical:
         meta: dict = {}
         cvd_snap = {"unavailable": "historical_view"}
-        candles_by_tf, oi, ratio_series, funding_rows = await asyncio.gather(
-            kl.fetch_all_tf(symbol, limit=300, end_ms=end_ms),
-            oi_mod.fetch_oi_hist(symbol, "5m", limit=48),
-            rat.fetch_ratio_series(symbol, "5m", limit=48),
-            fnd.funding_hist(symbol, limit=48),
-        )
+        # F07: klines only. OI/ratio/funding would be live reads for a past
+        # window, so they are not fetched at all (a test asserts the fetchers
+        # are never called).
+        candles_by_tf = await kl.fetch_all_tf(symbol, limit=300, end_ms=end_ms)
+        oi: list = []
+        ratio_series: dict = {}
+        funding_rows: list = []
     else:
         candles_by_tf, oi, ratio_series, funding_rows, meta, cvd_snap = await asyncio.gather(
             kl.fetch_all_tf(symbol, limit=300, end_ms=end_ms),
@@ -317,7 +329,10 @@ async def build_symbol(
             _ticker_24hr(symbol),
             cvd_mod.snapshot(symbol),
         )
-    div_inputs = await _divergence_inputs(symbol, candles_by_tf)
+    if historical:
+        div_inputs: dict = {}
+    else:
+        div_inputs = await _divergence_inputs(symbol, candles_by_tf)
 
     fivem = candles_by_tf.get("5m") or []
     series_data = {
@@ -349,6 +364,17 @@ async def build_symbol(
         obj.pop("ch", None)  # a live 24h change is meaningless for a past window
         if last_close:
             obj["price_note"] = "last close of the kline window ending at end_ms (historical view)"
+        # F07/A8: blocks without a historical cutoff are explicit, never
+        # live and never zero-filled. K-line blocks (multiTf/indicators/
+        # regime/vol/planning) above still compute from truncated candles.
+        _hist_unavail = {"unavailable": "HISTORICAL_INPUT_UNAVAILABLE"}
+        obj["cascade"] = dict(_hist_unavail)
+        obj["microstructure"] = dict(_hist_unavail)
+        obj["divergence"] = {"score": 0.0, "tf": None, "coverage": 0,
+                             "unavailable": "HISTORICAL_INPUT_UNAVAILABLE"}
+        obj["divergence_tier"] = "NONE"
+        for _key in ("funding_lens", "book", "ls_term", "spot_perp", "basis"):
+            obj[_key] = dict(_hist_unavail)
     return obj
 
 

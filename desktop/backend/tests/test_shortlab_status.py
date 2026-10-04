@@ -703,3 +703,86 @@ class TestDeriveStatus:
             text = (root / rel).read_text(encoding="utf-8")
             for token in ("aiohttp", "requests", "httpx", "duckdb", "sqlite", "get_json", "fetch_"):
                 assert token not in text, f"{rel} must stay pure (found {token!r})"
+
+
+# ---------------------------------------------------------------------------
+# F05: frozen policy DQ parity + explicit risk/status thresholds
+# ---------------------------------------------------------------------------
+
+
+class TestF05PolicyParity:
+    def test_v2_policy_matches_legacy_on_fresh_inputs(self):
+        from diveintocrypto_desktop.shortlab.config import (
+            load_shortlab_config as _load,
+        )
+        from diveintocrypto_desktop.shortlab.config import policy_hash as _phash
+        from diveintocrypto_desktop.shortlab.quality import (
+            quality_policy_from_config as _from_config,
+        )
+
+        config = _load()
+        frozen = _from_config(config, policy_hash=_phash(config))
+        assert frozen.version == "quality-policy-v2"
+        assert data_quality("LITE", _fresh_states(), ASOF_MS, frozen) == data_quality(
+            "LITE", _fresh_states(), ASOF_MS
+        )
+
+    def test_future_timestamp_invalid_only_under_v2(self):
+        from diveintocrypto_desktop.shortlab.quality import (
+            default_quality_policy as _default_policy,
+        )
+
+        future = _fresh_states(
+            funding_30d=FieldState(
+                "funding_30d", "OK", fetched_at_ms=_fetched(-60)
+            )
+        )
+        v2 = data_quality("LITE", future, ASOF_MS, _default_policy())
+        assert v2.field_details["funding_30d"].freshness == pytest.approx(0.0)
+        assert v2.stale is True
+        v1 = data_quality("LITE", future, ASOF_MS)
+        assert v1.field_details["funding_30d"].freshness == pytest.approx(1.0)
+        assert v1.stale is False
+
+    def test_explicit_thresholds_default_to_legacy(self):
+        calm = _ready_metadata(price_change_7d=0.10)
+        assert evaluate_risks({}, calm, 95.0) == evaluate_risks(
+            {}, dict(calm), 95.0,
+            veto_dq_threshold=60, breakout_24h=0.35, breakout_7d=0.70,
+            new_token_days=45,
+            hard_min_futures_qv=10_000_000.0, hard_min_oi_usd=2_000_000.0,
+        )
+        strict = evaluate_risks({}, calm, 95.0, breakout_7d=0.05)
+        assert PAUSE_BREAKOUT_7D in strict.pauses
+        assert PAUSE_BREAKOUT_7D not in evaluate_risks({}, calm, 95.0).pauses
+
+    def test_risk_policy_splat_scores_under_pinned_policy(self):
+        from diveintocrypto_desktop.shortlab.config import (
+            load_shortlab_config as _load,
+        )
+        from diveintocrypto_desktop.shortlab.risk.veto import (
+            risk_policy_from_config as _risk_from_config,
+        )
+
+        policy = _risk_from_config(_load())
+        assert policy.breakout_24h == pytest.approx(0.35)
+        assert policy.new_token_days == 45
+        assert policy.veto_dq_threshold == 60
+        meta = _ready_metadata(price_change_7d=0.10)
+        assert evaluate_risks(
+            {}, meta, 95.0, breakout_24h=policy.breakout_24h,
+            breakout_7d=policy.breakout_7d, new_token_days=policy.new_token_days,
+            hard_min_futures_qv=policy.hard_min_futures_qv,
+            hard_min_oi_usd=policy.hard_min_oi_usd,
+            veto_dq_threshold=policy.veto_dq_threshold,
+        ) == evaluate_risks({}, dict(meta), 95.0)
+
+    def test_derive_status_veto_threshold_explicit(self):
+        low = derive_status(
+            85, 80, 65.0, 8.0, _identity(), _ready_risk(), False,
+            veto_dq_threshold=80,
+        )
+        assert low.execution_status == "BLOCKED"
+        assert derive_status(
+            85, 80, 65.0, 8.0, _identity(), _ready_risk(), False
+        ).execution_status == "NOT_READY"

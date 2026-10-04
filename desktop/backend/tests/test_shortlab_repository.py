@@ -313,9 +313,9 @@ def test_public_db_methods_are_async_and_single_worker(repo):
 async def test_migrate_empty_then_repeat_preserves_data(tmp_path):
     handle = await ShortLabRepository.open(tmp_path / "fresh.duckdb")
     try:
-        assert await handle.migrate() == 1
+        assert await handle.migrate() == 4  # F01 base target (was 1 pre-F01)
         await handle.save_feature(_feature())
-        assert await handle.migrate() == 1  # repeat: no-op, no wipe
+        assert await handle.migrate() == 4  # repeat: no-op, no wipe
         stored = await handle.get_feature("feat-1")
         assert stored is not None and stored.symbol == "BTCUSDT"
     finally:
@@ -813,3 +813,153 @@ async def test_runtime_tables_and_indexes_match_design(repo):
     names = await repo.index_names()
     for index in EXPECTED_INDEXES:
         assert index in names, index
+
+
+# ---------------------------------------------------------------------------
+# F01 appendix: contracts, source persistence and execution gate
+# (plan F01 L133/L152-154; design A6.1/A6.2/B28.8/C3.2)
+# ---------------------------------------------------------------------------
+
+
+def test_h01_schema_constants_point_at_version_5():
+    from diveintocrypto_desktop.shortlab import repository as repo_mod
+
+    assert repo_mod.SCHEMA_VERSION == 5
+    assert repo_mod.MIGRATIONS == (
+        (1, "001_init.sql"),
+        (2, "002_unlock_social.sql"),
+        (3, "003_catalyst.sql"),
+        (4, "004_core_completion.sql"),
+        (5, "005_hedge_advisor.sql"),
+    )
+    assert repo_mod.QUEUE_CAPACITY == 256
+    assert repo_mod.QUEUE_AGING_SEC == 30.0
+    assert (
+        repo_mod.PRIORITY_CRITICAL,
+        repo_mod.PRIORITY_USER_QUERY,
+        repo_mod.PRIORITY_SOURCE_SCORE,
+        repo_mod.PRIORITY_BACKFILL,
+        repo_mod.PRIORITY_RETENTION,
+    ) == (0, 1, 2, 3, 4)
+
+
+def test_f01_schema_target_defaults_to_base_4():
+    from diveintocrypto_desktop.shortlab.config import load_shortlab_config
+    from diveintocrypto_desktop.shortlab.repository import schema_target_for_config
+
+    assert schema_target_for_config(load_shortlab_config()) == 4
+
+
+def test_f01_22_contract_methods_are_async_and_exported():
+    import dataclasses
+
+    from diveintocrypto_desktop.shortlab import repository as repo_mod
+
+    expected = [
+        "upsert_asset", "upsert_asset_mapping",
+        "save_identity_snapshot", "get_identity_snapshot",
+        "save_contract_rules_snapshot", "get_contract_rules_snapshot",
+        "latest_contract_rules",
+        "save_contract_lifecycle", "latest_contract_lifecycle",
+        "list_tracked_symbols",
+        "upsert_funding_events", "list_funding_events",
+        "save_funding_observation",
+        "save_fundamental_snapshot", "get_fundamental_before",
+        "save_config_snapshot", "get_config_snapshot",
+        "save_cursor", "load_cursor",
+        "list_scores_for_evidence", "list_due_scores",
+        "maintain_retention",
+    ]
+    assert len(expected) == 22
+    for name in expected:
+        assert asyncio.iscoroutinefunction(getattr(ShortLabRepository, name)), name
+    for record in (
+        "AssetRecord", "AssetMappingRecord", "IdentitySnapshotRecord",
+        "ContractRulesSnapshotRecord", "ContractLifecycleRecord",
+        "FundingEventRecord", "FundingObservationRecord",
+        "FundamentalSnapshotRecord", "ConfigSnapshotRecord",
+        "RetentionStats", "EvidencePage",
+    ):
+        cls = getattr(repo_mod, record)
+        assert dataclasses.is_dataclass(cls), record
+        assert cls.__dataclass_params__.frozen, record
+
+
+def test_f01_004_ddl_matches_design_a6_2_field_by_field():
+    from diveintocrypto_desktop.shortlab import repository as repo_mod
+
+    sql = (
+        Path(repo_mod.__file__).resolve().parent
+        / "migrations" / "004_core_completion.sql"
+    ).read_text(encoding="utf-8")
+    found: dict[str, list[str]] = {}
+    for match in re.finditer(
+        r"CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\);", sql, re.S
+    ):
+        table, body = match.group(1), match.group(2)
+        columns = []
+        for part in re.split(r",\s*\n", body):
+            name = part.strip().split()[0]
+            if name in ("PRIMARY", "FOREIGN", "CONSTRAINT", "UNIQUE", "CHECK"):
+                continue
+            columns.append(name)
+        found[table] = columns
+    assert found["sl_config_snapshot"] == [
+        "policy_hash", "config_hash", "policy_version", "canonical_json",
+        "created_at_ms",
+    ]
+    assert found["sl_identity_snapshot"] == [
+        "identity_snapshot_id", "futures_symbol", "canonical_id",
+        "mapping_version", "observed_at_ms", "identity_json",
+    ]
+    assert found["sl_contract_rules_snapshot"] == [
+        "snapshot_id", "symbol", "source_as_of_ms", "known_at_ms", "rules_json",
+    ]
+    assert found["sl_funding_observation"] == [
+        "observation_id", "symbol", "funding_time_ms", "known_at_ms",
+        "raw_json", "interval_hours", "interval_source", "observation_status",
+    ]
+    assert found["sl_data_cursor"] == [
+        "job_type", "cursor_key", "cursor_json", "updated_at_ms",
+    ]
+    assert "PRIMARY KEY(job_type, cursor_key)" in sql
+    for index in (
+        "idx_sl_identity_time", "idx_sl_rules_time",
+        "idx_sl_funding_observation_time", "idx_sl_contract_seen",
+        "idx_sl_fundamental_asset_time", "idx_sl_evidence_score_time",
+    ):
+        assert index in sql, index
+
+
+@pytest.mark.asyncio
+async def test_f01_source_meta_extension_keys_round_trip(repo):
+    from diveintocrypto_desktop.shortlab.models import SOURCE_META_EXTENSION_KEYS
+
+    assert SOURCE_META_EXTENSION_KEYS == frozenset(
+        {"_policy", "_identity_snapshot_id"}
+    )
+    meta = _feature_meta()
+    meta["_policy"] = {
+        "status": "OK", "fetched_at_ms": FETCHED, "as_of_ms": AS_OF,
+        "coverage_fraction": 1.0, "reason_code": None, "source": "policy-v1",
+    }
+    meta["_identity_snapshot_id"] = {
+        "status": "OK", "fetched_at_ms": FETCHED, "as_of_ms": AS_OF,
+        "coverage_fraction": 1.0, "reason_code": None, "source": "id-1",
+    }
+    await repo.save_feature(_feature(sid="feat-policy", meta=meta))
+    stored = await repo.get_feature("feat-policy")
+    assert stored is not None
+    assert stored.source_meta["_policy"]["source"] == "policy-v1"
+    assert stored.source_meta["_identity_snapshot_id"]["source"] == "id-1"
+    assert await repo.feature_source_status("feat-policy") == "OK"
+
+
+@pytest.mark.asyncio
+async def test_f01_busy_error_carries_http503_local_write_busy():
+    from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError
+
+    err = LocalWriteBusyError("HTTP503 LOCAL_WRITE_BUSY: full")
+    assert err.status_code == 503
+    assert err.error_code == "LOCAL_WRITE_BUSY"
+    assert "LOCAL_WRITE_BUSY" in str(err)

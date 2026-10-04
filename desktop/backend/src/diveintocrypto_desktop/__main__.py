@@ -1,8 +1,9 @@
 """Entry point: start the local service, serve the UI, open the browser.
 
-    uv run dive-desktop                 # serve + open the UI in your browser
-    uv run dive-desktop --no-open       # serve only (no browser)
-    uv run dive-desktop --port 8888
+    uv run short-lab                 # serve + open the UI in your browser
+    uv run short-lab --no-open       # serve only (no browser)
+    uv run short-lab --port 46408
+    uv run dive-desktop               # legacy compat alias, same entry
 """
 
 from __future__ import annotations
@@ -14,9 +15,10 @@ import webbrowser
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="dive-desktop", description="Dive Into Crypto — Desktop Edition")
+    parser = argparse.ArgumentParser(prog="short-lab", description="short-lab — Desktop Edition")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8780)
+    # 项目约定：所有需端口的服务一律使用 40000~60000 区间内的端口。
+    parser.add_argument("--port", type=int, default=46408)
     parser.add_argument("--no-open", action="store_true", help="do not open a browser window")
     args = parser.parse_args()
 
@@ -34,7 +36,7 @@ def main() -> None:
                 pass
         threading.Thread(target=_open, daemon=True).start()
 
-    print(f"Dive Into Crypto — Desktop  →  {url}  (Ctrl+C to stop)")
+    print(f"short-lab  →  {url}  (Ctrl+C to stop)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

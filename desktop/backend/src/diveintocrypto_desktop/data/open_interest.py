@@ -25,6 +25,7 @@ from typing import Any
 from crypcodile.exchanges.binance.backfill import _live_fetch_open_interest_hist, parse_open_interest_hist
 
 from diveintocrypto_desktop.data.http import FAPI_DATA, TransientUpstreamError, run_with_retries
+from diveintocrypto_desktop.shortlab import observations as _obs
 
 _VENUE = "binance-usdm"
 
@@ -188,6 +189,77 @@ def enrich_oi_hist_with_usd(
         row["reason_code"] = res["reason_code"]
         out.append(row)
     return out
+
+
+def compute_oi_change_7d(
+    first_oi_usd: float | None,
+    last_oi_usd: float | None,
+    *,
+    oi_start_ms: int | None,
+    oi_end_ms: int | None,
+    price_start_ms: int | None,
+    price_end_ms: int | None,
+    tolerance_ms: int = _obs.OI_PRICE_SYNC_TOLERANCE_MS,
+) -> dict:
+    """7D OI change ``last/first - 1`` gated on price-window alignment (F02).
+
+    Both OI-window ends must agree with the price window within
+    ``tolerance_ms`` (one 5m period); a misaligned or incomplete window is
+    ``{"value": None, "reason_code": WINDOW_MISALIGNED}`` -- never a
+    zero-filled ratio. Non-positive/unverified USD legs are
+    ``OI_UNIT_UNVERIFIED`` (native quantity and USD nominal stay separated;
+    see :func:`resolve_oi_value_usd`).
+    """
+    usable, reason = _obs.oi_price_window_usable(
+        oi_start_ms, oi_end_ms, price_start_ms, price_end_ms, tolerance_ms
+    )
+    if not usable:
+        return {"value": None, "reason_code": reason}
+    try:
+        first = float(first_oi_usd) if first_oi_usd is not None else None
+        last = float(last_oi_usd) if last_oi_usd is not None else None
+    except (TypeError, ValueError):
+        return {"value": None, "reason_code": OI_UNIT_UNVERIFIED}
+    if first is None or last is None or not (first > 0 and last > 0):
+        return {"value": None, "reason_code": OI_UNIT_UNVERIFIED}
+    return {"value": last / first - 1.0, "reason_code": None}
+
+
+async def fetch_oi_hist_observed(
+    symbol: str,
+    period: str = "5m",
+    limit: int = 48,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[list[dict]]:
+    """Recent open-interest points wrapped as an ``Observed`` (F02).
+
+    Legacy :func:`fetch_oi_hist` keeps its signature and return type; the
+    wrapper only adds the PIT envelope (completion ``known_at``; native
+    ``oi`` quantity and quote ``oi_value`` nominal stay separated). OI
+    carries no result cache, so every call is fresh. ``as_of_ms`` is
+    accepted for the downstream cutoff check.
+    """
+    _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
+    points = await fetch_oi_hist(symbol, period, limit)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    times = sorted(_to_ms(p.get("t")) for p in points or [])
+    times = [t for t in times if t is not None]
+    return _obs.make_observation(
+        points,
+        source="binance-futures-oi",
+        source_as_of_ms=max(times) if times else None,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        window_start_ms=min(times) if times else None,
+        window_end_ms=max(times) if times else None,
+        complete=bool(points),
+        coverage_fraction=1.0 if points else 0.0,
+        units=_obs.ObservationUnits(qty_unit="BASE", quote_asset="USDT"),
+        identity_snapshot_id=identity_snapshot_id,
+    )
 
 
 async def fetch_oi_hist(symbol: str, period: str = "5m", limit: int = 48) -> list[dict]:

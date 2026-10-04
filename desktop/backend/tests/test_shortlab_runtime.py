@@ -105,6 +105,7 @@ def make_metadata(symbols: list[str], clock_ms: int, *, status: str = "TRADING",
             "status": status,
             "contract_type": "PERPETUAL",
             "observed_at_ms": clock_ms,
+            "quote_to_usd": "1",  # Explicit verified FX in this offline happy-path fixture.
             "contract_multiplier": None,
             "multiplier_source": None,
         }
@@ -661,7 +662,10 @@ async def test_funding_batches_80_per_5min_with_continuation(tmp_path) -> None:
     clock.advance(301_000)  # next 5-minute window
     observed["fetched_symbols"].clear()
     status2 = await service.run_refresh()
-    assert status2.stats["funding_requested"] == 80
+    # Complete archives from the first batch are reused; only the missing
+    # 20 symbols consume sends in the second window.
+    assert status2.stats["funding_requested"] == 20
+    assert status2.stats["funding_deferred"] == 0
     second_batch = set(observed["fetched_symbols"])
     # The 20 symbols deferred in run 1 are picked up first in run 2.
     deferred = {f"T{i:03d}USDT" for i in range(100)} - first_batch

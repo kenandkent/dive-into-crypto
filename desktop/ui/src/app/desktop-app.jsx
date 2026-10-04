@@ -142,6 +142,62 @@ function StaleBanner({stale,onRetry,onDismiss}){
    global no-data gate must not cover it. Extracted pure for tests. */
 function shortlabBypassesNoData(view){ return view==="shortlab"; }
 
+/* H09 Short-Lab sub-navigation (design B34): Candidates · Funding ·
+   Planner · Monitor · Alerts · Evidence. Stays inside the SHORT LAB product —
+   no new top-level product. Hash sub-routes (#/shortlab/funding …) resolve to
+   view "shortlab" (viewFromHash splits on "/" and keeps only the head), while
+   shortlabTabFromHash picks the inner tab. Every hedge page is guarded by
+   typeof so bundles without the H09 files (e.g. legacy Task-15 tests) still
+   render candidates. */
+const SHORTLAB_SUB_TABS = ["candidates", "funding", "planner", "monitor", "alerts", "evidence"];
+function shortlabTabFromHash(){
+  try{
+    const h = (typeof location !== "undefined" && location.hash ? location.hash : "").replace(/^#\/?/, "");
+    const parts = h.split("/");
+    if (parts[0] !== "shortlab") return "candidates";
+    const t = parts[1];
+    return SHORTLAB_SUB_TABS.includes(t) ? t : "candidates";
+  }catch(e){ return "candidates"; }
+}
+function ShortLabShell({ initialTab }){
+  const [tab, setTab] = useState(() => initialTab || shortlabTabFromHash());
+  useEffect(() => {
+    const onHash = () => setTab(shortlabTabFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const go = (t) => {
+    setTab(t);
+    try { const h = "#/shortlab/" + t; if (location.hash !== h) location.hash = h; } catch (e) {}
+  };
+  const tabBtn = (id, labelKey, fallback) => (
+    <button key={id} className={"chip" + (tab === id ? " on" : "")} role="tab"
+      aria-selected={tab === id} data-testid={`shortlab-tab-${id}`} onClick={() => go(id)}>
+      {(typeof L === "function" ? L(labelKey) : null) || fallback}
+    </button>
+  );
+  let page = null;
+  if (tab === "funding") page = (typeof FundingView !== "undefined") ? <FundingView/> : <div className="reason">Funding · H09 bundle missing</div>;
+  else if (tab === "planner") page = (typeof HedgePlanner !== "undefined") ? <HedgePlanner/> : <div className="reason">Planner · H09 bundle missing</div>;
+  else if (tab === "monitor") page = (typeof HedgeMonitor !== "undefined") ? <HedgeMonitor/> : <div className="reason">Monitor · H09 bundle missing</div>;
+  else if (tab === "alerts") page = (typeof HedgeAlerts !== "undefined") ? <HedgeAlerts/> : <div className="reason">Alerts · H09 bundle missing</div>;
+  else if (tab === "evidence") page = (typeof ShortLabEvidence !== "undefined") ? <ShortLabEvidence/> : <div className="reason">Evidence · bundle missing</div>;
+  else page = (typeof ShortLabView !== "undefined") ? <ShortLabView/> : <div className="reason">Candidates · bundle missing</div>;
+  return (
+    <div data-testid="shortlab-shell">
+      <div className="scanbar" role="tablist" aria-label="Short-Lab sections" data-testid="shortlab-subnav">
+        {tabBtn("candidates", "sl_tab_candidates", "CANDIDATES")}
+        {tabBtn("funding", "hedge_tab_funding", "FUNDING")}
+        {tabBtn("planner", "hedge_tab_planner", "PLANNER")}
+        {tabBtn("monitor", "hedge_tab_monitor", "MONITOR")}
+        {tabBtn("alerts", "hedge_tab_alerts", "ALERTS")}
+        {tabBtn("evidence", "sl_tab_evidence", "EVIDENCE")}
+      </div>
+      <div data-testid={`shortlab-page-${tab}`}>{page}</div>
+    </div>
+  );
+}
+
 /* Boot the symbol universe. Extracted so the no-fabrication guarantee is directly
    testable: on failure this returns an error and MUST NOT touch window.DIVE_MOCK. */
 async function bootUniverse(api){
@@ -2105,12 +2161,12 @@ function CommandPalette({open,onClose,onGo,onPickSymbol,onScan,onEvidence,onComp
   useEffect(()=>{ if(open){ setQ(""); setSel(0); setTimeout(()=>inputRef.current&&inputRef.current.focus(),0); } },[open]);
   if(!open)return null;
   const VIEWS=[["scan","pal_scan"],["panel","pal_panel"],["flow","pal_flow"],
-    ["sig","pal_sig"],["evidence","pal_evidence"],["shortlab",null],
+    ["sig","pal_sig"],["evidence","pal_evidence"],["shortlab","pal_shortlab"],
     ["compare","pal_compare"],
     ["map","pal_map"],["portfolio","pal_portfolio"],["structure","pal_structure"],
     ["logs","pal_logs"],["settings","pal_settings"]];
   const themes=[["phosphor","tema: phosphor"],["amber","tema: amber"],["ice","tema: ice"],["paper","tema: paper"]];
-  const langs=[["tr",L("pal_lang_tr")],["en",L("pal_lang_en")]];
+  const langs=[["zh",L("pal_lang_zh")],["tr",L("pal_lang_tr")],["en",L("pal_lang_en")]];
   const verbs=[];
   const m1=q.match(/^tara\s+(\d{1,4})\s*$/i)||q.match(/^derin\s+(\d{1,4})\s*$/i);
   if(m1)verbs.push({label:`→ derin tarama · evren ${m1[1]}`,run:()=>onScan(parseInt(m1[1],10))});
@@ -2120,7 +2176,7 @@ function CommandPalette({open,onClose,onGo,onPickSymbol,onScan,onEvidence,onComp
   if(m3)verbs.push({label:`→ kıyas · ${m3[1].toUpperCase()}`,run:()=>onCompare(m3[1].toUpperCase().split(/[\s,]+/).slice(0,4))});
   const items=[
     ...verbs.map(v=>({kind:"verb",text:v.label,run:v.run})),
-    ...VIEWS.map(([id,key])=>({kind:"view",text:key?L(key):"SHORT LAB · tarama",run:()=>onGo(id)})),
+    ...VIEWS.map(([id,key])=>({kind:"view",text:L(key)||"SHORT LAB",run:()=>onGo(id)})),
     ...(window.SGS_DATA||[]).slice(0,60).map(r=>({kind:"sym",text:`sembol · ${r.s.replace("USDT","")} · ${r.name||""}`,
       run:()=>onPickSymbol(r.s)})),
     ...themes.map(([id,label])=>({kind:"theme",text:label,run:()=>onTheme(id)})),
@@ -2175,7 +2231,7 @@ function Settings({theme,setTheme,lang,setLang}){
       <div className="meta">DEPTH TERMINAL · v0.3.0</div></div>
     <div className="panel"><div className="ph"><span className="tick">▸</span>{L("set_lang")}</div>
       <div className="pb" style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-        {[["tr","TR"],["en","EN"]].map(([code,label])=><button key={code} className="cta" style={{background:code===lang?"var(--accent)":"transparent",
+        {[["zh","中文"],["tr","TR"],["en","EN"]].map(([code,label])=><button key={code} className="cta" style={{background:code===lang?"var(--accent)":"transparent",
           color:code===lang?"var(--accent-ink)":"var(--dim)",border:"1px solid var(--line2)"}}
           aria-pressed={code===lang} onClick={()=>setLang&&setLang(code)}>{label}</button>)}
       </div></div>
@@ -2191,13 +2247,15 @@ function Settings({theme,setTheme,lang,setLang}){
   </>;}
 
 /* ── shell + data orchestration ──────────────────────────────────────────── */
+/* Rail labels render via L("nav_"+id) at render time (see App shell below),
+   so TR/EN/ZH all follow the i18n catalog; ids stay stable for tests/keys. */
 const NAV=[
-  {id:"scan",label:"TARA",icon:"scan"},{id:"panel",label:"PANEL",icon:"panel"},
-  {id:"flow",label:"OI·L/S",icon:"oi"},{id:"sig",label:"SİNYAL",icon:"signal"},
-  {id:"evidence",label:"KANIT",icon:"ev"},{id:"shortlab",label:"SHORT LAB",icon:"sl"},
-  {id:"compare",label:"KIYAS",icon:"compare"},
-  {id:"map",label:"HARİTA",icon:"map"},{id:"portfolio",label:"PORTFÖY",icon:"wallet"},
-  {id:"structure",label:"YAPI",icon:"structure"},{id:"logs",label:"LOG",icon:"logs"},
+  {id:"scan",icon:"scan"},{id:"panel",icon:"panel"},
+  {id:"flow",icon:"oi"},{id:"sig",icon:"signal"},
+  {id:"evidence",icon:"ev"},{id:"shortlab",icon:"sl"},
+  {id:"compare",icon:"compare"},
+  {id:"map",icon:"map"},{id:"portfolio",icon:"wallet"},
+  {id:"structure",icon:"structure"},{id:"logs",icon:"logs"},
 ];
 const THEMES=[["phosphor","#39ff9e"],["amber","#ffb02e"],["ice","#59c6ff"],["paper","#c2410c"]];
 const SYMBOL_VIEWS=new Set(["panel","flow","sig"]);
@@ -2217,7 +2275,7 @@ function App(){
   const [view,setView]=useState(()=>viewFromHash()||"scan");
   const [sym,setSym]=useState(null);
   const [theme,setThemeState]=useState(()=>localStorage.getItem("dive_theme")||"phosphor");
-  const [lang,setLangState]=useState(()=>(typeof diveLang==="function")?diveLang():"tr");
+  const [lang,setLangState]=useState(()=>(typeof diveLang==="function")?diveLang():"zh");
   const [q,setQ]=useState("");
   const [clock,setClock]=useState("");
   const [bootErr,setBootErr]=useState(null);
@@ -2235,8 +2293,8 @@ function App(){
   const [,force]=useState(0);
   const demo=isDemo();
   const setTheme=(t)=>{setThemeState(t);localStorage.setItem("dive_theme",t);document.documentElement.setAttribute("data-theme",t);};
-  /* TR/EN language: persist via i18n.js setDiveLang (localStorage "dive_lang")
-     and keep local state in sync so every L() call re-renders. */
+  /* TR/EN/ZH language: persist via i18n.js setDiveLang (localStorage "dive_lang",
+     default zh) and keep local state in sync so every L() call re-renders. */
   const setLang=(code)=>{ setLangState(code); if(typeof setDiveLang==="function") setDiveLang(code); };
   useEffect(()=>{ window.__diveOnLang=()=>{ if(typeof diveLang==="function") setLangState(diveLang()); };
     return()=>{ window.__diveOnLang=null; }; },[]);
@@ -2342,16 +2400,14 @@ function App(){
   // One poll loop per view. Every outcome is honest: success stamps freshness and
   // clears the stale banner; any throw names the failing endpoint in the banner.
   // Short-Lab is an independent failure domain: its outage only names itself and
-  // never touches SGS_DATA / SGS_SCAN.
+  // never touches SGS_DATA / SGS_SCAN. F08: Short-Lab request state is owned
+  // by ShortLabView itself (pinned generation + 2s job polling) — the App
+  // never polls the same candidates query here.
   const poll=useCallback(async()=>{
     let fail=null;
     try{
       if(view==="scan"){ if(!holdRef.current) await window.DIVE.scan(15,24); }
       else if(view==="evidence"){ if(evHorizon) await window.DIVE.evidence(evHorizon); }
-      else if(view==="shortlab"){
-        if(typeof window.DIVE.shortCandidates==="function")
-          await window.DIVE.shortCandidates((window.__diveShortQuery)||{});
-      }
       else if(SYMBOL_VIEWS.has(view)&&sym) await window.DIVE.symbol(sym);
     }catch(e){
       const what=view==="scan"?"tarama":view==="evidence"?"kanıt":view==="shortlab"?"short lab":(sym||"sembol")+" verisi";
@@ -2388,7 +2444,7 @@ function App(){
   if(noData && view!=="settings" && !shortlabBypassesNoData(view)) body=<DataSourceDown error={bootErr} onRetry={boot}/>;
   else if(view==="scan") body=<Scanner onPick={pick} onCompare={startCompare} job={job} prog={jobProg} jobErr={jobErr}
     onAsyncStart={startAsync} onAsyncCancel={clearJob} onRetryResult={retryResult}/>;
-  else if(view==="shortlab") body=<ShortLabView/>;
+  else if(view==="shortlab") body=<ShortLabShell/>;
   else if(view==="panel") body=<Panel sym={sym} evHorizon={evHorizon}/>;
   else if(view==="flow") body=<Flow sym={sym} onSelect={setSym}/>;
   else if(view==="sig") body=<Signal onPick={pick}/>;
@@ -2449,8 +2505,18 @@ const _diveRoot = (typeof document!=="undefined" && document.getElementById) ? d
 if(_diveRoot) ReactDOM.createRoot(_diveRoot).render(<App/>);
 globalThis.DIVE_APP = { App, DemoBanner, DemoMark, DataSourceDown, StaleBanner, Scanner, Flow, Signal,
   Evidence, CandleChart, ScanProgressPanel, bootUniverse, isDemo, shortlabBypassesNoData,
-  /* Short-Lab views (Task 15 · design §26; concatenated before this file) */
+  /* Short-Lab views (Task 15 · design §26; F08 adds the evidence subpage) */
   ShortLabView, ShortLabDetail, ShortLabTable,
+  ShortLabEvidence: (typeof ShortLabEvidence !== "undefined" ? ShortLabEvidence : undefined),
+  /* H09 hedge views (design B32/B34): guarded so legacy bundles still load */
+  ShortLabShell, shortlabTabFromHash, SHORTLAB_SUB_TABS,
+  FundingView: (typeof FundingView !== "undefined" ? FundingView : undefined),
+  HedgePlanner: (typeof HedgePlanner !== "undefined" ? HedgePlanner : undefined),
+  buildHedgeSimulationBody: typeof buildHedgeSimulationBody !== "undefined" ? buildHedgeSimulationBody : undefined,
+  buildHedgeLegPayload: typeof buildHedgeLegPayload !== "undefined" ? buildHedgeLegPayload : undefined,
+  normalizeHedgePlanResponse: typeof normalizeHedgePlanResponse !== "undefined" ? normalizeHedgePlanResponse : undefined,
+  HedgeMonitor: (typeof HedgeMonitor !== "undefined" ? HedgeMonitor : undefined),
+  HedgeAlerts: (typeof HedgeAlerts !== "undefined" ? HedgeAlerts : undefined),
   /* v0.3 surfaces + route map (hash-route registration is pinned by tests) */
   Panel, Compare, MapView, Portfolio, StructureView, PulseStrip, FngChip, DvolChip,
   CommandPalette, HitLabel, ReliabilityDiagram, ReplayPanel, TfMatrix, OpposingEvidence,

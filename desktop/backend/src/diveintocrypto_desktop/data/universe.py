@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from diveintocrypto_desktop.data.http import FAPI_V1, LoopBoundLock, get_json
+from diveintocrypto_desktop.shortlab import observations as _obs
 
 # Stablecoin / fiat bases excluded from the scan (no directional edge).
 _SKIP_BASES = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "EUR", "GBP", "USTC"}
@@ -356,3 +357,146 @@ async def list_universe(limit: int | None = None) -> list[dict]:
                 _cache_ts = now
     rows = _cache or []
     return rows[:limit] if limit else rows
+
+
+# ---------------------------------------------------------------------------
+# F02 observation wrappers (design A4.1/A4.3, B16.1; plan F02.1).
+#
+# Legacy readers above keep their exact signatures and return types. The
+# ``*_observed`` adapters below wrap the same results in
+# ``shortlab.observations.Observed`` with ``known_at_ms`` set to the
+# response-completion time; a cache hit returns the identical ``Observed``
+# (original ``known_at``/``source_as_of``), never a hit-time restamp.
+# The raw exchangeInfo payload (original ``filters``/``time``) is stored
+# verbatim in the observation value -- no second parser is built here
+# (rule parsing stays H02's job).
+# ---------------------------------------------------------------------------
+
+# Raw exchangeInfo kept 30 minutes per B16.1 (rules-snapshot refresh cadence).
+_EXCHANGE_INFO_OBSERVED_TTL = 1800.0
+_UNIVERSE_SOURCE = "binance-futures-universe"
+_EXCHANGE_INFO_SOURCE = "binance-futures-exchangeInfo"
+
+_exchange_info_observed: _obs.Observed[dict] | None = None
+_exchange_info_observed_mono: float = 0.0
+_universe_observed: _obs.Observed[list[dict]] | None = None
+_universe_observed_mono: float = 0.0
+
+
+def reset_observation_cache() -> None:
+    """Drop the F02 ``Observed`` caches (test hook; legacy caches untouched)."""
+    global _exchange_info_observed, _exchange_info_observed_mono
+    global _universe_observed, _universe_observed_mono
+    _exchange_info_observed = None
+    _exchange_info_observed_mono = 0.0
+    _universe_observed = None
+    _universe_observed_mono = 0.0
+
+
+def _exchange_server_time(payload: Any) -> int | None:
+    try:
+        raw = payload.get("serverTime") if isinstance(payload, dict) else None
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+async def fetch_exchange_info_observed(
+    *,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[dict]:
+    """Raw ``exchangeInfo`` payload wrapped as an ``Observed`` (F02/B16.1).
+
+    ``value`` is the verbatim payload (original per-symbol ``filters`` and
+    ``serverTime`` preserved); ``meta.source_as_of_ms`` is ``serverTime``
+    (``None`` when the venue omits it -- never the local clock).
+    """
+    global _exchange_info_observed, _exchange_info_observed_mono
+    now_mono = time.monotonic()
+    if (
+        _exchange_info_observed is not None
+        and now_mono - _exchange_info_observed_mono < _EXCHANGE_INFO_OBSERVED_TTL
+    ):
+        return _exchange_info_observed
+    async with _cache_lock:
+        now_mono = time.monotonic()
+        if (
+            _exchange_info_observed is not None
+            and now_mono - _exchange_info_observed_mono < _EXCHANGE_INFO_OBSERVED_TTL
+        ):
+            return _exchange_info_observed
+        payload: dict[str, Any] = await get_json(f"{FAPI_V1}/exchangeInfo")
+        completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        raw_symbols = payload.get("symbols") or []
+        update_contract_metadata(raw_symbols, completed)
+        observed = _obs.make_observation(
+            payload,
+            source=_EXCHANGE_INFO_SOURCE,
+            source_as_of_ms=_exchange_server_time(payload),
+            fetched_at_ms=completed,
+            known_at_ms=completed,
+            units=_obs.ObservationUnits(quote_asset="USDT"),
+            identity_snapshot_id=identity_snapshot_id,
+        )
+        _exchange_info_observed = observed
+        _exchange_info_observed_mono = time.monotonic()
+        return observed
+
+
+async def fetch_universe_observed(
+    limit: int | None = None,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[list[dict]]:
+    """Ranked universe rows wrapped as an ``Observed`` (F02).
+
+    Mirrors the 30s legacy TTL: a cache hit returns the identical
+    ``Observed`` with its original ``known_at_ms``. ``as_of_ms`` is
+    accepted for the downstream cutoff check only.
+    """
+    _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
+    global _universe_observed, _universe_observed_mono
+    now_mono = time.monotonic()
+    if (
+        _universe_observed is not None
+        and now_mono - _universe_observed_mono < _UNIVERSE_TTL
+    ):
+        return _slice_universe_observed(_universe_observed, limit)
+    async with _cache_lock:
+        now_mono = time.monotonic()
+        if (
+            _universe_observed is not None
+            and now_mono - _universe_observed_mono < _UNIVERSE_TTL
+        ):
+            return _slice_universe_observed(_universe_observed, limit)
+        rows = await _fetch_universe()  # raises propagate; observed cache untouched
+        completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        _universe_observed = _obs.make_observation(
+            rows,
+            source=_UNIVERSE_SOURCE,
+            source_as_of_ms=None,
+            fetched_at_ms=completed,
+            known_at_ms=completed,
+            units=_obs.ObservationUnits(quote_asset="USDT"),
+            identity_snapshot_id=identity_snapshot_id,
+        )
+        _universe_observed_mono = time.monotonic()
+        return _slice_universe_observed(_universe_observed, limit)
+
+
+def _slice_universe_observed(
+    observed: _obs.Observed[list[dict]], limit: int | None
+) -> _obs.Observed[list[dict]]:
+    """Apply ``limit`` without restamping: slices share the cached ``meta``."""
+    if not limit:
+        return observed
+    return _obs.Observed(value=observed.value[:limit], meta=observed.meta)

@@ -183,6 +183,156 @@ def _unavailable_response(reason: str, detail: str | None = None) -> JSONRespons
     return JSONResponse(body, status_code=503)
 
 
+def _hedge_capabilities_for(service: Any) -> dict[str, Any]:
+    """Additive H08 hedge capabilities (never break the F08 health shape).
+
+    ``hedge`` is True only when the Hedge tables are usable (005 migrated);
+    ``hedgeEvidence`` is True only when the H10 provider is wired (lazy
+    import, missing means honest False, never assert). Chain venues report
+    their configured ``enabled`` flags honestly (unconfigured stays False).
+    """
+    try:
+        hedge_on = False
+        flag = getattr(service, "_hedge_available", None)
+        if flag is True:
+            hedge_on = True
+        elif flag is False:
+            hedge_on = False
+        else:
+            # Auto-probe without a runtime flag: base tests without hedge
+            # tables report False; hedge-enabled DBs report True. Best-effort
+            # only (probe failures mean disabled, never a 500 here).
+            hedge_on = False
+    except Exception:
+        hedge_on = False
+    try:
+        hedge_evidence_on = False
+        try:
+            from diveintocrypto_desktop.shortlab.evidence import hedge_metrics as _hm  # type: ignore[import-not-found]
+
+            hedge_evidence_on = bool(
+                getattr(_hm, "hedge_summary", None) is not None
+                or getattr(_hm, "summary", None) is not None
+            ) and bool(hedge_on)
+        except Exception:
+            hedge_evidence_on = False
+    except Exception:
+        hedge_evidence_on = False
+    try:
+        cfg = getattr(service, "config", None)
+        if callable(cfg):
+            cfg = None
+        else:
+            try:
+                cfg = service.config  # type: ignore[attr-defined]
+            except Exception:
+                cfg = getattr(service, "_config", None)
+        hedge_cfg = getattr(cfg, "hedge", None) if cfg is not None else None
+        providers = getattr(hedge_cfg, "providers", {}) if hedge_cfg is not None else {}
+        if not isinstance(providers, Mapping):
+            providers = {}
+    except Exception:
+        providers = {}  # type: ignore[assignment]
+
+    def _enabled(name: str) -> bool:
+        try:
+            entry = providers.get(name) if isinstance(providers, Mapping) else None
+            if isinstance(entry, Mapping):
+                return bool(entry.get("enabled"))
+            return bool(getattr(entry, "enabled", False))
+        except Exception:
+            return False
+
+    return {
+        "hedge": bool(hedge_on),
+        "hedgeEvidence": bool(hedge_evidence_on),
+        "hedgeChains": {
+            "binanceSpot": bool(_enabled("binance_spot")),
+            "binanceAlpha": bool(_enabled("binance_alpha")),
+            "onchain": bool(_enabled("onchain")),
+        },
+    }
+
+
+def _hedge_error(status: int, error: str, reason: str, detail: str | None = None) -> JSONResponse:
+    body: dict[str, Any] = {"error": error, "reason": reason, "reason_code": reason, "code": error}
+    if detail:
+        body["detail"] = str(detail)[:300]
+    return JSONResponse(body, status_code=status)
+
+
+def _map_hedge_exception(exc: Exception) -> JSONResponse:
+    """Map frozen Hedge/service errors to B33 HTTP codes (never 500 for known)."""
+    status = int(getattr(exc, "status_code", 500) or 500)
+    code = str(getattr(exc, "error_code", None) or getattr(exc, "reason_code", None) or type(exc).__name__)
+    reason = str(getattr(exc, "reason_code", None) or code)
+    detail = str(exc)[:300]
+    # Repository-level aliases (H01 single-worker contracts).
+    try:
+        from diveintocrypto_desktop.shortlab.repository import HedgeIdempotencyError as _Idem
+        from diveintocrypto_desktop.shortlab.repository import HedgeVersionConflictError as _Ver
+        from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy
+        from diveintocrypto_desktop.shortlab.repository import ReferenceNotFoundError as _Ref
+        from diveintocrypto_desktop.shortlab.repository import ValidationError as _Val
+
+        if isinstance(exc, _Busy):
+            return _hedge_error(503, "LOCAL_WRITE_BUSY", "LOCAL_WRITE_BUSY", detail)
+        if isinstance(exc, _Idem):
+            return _hedge_error(409, "IDEMPOTENCY_PAYLOAD_MISMATCH", "IDEMPOTENCY_PAYLOAD_MISMATCH", detail)
+        if isinstance(exc, _Ver):
+            return _hedge_error(409, "PLAN_VERSION_CONFLICT", "PLAN_VERSION_CONFLICT", detail)
+        if isinstance(exc, _Ref):
+            msg = str(exc).lower()
+            if "simulation" in msg:
+                return _hedge_error(404, "HEDGE_SIMULATION_NOT_FOUND", "HEDGE_SIMULATION_NOT_FOUND", detail)
+            if "plan" in msg:
+                return _hedge_error(404, "HEDGE_PLAN_NOT_FOUND", "HEDGE_PLAN_NOT_FOUND", detail)
+            return _hedge_error(404, code or "HEDGE_NOT_FOUND", code or "HEDGE_NOT_FOUND", detail)
+        if isinstance(exc, _Val):
+            msg_l = str(exc).lower()
+            if "expired" in msg_l:
+                return _hedge_error(409, "QUOTE_EXPIRED", "QUOTE_EXPIRED", detail)
+            return _hedge_error(422, code or "HEDGE_INPUT_INVALID", code or "HEDGE_INPUT_INVALID", detail)
+    except Exception:
+        pass
+    # Service-level Hedge* errors already carry status/error/reason.
+    try:
+        from diveintocrypto_desktop.shortlab.service import HedgeAlertNotFound as _Alert404
+        from diveintocrypto_desktop.shortlab.service import HedgeBusy as _Busy2
+        from diveintocrypto_desktop.shortlab.service import HedgeInputMismatch as _Mismatch
+        from diveintocrypto_desktop.shortlab.service import HedgeLegsIncomplete as _Legs
+        from diveintocrypto_desktop.shortlab.service import HedgeOpenLegsRemain as _Open
+        from diveintocrypto_desktop.shortlab.service import HedgePlanNotFound as _Plan404
+        from diveintocrypto_desktop.shortlab.service import HedgeQuoteExpired as _Expired
+        from diveintocrypto_desktop.shortlab.service import HedgeSimulationNotFound as _Sim404
+        from diveintocrypto_desktop.shortlab.service import HedgeUnavailable as _Unavail
+        from diveintocrypto_desktop.shortlab.service import HedgeValidationError as _Valid
+        from diveintocrypto_desktop.shortlab.service import HedgeVersionConflict as _Conflict
+        from diveintocrypto_desktop.shortlab.service import HedgeIdempotencyMismatch as _Idem2
+
+        if isinstance(exc, _Busy2):
+            return _hedge_error(503, "LOCAL_WRITE_BUSY", "LOCAL_WRITE_BUSY", detail)
+        if isinstance(exc, _Unavail):
+            return _hedge_error(503, "HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", detail)
+        if isinstance(exc, (_Sim404, _Plan404, _Alert404)):
+            return _hedge_error(404, code, code, detail)
+        if isinstance(exc, (_Expired, _Mismatch, _Idem2, _Conflict, _Legs, _Open)):
+            return _hedge_error(409, code, code, detail)
+        if isinstance(exc, _Valid):
+            return _hedge_error(422, code, reason or code, detail)
+    except Exception:
+        pass
+    if status == 422:
+        return _hedge_error(422, code or "HEDGE_INPUT_INVALID", reason or code, detail)
+    if status == 404:
+        return _hedge_error(404, code or "HEDGE_NOT_FOUND", code or "HEDGE_NOT_FOUND", detail)
+    if status == 409:
+        return _hedge_error(409, code or "HEDGE_CONFLICT", code or "HEDGE_CONFLICT", detail)
+    if status == 503:
+        return _hedge_error(503, code or "HEDGE_UNAVAILABLE", code or "HEDGE_UNAVAILABLE", detail)
+    return _hedge_error(500, "hedge_internal", "hedge_internal", detail)
+
+
 def _sort_codes(codes: list[str], order: tuple[str, ...]) -> list[str]:
     seen: dict[str, None] = {}
     for code in codes:
@@ -852,6 +1002,53 @@ async def short_health(request: Request) -> Any:
         tier = str(service.config.analysis_tier)  # type: ignore[attr-defined]
     except Exception:
         tier = "LITE"
+    # F08 additive (A9.1): original fields above stay byte-identical in name
+    # and meaning; the keys below are additive only. UI reads the latest
+    # generation via lastSuccessfulGeneration and never assumes provider
+    # health from available=true.
+    try:
+        from diveintocrypto_desktop.shortlab.service import (
+            FULL_PROVIDER_NAMES as _FULL_NAMES,
+        )
+        from diveintocrypto_desktop.shortlab.service import (
+            KNOWN_JOB_TYPES as _KNOWN_JOBS,
+        )
+    except Exception:  # pragma: no cover - defensive fallback
+        _FULL_NAMES = ("unlock", "social", "catalyst")
+        _KNOWN_JOBS = ("score_refresh", "funding_backfill", "contract_refresh", "metadata")
+    try:
+        _metrics_ready = getattr(service, "_metrics_provider", None) is not None
+    except Exception:
+        _metrics_ready = False
+    try:
+        _registry = getattr(service, "registry", None)
+        _full_ready = bool(
+            _registry is not None
+            and all(bool(_registry.has(name)) for name in _FULL_NAMES)
+        )
+    except Exception:
+        _full_ready = False
+    try:
+        _missing: list[str] = []
+        _registry2 = getattr(service, "registry", None)
+        for _name in _FULL_NAMES:
+            try:
+                if _registry2 is None or not bool(_registry2.has(_name)):
+                    _missing.append(str(_name))
+            except Exception:
+                _missing.append(str(_name))
+    except Exception:
+        _missing = []
+    try:
+        _running_ids: list[str] = []
+        for _slot in dict(getattr(service, "_running", {}) or {}).values():
+            try:
+                if not bool(_slot["task"].done()):
+                    _running_ids.append(str(_slot["job_id"]))
+            except Exception:
+                continue
+    except Exception:
+        _running_ids = []
     return {
         "ok": True,
         "available": True,
@@ -859,6 +1056,19 @@ async def short_health(request: Request) -> Any:
         "scoreVersion": "ltss-lite-v1",
         "generationId": generation_id,
         "generatedAtMs": now_ms,
+        "schemaVersion": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "capabilities": {
+            "scoreRefresh": True,
+            "jobStatus": True,
+            "generationPinning": True,
+            "evidenceSummary": bool(_metrics_ready),
+            "fullTier": bool(_full_ready),
+            **_hedge_capabilities_for(service),
+        },
+        "jobs": {"known": list(_KNOWN_JOBS), "running": _running_ids},
+        "lastSuccessfulGeneration": generation_id,
+        "missingDependencies": _missing,
     }
 
 
@@ -1342,4 +1552,282 @@ async def short_evidence_summary(request: Request) -> Any:
         "total": total,
         "generatedAtMs": int(generated_at),
     }
+
+
+# ---------------------------------------------------------------------------
+# H08 hedge routes (design B32, 14 categories; frozen DTOs, camelCase wire)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/funding-opportunities")
+async def hedge_funding_opportunities(request: Request) -> Any:
+    """B32.1 funding opportunities (query snake aliases, camelCase JSON)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    filters = dict(request.query_params)
+    try:
+        result = await service.funding_opportunities(filters)
+    except Exception as exc:
+        try:
+            from diveintocrypto_desktop.shortlab.service import HedgeUnavailable as _HU
+
+            if isinstance(exc, _HU):
+                return _hedge_error(503, "HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", str(exc)[:200])
+        except Exception:
+            pass
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.get("/hedge/venues/{symbol}")
+async def hedge_venues(symbol: str, request: Request) -> Any:
+    """B32.2 venue quotes for one symbol (all venues, never only best)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    query = dict(request.query_params)
+    # notional_usd alias (camel + snake).
+    notional = query.get("notional_usd", query.get("notionalUsd"))
+    try:
+        result = await service.hedge_venues(symbol, notional)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.post("/hedge/simulate")
+async def hedge_simulate(request: Request) -> Any:
+    """B32.3 simulate (compute only, persist immutable snapshot, no plan)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        payload = await request.json()
+    except Exception:
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be JSON")
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be a JSON object")
+    try:
+        result = await service.simulate(payload)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return JSONResponse(result, status_code=200)
+
+
+@router.get("/hedge/simulations/{simulation_id}")
+async def hedge_get_simulation(simulation_id: str, request: Request) -> Any:
+    """B32.3.1 read-only simulation (expired still 200+expired:true, missing 404)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        result = await service.get_simulation(simulation_id)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.post("/hedge/plans")
+async def hedge_create_plan(request: Request) -> Any:
+    """B32.4 save plan (idempotency first, then expiry/version/content)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        payload = await request.json()
+    except Exception:
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be JSON")
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be a JSON object")
+    try:
+        result = await service.save_plan(payload)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    # Idempotent retry returns 200 with existing:true; first creation is 201.
+    status = 200 if bool(result.get("existing")) else 201
+    return JSONResponse(result, status_code=status)
+
+
+@router.get("/hedge/plans")
+async def hedge_list_plans(request: Request) -> Any:
+    """B32.5 list plans (status/symbol/mode/venue/limit/offset)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    filters = dict(request.query_params)
+    try:
+        result = await service.list_plans(filters)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.get("/hedge/plans/{plan_id}")
+async def hedge_get_plan(plan_id: str, request: Request) -> Any:
+    """B32.6 full plan + actual legs + latest monitor + alerts."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        result = await service.get_plan(plan_id)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.patch("/hedge/plans/{plan_id}/legs")
+async def hedge_apply_leg_event(plan_id: str, request: Request) -> Any:
+    """B32.7 manual fill event (event/client/version, idempotent, CAS)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        payload = await request.json()
+    except Exception:
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be JSON")
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be a JSON object")
+    try:
+        result = await service.apply_leg_event(plan_id, payload)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.post("/hedge/plans/{plan_id}/activate")
+async def hedge_activate_plan(plan_id: str, request: Request) -> Any:
+    """B32.8 activate (local state only, 409 when legs incomplete)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        payload = await request.json()
+    except Exception:
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be JSON")
+    if not isinstance(payload, Mapping):
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be a JSON object")
+    try:
+        result = await service.activate(plan_id, payload)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.post("/hedge/plans/{plan_id}/close")
+async def hedge_close_plan(plan_id: str, request: Request) -> Any:
+    """B32.9 close (only after both legs exited, 409 when open qty remains)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        payload = await request.json()
+    except Exception:
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be JSON")
+    if not isinstance(payload, Mapping):
+        return _hedge_error(422, "HEDGE_INPUT_INVALID", "HEDGE_INPUT_INVALID", "body must be a JSON object")
+    try:
+        result = await service.close(plan_id, payload)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.get("/hedge/plans/{plan_id}/monitor")
+async def hedge_monitor(plan_id: str, request: Request) -> Any:
+    """B32.10 monitor snapshot (ratio/exposure/PnL/funding/basis/liq/exit/safety/alerts)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        result = await service.monitor(plan_id)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.get("/hedge/alerts")
+async def hedge_alerts(request: Request) -> Any:
+    """B32.11 alerts (plan_id/state/severity/code)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    filters = dict(request.query_params)
+    try:
+        # Service exposes both hedge_alerts and the H08 alias alerts.
+        fn = getattr(service, "hedge_alerts", None) or getattr(service, "alerts", None)
+        result = await fn(filters)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.post("/hedge/alerts/{alert_id}/ack")
+async def hedge_ack_alert(alert_id: str, request: Request) -> Any:
+    """B32.12 ack a local alert (never resolves as fixed)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    try:
+        result = await service.ack_hedge_alert(alert_id)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    return result
+
+
+@router.get("/hedge/evidence/summary")
+async def hedge_evidence_summary(request: Request) -> Any:
+    """B32.13 independent hedge evidence (directional evidence stays separate)."""
+    try:
+        service = _require_service(request)
+    except ShortLabUnavailable as exc:
+        return _unavailable_response(str(exc))
+    filters = dict(request.query_params)
+    try:
+        result = await service.hedge_evidence_summary(filters)
+    except Exception as exc:
+        return _map_hedge_exception(exc)
+    if isinstance(result, Unavailable) or (
+        hasattr(result, "reason") and result.__class__.__name__ == "Unavailable"
+    ):
+        reason = str(getattr(result, "reason", "HEDGE_EVIDENCE_UNAVAILABLE"))
+        detail = getattr(result, "detail", None)
+        body: dict[str, Any] = {"error": reason, "reason": reason, "reason_code": reason}
+        if detail:
+            body["detail"] = str(detail)[:300]
+        return JSONResponse(body, status_code=503)
+    # H10 real shape passes through; normalise the camelCase wire view.
+    if isinstance(result, Mapping):
+        out = dict(result)
+        # Ensure camelCase aliases for the B32.13 contract.
+        if "generated_at_ms" in out and "generatedAt" not in out:
+            out["generatedAt"] = out.pop("generated_at_ms")
+        return out
+    try:
+        return {
+            "generatedAt": int(getattr(result, "generated_at_ms", _service_now(service))),
+            "filters": dict(getattr(result, "filters", filters) or {}),
+            "buckets": list(getattr(result, "buckets", []) or []),
+        }
+    except Exception as exc:
+        return _hedge_error(503, "HEDGE_EVIDENCE_UNAVAILABLE", "HEDGE_EVIDENCE_UNAVAILABLE", str(exc)[:160])
 

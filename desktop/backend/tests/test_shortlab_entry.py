@@ -516,6 +516,13 @@ class TestEntryBudget:
 
     @pytest.mark.asyncio
     async def test_429_retry_counts_every_attempt(self, monkeypatch):
+        """F03: Entry no longer retries; the unique retry lives in http.py.
+
+        A transient leaf failure is a single spent call that degrades its
+        block (FETCH_FAILED) instead of an Entry-level retry. HTTP-level
+        retries/pages counting against the shared RequestBudget is covered in
+        test_shortlab_http_budget.py (single retry layer).
+        """
         calls: _CallLog = _CallLog()
         _install_fakes(
             monkeypatch, calls, assembled=_canned_assembled(), klines_fail_once={"1h"}
@@ -524,10 +531,11 @@ class TestEntryBudget:
         result = await build_entry_snapshot(
             "BTCUSDT", budget=budget, as_of_ms=ASOF_MS, now_ms=FETCHED_MS
         )
-        assert result.entry_score == 66.0
-        assert result.reason_code is None
-        # 18 base calls + 1 transient retry, all spent through the budget.
-        assert budget.used_calls == 19
+        # One transient 1h failure degrades consensus (no Entry retry).
+        assert result.entry_score is None
+        assert "consensus" in result.missing_blocks
+        # 18 leaf calls, each spent exactly once (no second-layer retry).
+        assert budget.used_calls == 18
 
     @pytest.mark.asyncio
     async def test_retries_stay_on_shared_limiter_path(self, monkeypatch):
@@ -682,6 +690,9 @@ class TestEntryBudget:
 class TestHistoricalReplay:
     @pytest.mark.asyncio
     async def test_build_symbol_end_ms_mixes_live_funding_and_is_rejected(self, monkeypatch):
+        # F07 live-pollution guard: historical view never fetches live
+        # OI/ratio/funding (HISTORICAL_INPUT_UNAVAILABLE), never mixes the
+        # live tail into a past window.
         old_ms = ASOF_MS - 60 * DAY_MS
         old_candles = {
             tf: [_candle(old_ms - (24 - i) * DAY_MS, 100.0 - i) for i in range(24)]
@@ -692,23 +703,21 @@ class TestHistoricalReplay:
             assert end_ms == old_ms
             return {tf: list(rows) for tf, rows in old_candles.items()}
 
-        live_oi = [{"t": ASOF_MS * 1_000_000, "oi": 999.0, "oi_value": 49_000_000.0}]
         live_funding = [
             {"t": ASOF_MS - i * 8 * HOUR_MS, "funding_rate": 0.0002} for i in range(48)
         ]
 
-        async def fake_oi(symbol, period="5m", limit=48):
-            return [dict(p) for p in live_oi]
+        async def fake_oi(*args, **kwargs):
+            raise AssertionError("historical view must not fetch live OI")
 
-        async def fake_ratios(symbol, period="5m", limit=48):
-            return {"glob": [1.1] * 48, "acc": [1.2] * 48,
-                    "pos": [1.3] * 48, "taker": [1.0] * 48}
+        async def fake_ratios(*args, **kwargs):
+            raise AssertionError("historical view must not fetch live ratios")
 
-        async def fake_hist(symbol, limit=48):
-            return [dict(r) for r in live_funding]
+        async def fake_hist(*args, **kwargs):
+            raise AssertionError("historical view must not fetch live funding")
 
-        async def fake_pos_ts(symbol, period, limit=60):
-            return {"t": [], "v": []}
+        async def fake_pos_ts(*args, **kwargs):
+            raise AssertionError("historical view must not fetch live position L/S")
 
         monkeypatch.setattr(klines_mod, "fetch_all_tf", fake_all_tf)
         monkeypatch.setattr(oi_mod, "fetch_oi_hist", fake_oi)
@@ -719,7 +728,14 @@ class TestHistoricalReplay:
         obj = await symbol_builder_mod.build_symbol("BTCUSDT", end_ms=old_ms)
         tail_times = [r["t"] for r in live_funding]
         assert max(tail_times) > old_ms
-        assert obj["series"]["funding"] == [r["funding_rate"] for r in live_funding]
+        # F07 contract: live tail is not mixed in; funding/OI stay empty.
+        assert obj["series"]["funding"] == []
+        assert obj["series"]["funding"] != [r["funding_rate"] for r in live_funding]
+        assert obj["series"]["oi"] == []
+        assert obj["microstructure"] == {"unavailable": "HISTORICAL_INPUT_UNAVAILABLE"}
+        assert obj["cascade"] == {"unavailable": "HISTORICAL_INPUT_UNAVAILABLE"}
+        assert "HISTORICAL_INPUT_UNAVAILABLE" in str(obj)
+        assert "ch" not in obj
 
         with pytest.raises(HistoricalReplayError):
             build_historical_entry("BTCUSDT", end_ms=old_ms)
@@ -795,9 +811,11 @@ class TestEntryPersistence:
         for block, meta in result.source_meta.items():
             assert set(meta) == {
                 "status", "fetched_at_ms", "as_of_ms",
-                "coverage_fraction", "reason_code", "source",
+                "coverage_fraction", "reason_code", "source", "known_at_ms", "query_cutoff_ms",
             }
-            assert meta["fetched_at_ms"] == FETCHED_MS
+            assert meta["fetched_at_ms"] >= FETCHED_MS
+            assert meta["known_at_ms"] == meta["fetched_at_ms"]
+            assert meta["query_cutoff_ms"] == ASOF_MS
             assert meta["as_of_ms"] == ASOF_MS
 
         repo = await ShortLabRepository.open(db_path=tmp_path / "entry.duckdb")

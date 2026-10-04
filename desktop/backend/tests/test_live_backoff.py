@@ -21,11 +21,28 @@ _ERR = {"error": "live_fetch_failed", "symbol": "BTCUSDT"}
 
 @pytest.fixture(autouse=True)
 def _fast_cadence(monkeypatch):
-    """Shrink the /api/live 5s cadence (and any in-test await) to ~10ms ticks."""
+    """Shrink ONLY the /api/live 5s cadence to ~10ms ticks.
+
+    A broad clamp (``min(seconds, 0.01)``) also shortens the Short-Lab
+    scheduler's 300s/1800s intervals + jitter and HTTP retry backoffs that
+    share ``asyncio.sleep`` on the same TestClient portal loop: background
+    jobs then spin hot, submit DB work that gets cancelled at teardown and
+    leave the repository close waiting forever (full-suite hang). Only the
+    exact live cadence (``sleep(5)``) is shortened; everything else keeps
+    real time so background jobs stay idle.
+    """
     real_sleep = asyncio.sleep
 
     async def fast_sleep(seconds, *args, **kwargs):
-        await real_sleep(min(float(seconds), 0.01), *args, **kwargs)
+        try:
+            s = float(seconds)
+        except (TypeError, ValueError):
+            await real_sleep(seconds, *args, **kwargs)
+            return
+        if s == 5:
+            await real_sleep(0.01, *args, **kwargs)
+        else:
+            await real_sleep(seconds, *args, **kwargs)
 
     monkeypatch.setattr(asyncio, "sleep", fast_sleep)
 

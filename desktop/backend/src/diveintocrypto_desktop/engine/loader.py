@@ -8,6 +8,9 @@ from typing import Any
 
 import yaml
 
+from diveintocrypto_desktop.resources import read_resource_text
+
+_RESOURCE_NAME = "engine/config/default.yaml"
 _CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
 
 
@@ -18,6 +21,8 @@ def load_config() -> dict[str, Any]:
     The same dict is consumed by both ``SignalService(config)`` (which reads
     ``indicator_thresholds[name]`` per indicator) and ``ConsensusEngine(config)``
     (which reads ``indicator_weights`` / ``consensus`` / ``no_trade``).
+
+    Read via :func:`resources.read_resource_text` so frozen builds resolve
+    the same packaged file; no domain default is changed here.
     """
-    with _CONFIG_PATH.open() as f:
-        return yaml.safe_load(f)
+    return yaml.safe_load(read_resource_text(_RESOURCE_NAME))

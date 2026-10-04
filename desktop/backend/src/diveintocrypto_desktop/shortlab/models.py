@@ -145,6 +145,52 @@ class AssetIdentity:
         object.__setattr__(self, "categories", _coerce_str_tuple("categories", self.categories))
 
 
+# ---------------------------------------------------------------------------
+# F01 source-provenance extension keys + retention policy (additive only).
+#
+# Design A6.2: `feature.source_meta_json` gains `_policy`,
+# `_identity_snapshot_id` and per-source references. The new keys ride
+# alongside the existing field entries -- they never replace old key names
+# and the repository strict check keeps accepting rows written before F01.
+# `RetentionPolicy` is the typed form of the `policy` argument accepted by
+# `ShortLabRepository.maintain_retention` (a plain mapping with the same
+# keys is accepted too). Row records themselves stay frozen in
+# `repository.py`, which is the single export point for F01 consumers.
+# ---------------------------------------------------------------------------
+
+#: Extra `source_meta_json` top-level keys introduced by F01 (design A6.2).
+SOURCE_META_POLICY_KEY = "_policy"
+SOURCE_META_IDENTITY_SNAPSHOT_KEY = "_identity_snapshot_id"
+SOURCE_META_EXTENSION_KEYS = frozenset(
+    {SOURCE_META_POLICY_KEY, SOURCE_META_IDENTITY_SNAPSHOT_KEY}
+)
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Per-table age limits for `maintain_retention` (all optional, ms).
+
+    A table is swept only when its TTL is set; unset means "keep". The F01
+    sweeps never delete evidence: `CONFLICT` funding observations, the
+    latest `SUCCEEDED` generation and any score referenced by a forward
+    outcome are always retained.
+    """
+
+    funding_observation_ttl_ms: int | None = None
+    cursor_ttl_ms: int | None = None
+    score_ttl_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "funding_observation_ttl_ms",
+            "cursor_ttl_ms",
+            "score_ttl_ms",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise ValueError(f"{name} must be a non-negative int or None")
+
+
 @dataclass(frozen=True)
 class FeatureSnapshot:
     """Point-in-time feature carrier; raw values only, never API JSON."""

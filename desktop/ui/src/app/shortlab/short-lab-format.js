@@ -167,8 +167,43 @@ const SL_REASON_TEXT = {
   WARN_HIGH_CONCENTRATION: "high holder concentration (when wired)",
 };
 
+/* Chinese glosses for the same rule codes. Codes stay verbatim in every
+   language; only this human gloss switches. TR/EN share the EN gloss map
+   (legacy behavior); ZH gets its own map. diveLang() comes from i18n.js,
+   which always loads before this file in build.mjs and in the tests. */
+const SL_REASON_TEXT_ZH = {
+  VETO_DATA_IDENTITY: "身份未确认 —— 不跨 provider 猜测",
+  VETO_LOW_DATA_QUALITY: "数据质量低于硬下限",
+  VETO_LOW_LIQUIDITY: "低于成交量/OI 硬下限或合约不可交易",
+  VETO_CONTRACT_DELISTING: "已确认退市 / 交割关闭窗口",
+  PAUSE_BREAKOUT_24H: "24h 暴涨 —— 突破风险，暂停入场",
+  PAUSE_BREAKOUT_7D: "7d 暴涨 —— 突破风险，暂停入场",
+  PAUSE_SQUEEZE: "价格↑ + OI↑ 逼空特征",
+  PAUSE_NEGATIVE_CARRY: "资金费率转负 —— 持有空头要付费",
+  PAUSE_NEW_TOKEN: "上市太新，结构无法判断",
+  PAUSE_CONTRACT_STATUS_UNVERIFIED: "从实时全市场消失，无已验证终态",
+  PAUSE_MAJOR_CATALYST: "重大事件窗口（上市/主网/销毁/回购）",
+  LTSS_BELOW_READY: "LTSS 低于 READY 阈值",
+  ENTRY_NOT_AVAILABLE: "该币种未计算 Entry",
+  ENTRY_BUDGET_EXHAUSTED: "Entry 构建延期 —— 单轮请求预算耗尽",
+  ENTRY_BELOW_READY_THRESHOLD: "Entry 低于 READY 阈值",
+  DATA_QUALITY_BELOW_READY: "数据质量低于 READY 阈值",
+  TRADEABILITY_BELOW_READY: "可交易性低于 READY 阈值",
+  IDENTITY_REVIEW_REQUIRED: "身份置信度 MEDIUM —— 需人工复核",
+  MULTIPLIER_UNVERIFIED: "合约乘数未验证 —— 跨源价格已隐藏",
+  LISTING_AGE_UNKNOWN: "无有效上市日期 —— 币龄无法验证",
+  READY_INPUT_STALE: "READY 必需输入已过时 —— 已降级，未重算",
+  FULL_PREREQUISITE_MISSING: "请求 FULL 但缺必需 provider —— 当前提供 LITE",
+  WARN_HIGH_VOLATILITY: "波动率异常高",
+  WARN_FUNDING_WEAKENING: "30D 资金费率为正但近 7D 走弱",
+  WARN_PROVIDER_PARTIAL: "某 provider 返回部分数据",
+  WARN_HIGH_CONCENTRATION: "筹码集中度高（接入后生效）",
+};
+
 function slReasonText(code) {
-  return SL_REASON_TEXT[code] || String(code || "");
+  const lang = (typeof diveLang === "function") ? diveLang() : "zh";
+  const map = lang === "zh" ? SL_REASON_TEXT_ZH : SL_REASON_TEXT;
+  return map[code] || String(code || "");
 }
 
 /* Exposed on window for the node --test suite (same pattern as data.js);
@@ -182,5 +217,5 @@ window.SL_FORMAT = {
   fmtShare: slFmtShare, fmtUsd: slFmtUsd, fmtMs: slFmtMs,
   tierTag: slTierTag, statusLabel: slStatusLabel, statusClass: slStatusClass,
   fieldText: slFieldText, availabilityLabel: slAvailabilityLabel,
-  REASON_TEXT: SL_REASON_TEXT, reasonText: slReasonText,
+  REASON_TEXT: SL_REASON_TEXT, REASON_TEXT_ZH: SL_REASON_TEXT_ZH, reasonText: slReasonText,
 };

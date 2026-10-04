@@ -14,13 +14,13 @@ function ShortLabTable({ items, sort, order, onSort, onPick }) {
   const arrow = (k) => (sort === k ? (order === "asc" ? " ▲" : " ▼") : "");
   const thBtn = (label, k) => (
     <button className="thbtn" onClick={() => wantSort(k)}
-      aria-label={`${label} sütununa göre sırala`}>{label}{arrow(k)}</button>
+      aria-label={L("sl_sort_by_column", label)}>{label}{arrow(k)}</button>
   );
   return (
     <div className="sl-scroll" data-testid="shortlab-table-wrap">
       <table className="rank sl-table" data-testid="shortlab-table">
         <thead><tr>
-          <th scope="col">SEMBOL</th>
+          <th scope="col">{L("sl_col_symbol")}</th>
           <th scope="col" className="r" aria-sort={sort === "ltss" ? (order === "asc" ? "ascending" : "descending") : undefined}>{thBtn("LTSS", "ltss")}</th>
           <th scope="col" className="r" aria-sort={sort === "entry" ? (order === "asc" ? "ascending" : "descending") : undefined}>{thBtn("ENTRY", "entry")}</th>
           <th scope="col" className="r" aria-sort={sort === "funding30d" ? (order === "asc" ? "ascending" : "descending") : undefined}>{thBtn("30D FUND", "funding30d")}</th>
@@ -47,7 +47,7 @@ function ShortLabTable({ items, sort, order, onSort, onPick }) {
                 tabIndex={0}
                 onClick={() => onPick && onPick(it.symbol)}
                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick && onPick(it.symbol); } }}
-                aria-label={`${it.symbol} short-lab detayını aç`}>
+                aria-label={L("sl_open_detail", it.symbol)}>
                 <td>
                   <div className="sym">{it.symbol}
                     <small>{it.canonicalId || ""}{it.stale ? " · STALE" : ""}</small>
@@ -81,7 +81,7 @@ function ShortLabTable({ items, sort, order, onSort, onPick }) {
         </tbody>
       </table>
       {rows.length === 0 && (
-        <div className="reason">Filtreye uyan aday yok — eşikleri gevşet · no candidates match these filters.</div>
+        <div className="reason">{L("sl_empty")}</div>
       )}
     </div>
   );

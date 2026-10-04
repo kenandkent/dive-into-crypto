@@ -10,12 +10,20 @@ const FILES = [
   "mock.js",         // offline demo fallback (window.DIVE_MOCK)
   "i18n.js",         // TR/EN catalogs + L() helper (window.DIVE_I18N / dive_lang)
   // Short-Lab views (Task 15): format helpers → table → detail → scanner view.
-  // Order matters: desktop-app.jsx references these globals; nothing here may
+  // F08 adds the evidence subpage (real API, no mock). H09 adds hedge pages.
+  // Order matters: format helpers load before pages, everything loads before
+  // desktop-app.jsx which references these globals; nothing here may
   // fetch — all Short-Lab I/O goes through data.js (window.DIVE.*).
   "shortlab/short-lab-format.js",
+  "shortlab/hedge-format.js",
   "shortlab/short-lab-table.jsx",
   "shortlab/short-lab-detail.jsx",
   "shortlab/short-lab-view.jsx",
+  "shortlab/short-lab-evidence.jsx",
+  "shortlab/funding-view.jsx",
+  "shortlab/hedge-planner.jsx",
+  "shortlab/hedge-monitor.jsx",
+  "shortlab/hedge-alerts.jsx",
   "desktop-app.jsx", // "Depth Terminal" UI — shell + screens
 ];
 

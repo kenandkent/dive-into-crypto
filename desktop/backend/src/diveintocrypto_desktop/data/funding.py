@@ -11,12 +11,18 @@ explicit ``None`` — never a zero dressed as data.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from aiolimiter import AsyncLimiter
 
 from diveintocrypto_desktop.data.http import FAPI_V1, get_json
+from diveintocrypto_desktop.shortlab import observations as _obs
+from diveintocrypto_desktop.shortlab.request_budget import (
+    RequestContext,
+    get_current_request_context,
+)
 
 # Funding settles three times a day (00:00 / 08:00 / 16:00 UTC) for most pairs.
 _SETTLE_SECONDS = 8 * 3600
@@ -86,7 +92,24 @@ def _event_time_ms(event: dict[str, Any]) -> int | None:
         return None
 
 
-async def premium_index(symbol: str) -> dict[str, float]:
+async def _budgeted_get_json(
+    url: str, params: dict[str, Any] | None, ctx: RequestContext | None
+) -> Any:
+    """Call ``get_json`` preserving legacy fake signatures (F03 compat).
+
+    Legacy test doubles patch ``funding.get_json`` as
+    ``fake(url, params=None)`` without the additive ``request_context`` kwarg.
+    Only pass the kwarg when a real budget is present; otherwise use the exact
+    legacy call shape.
+    """
+    if ctx is not None and ctx.budget is not None:
+        return await get_json(url, params, request_context=ctx)
+    return await get_json(url, params)
+
+
+async def premium_index(
+    symbol: str, *, request_context: RequestContext | None = None
+) -> dict[str, float]:
     """Current mark price, index price and last funding rate for one symbol.
 
     ``time_ms`` is the exchange's ``time`` field (``None`` when absent — never
@@ -94,7 +117,10 @@ async def premium_index(symbol: str) -> dict[str, float]:
     mark price. ``last_funding_rate`` is the *predicted* (pre-settlement) rate
     and must never be used as settled funding history.
     """
-    d: dict[str, Any] = await get_json(f"{FAPI_V1}/premiumIndex", {"symbol": symbol})
+    ctx = request_context if request_context is not None else get_current_request_context()
+    d: dict[str, Any] = await _budgeted_get_json(
+        f"{FAPI_V1}/premiumIndex", {"symbol": symbol}, ctx
+    )
     out: dict[str, Any] = {
         "mark_price": float(d["markPrice"]),
         "index_price": float(d["indexPrice"]),
@@ -108,14 +134,19 @@ async def premium_index(symbol: str) -> dict[str, float]:
     return out
 
 
-async def premium_index_all() -> dict[str, dict[str, float]]:
+async def premium_index_all(
+    *, request_context: RequestContext | None = None
+) -> dict[str, dict[str, float]]:
     """premiumIndex for EVERY symbol in one call (weight 10) → ``{symbol: row}``.
 
     Cheaper than per-symbol loops for scan-wide funding/basis annotations.
     Each row carries the same additive ``time_ms`` contract as
     :func:`premium_index` (per-row ``time`` field, ``None`` when absent).
     """
-    rows: list[dict[str, Any]] = await get_json(f"{FAPI_V1}/premiumIndex")
+    ctx = request_context if request_context is not None else get_current_request_context()
+    rows: list[dict[str, Any]] = await _budgeted_get_json(
+        f"{FAPI_V1}/premiumIndex", None, ctx
+    )
     out: dict[str, dict[str, float]] = {}
     for d in rows:
         try:
@@ -135,46 +166,72 @@ async def premium_index_all() -> dict[str, dict[str, float]]:
     return out
 
 
-async def funding_hist(symbol: str, limit: int = 48) -> list[dict]:
+async def funding_hist(
+    symbol: str, limit: int = 48, *, request_context: RequestContext | None = None
+) -> list[dict]:
     """Recent funding events ``[{t, funding_rate}]`` (t in ms).
 
     Legacy tail reader for existing scan callers; behaviour unchanged.
     Short-Lab windowed backfill must use :func:`funding_history_range`.
     """
-    rows: list[dict[str, Any]] = await get_json(
-        f"{FAPI_V1}/fundingRate", {"symbol": symbol, "limit": limit}
+    ctx = request_context if request_context is not None else get_current_request_context()
+    rows: list[dict[str, Any]] = await _budgeted_get_json(
+        f"{FAPI_V1}/fundingRate",
+        {"symbol": symbol, "limit": limit},
+        ctx,
     )
     return [{"t": int(r["fundingTime"]), "funding_rate": float(r["fundingRate"])} for r in rows]
 
 
 async def funding_history_range(
-    symbol: str, start_ms: int, end_ms: int, limit: int = 1000
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    *,
+    request_context: RequestContext | None = None,
 ) -> list[dict]:
     """Settled funding events over ``[start_ms, end_ms]`` (ascending ``t``).
 
     Pages ``GET /fapi/v1/fundingRate`` with ``startTime/endTime/limit`` through
-    the shared ``data/http.py`` path (429/5xx retried with ``Retry-After``),
-    under the Short-Lab 80 req/5min limiter. A full page resumes at
-    ``last fundingTime + 1``; repeated times are deduped; an empty (or
-    sub-``limit``) page ends pagination. Each event is
-    ``{t, funding_rate, mark_price}`` (``mark_price`` is ``None`` when the row
-    lacks ``markPrice``). Only the settled ``fundingRate`` endpoint is read —
-    the predicted ``premiumIndex.lastFundingRate`` is never history.
+    the shared ``data/http.py`` path (429/5xx retried with ``Retry-After``).
+    Without a budget this uses the legacy Short-Lab 80 req/5min limiter;
+    with ``request_context`` (F03) each page — including retries, the
+    full-page resume and the terminating empty/sub-limit confirmation — is a
+    real attempt counted by the shared ``RequestBudget`` funding window
+    (80/300s). A cancelled pagination still counts already-sent pages (sent
+    permits are never refunded). A full page resumes at ``last fundingTime +
+    1``; repeated times are deduped; an empty (or sub-``limit``) page ends
+    pagination. Each event is ``{t, funding_rate, mark_price}``
+    (``mark_price`` is ``None`` when the row lacks ``markPrice``). Only the
+    settled ``fundingRate`` endpoint is read — the predicted
+    ``premiumIndex.lastFundingRate`` is never history.
     """
     start_ms, end_ms = int(start_ms), int(end_ms)
     if end_ms <= start_ms:
         return []
     limit = max(1, min(int(limit), SHORTLAB_FUNDING_PAGE_LIMIT))
-    limiter = _shortlab_funding_limiter()
+    ctx = request_context if request_context is not None else get_current_request_context()
+    budgeted = ctx is not None and ctx.budget is not None
+    limiter = None if budgeted else _shortlab_funding_limiter()
     events: list[dict[str, Any]] = []
     seen: set[int] = set()
     cursor = start_ms
     while True:
-        async with limiter:
+        params = {"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": limit}
+        if limiter is None:
+            # Budgeted path: each page (and each retry inside get_json) is a
+            # shared-window attempt; cancellation propagates with sent pages
+            # already counted (http permits are never refunded once sent).
             page: list[dict[str, Any]] = await get_json(
-                f"{FAPI_V1}/fundingRate",
-                {"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": limit},
+                f"{FAPI_V1}/fundingRate", params, request_context=ctx
             )
+        else:
+            async with limiter:
+                page = await get_json(
+                    f"{FAPI_V1}/fundingRate",
+                    params,
+                )
         if not page:
             break
         page_times: list[int] = []
@@ -347,3 +404,79 @@ def funding_lens(
         "seconds_to_funding": seconds_to_funding,
         "regime": funding_regime(predicted_funding),
     }
+
+
+# ---------------------------------------------------------------------------
+# F02 observation wrappers (design A4.1/A4.3; plan F02.1).
+#
+# Legacy readers above keep their exact signatures and return types. The
+# ``*_observed`` adapters below wrap the same results in
+# ``shortlab.observations.Observed``: ``value`` is the legacy return object
+# itself, ``meta.known_at_ms`` is the response-completion time (the injected
+# ``now_ms`` receive clock in tests, otherwise the wall clock read *after*
+# the last page resolves), and an unknown source time stays ``None``.
+# Funding history has no result cache, so every call is a fresh observation.
+# ---------------------------------------------------------------------------
+
+_FUNDING_SOURCE = "binance-futures-funding"
+
+
+async def fetch_funding_history_observed(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[list[dict]]:
+    """Settled funding events wrapped as an ``Observed`` (F02).
+
+    ``as_of_ms`` is the decision cutoff the caller validates against via
+    ``validate_observation``; it is not used to trim the window here.
+    """
+    events = await funding_history_range(symbol, start_ms, end_ms, limit=limit)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    cov = funding_coverage(events, start_ms, end_ms)
+    source_as_of = cov.last_event_ms
+    ok = bool(cov.complete)
+    return _obs.make_observation(
+        events,
+        source=_FUNDING_SOURCE,
+        source_as_of_ms=source_as_of,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        status="OK" if ok else "PARTIAL",
+        reason_code=None if ok else FUNDING_HISTORY_INCOMPLETE,
+        window_start_ms=cov.window_start_ms,
+        window_end_ms=cov.window_end_ms,
+        complete=ok,
+        coverage_fraction=cov.coverage_fraction,
+        identity_snapshot_id=identity_snapshot_id,
+    )
+
+
+async def fetch_premium_index_observed(
+    symbol: str,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[dict]:
+    """Current premium-index row wrapped as an ``Observed`` (F02).
+
+    ``meta.source_as_of_ms`` is the exchange ``time`` field (``None`` when
+    absent -- never the local clock); ``known_at_ms`` is the completion time.
+    """
+    _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
+    row = await premium_index(symbol)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    return _obs.make_observation(
+        row,
+        source=_FUNDING_SOURCE,
+        source_as_of_ms=row.get("time_ms"),
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        identity_snapshot_id=identity_snapshot_id,
+    )

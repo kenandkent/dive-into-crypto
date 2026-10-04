@@ -10,7 +10,7 @@
 
 # 0. 文档使用规则与执行优先级
 
-> **强制结论：** short-lab 是桌面端产品名，不是独立服务。必须作为现有 desktop/backend 的内部功能模块实现，继续使用同一个 FastAPI；默认监听 127.0.0.1:8780，保留现有 `--host`/`--port` 参数。V1 不修改 Android。对外名称和内部标识的迁移见 1.5 节。
+> **强制结论：** short-lab 是桌面端产品名，不是独立服务。必须作为现有 desktop/backend 的内部功能模块实现，继续使用同一个 FastAPI；默认监听 127.0.0.1:46408，保留现有 `--host`/`--port` 参数。V1 不修改 Android。对外名称和内部标识的迁移见 1.5 节。
 
 
 本方案用于指导对本地 Short-Lab / Dive Into Crypto 项目的二次开发。第三方实施人员不得根据“常见微服务习惯”自行拆分服务，也不得为了方便重新实现已有 Binance/Futures 数据链路。
@@ -163,7 +163,7 @@ Short-Lab 只能作为现有 Python package 的内部模块。不得启动新的
 ```bash
 cd desktop/backend
 uv run short-lab
-# 仍由现有 FastAPI 监听 127.0.0.1:8780
+# 仍由现有 FastAPI 监听 127.0.0.1:46408
 # 仍由现有入口挂载/服务 React UI
 ```
 
@@ -2086,7 +2086,7 @@ UI 测试沿用 `desktop/ui` 的 Node test runner；根 E2E 与 backend pytest �
 
 ## 35.1 架构验收
 
-- 只有一个 FastAPI 服务与一个 127.0.0.1:8780。
+- 只有一个 FastAPI 服务与一个 127.0.0.1:46408。
 
 - `uv run short-lab` 是推荐启动命令；`uv run dive-desktop` 作为兼容别名仍可用，均启动同一服务。
 
@@ -2343,7 +2343,7 @@ Runtime path:    __________________________
 
 Confirmed constraints:
 [ ] one FastAPI only
-[ ] 127.0.0.1:8780 unchanged
+[ ] 127.0.0.1:46408 unchanged
 [ ] Android V1 untouched
 [ ] no auto trading
 [ ] existing consensus semantics unchanged

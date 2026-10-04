@@ -8,7 +8,7 @@ Build (from desktop/backend):
 Output: dist/short-lab/ — a ONEDIR bundle on purpose, NOT onefile. A onefile
 self-extracting executable is a classic antivirus false-positive trigger and
 pays a temp-dir extraction cost on every launch. Afterwards run
-dist/short-lab/short-lab.exe; it serves 127.0.0.1:8780 and opens the UI.
+dist/short-lab/short-lab.exe; it serves 127.0.0.1:46408 and opens the UI.
 
 The `short-lab` console script and the legacy `dive-desktop` alias both point
 at `diveintocrypto_desktop.__main__:main`, so the frozen executable exposes
@@ -46,8 +46,20 @@ Bundled resources beyond the UI
 -------------------------------
 - DuckDB native libraries (collect_dynamic_libs("duckdb")): the query engine
   cannot run from pure Python alone.
+- engine/config/default.yaml: the canonical engine thresholds/weights, read
+  via diveintocrypto_desktop.resources.read_resource_text.
 - shortlab/default.yaml: the packaged default Short-Lab configuration, read
-  when SHORTLAB_CONFIG_PATH is unset.
+  when SHORTLAB_CONFIG_PATH is unset (same resources entry point).
+- shortlab/identity/asset_overrides.yaml + verified_assets.yaml: the two
+  human-verified identity tables (same resources entry point).
+- shortlab/migrations/001_init.sql … 005_hedge_advisor.sql: the F01 base
+  migrations plus the H01 Hedge advisor migration applied by
+  ShortLabRepository.migrate (same resources entry point). H01 adds
+  005_hedge_advisor.sql and H11 verifies the full 005 manifest. Never
+  create a placeholder 005 file to satisfy the bundle.
+- All runtime reads go through resources.read_resource_text
+  (importlib.resources + a _MEIPASS fallback that is only covered by the
+  frozen product smoke, never by unit-test fakes).
 
 pandas / numpy / aiohttp / fastapi are picked up automatically by Analysis;
 the hiddenimports below cover uvicorn's dynamically-selected standard extras,
@@ -68,6 +80,34 @@ _UI_DIST = os.path.join(_ROOT, os.pardir, "ui", "dist")
 _SHORTLAB_DEFAULT_YAML = os.path.join(
     _ROOT, "src", "diveintocrypto_desktop", "shortlab", "default.yaml"
 )
+# Canonical engine configuration (F09 base resource).
+_ENGINE_DEFAULT_YAML = os.path.join(
+    _ROOT, "src", "diveintocrypto_desktop", "engine", "config", "default.yaml"
+)
+# Human-verified identity tables (F09 base resources).
+_IDENTITY_OVERRIDES_YAML = os.path.join(
+    _ROOT, "src", "diveintocrypto_desktop", "shortlab", "identity",
+    "asset_overrides.yaml",
+)
+_VERIFIED_ASSETS_YAML = os.path.join(
+    _ROOT, "src", "diveintocrypto_desktop", "shortlab", "identity",
+    "verified_assets.yaml",
+)
+# F01 base migrations 001-004 plus H01 Hedge advisor 005 (explicit list;
+# no placeholder: 005_hedge_advisor.sql is frozen by H01, reviewed by F09).
+_MIGRATIONS = [
+    os.path.join(
+        _ROOT, "src", "diveintocrypto_desktop", "shortlab", "migrations",
+        name,
+    )
+    for name in (
+        "001_init.sql",
+        "002_unlock_social.sql",
+        "003_catalyst.sql",
+        "004_core_completion.sql",
+        "005_hedge_advisor.sql",
+    )
+]
 
 a = Analysis(
     # Analyze the console-script target directly. __main__.py imports the rest
@@ -88,6 +128,13 @@ a = Analysis(
         (_UI_DIST, "ui/dist"),
         # Packaged Short-Lab default configuration (see header).
         (_SHORTLAB_DEFAULT_YAML, "diveintocrypto_desktop/shortlab"),
+        # Canonical engine configuration (F09 base resource).
+        (_ENGINE_DEFAULT_YAML, "diveintocrypto_desktop/engine/config"),
+        # Human-verified identity tables (F09 base resources).
+        (_IDENTITY_OVERRIDES_YAML, "diveintocrypto_desktop/shortlab/identity"),
+        (_VERIFIED_ASSETS_YAML, "diveintocrypto_desktop/shortlab/identity"),
+        # F01 base migrations 001-004 plus H01 Hedge 005 (explicit).
+        *[(path, "diveintocrypto_desktop/shortlab/migrations") for path in _MIGRATIONS],
         # DuckDB package data, if any ships alongside the extension.
         *collect_data_files("duckdb", include_py_files=False),
     ],

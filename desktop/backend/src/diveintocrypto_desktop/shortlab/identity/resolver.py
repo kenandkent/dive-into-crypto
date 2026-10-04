@@ -30,6 +30,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from eth_hash.auto import keccak as _eth_keccak
+
 VERIFIED = "VERIFIED"
 HIGH = "HIGH"
 MEDIUM = "MEDIUM"
@@ -57,6 +59,165 @@ _PREFIX_RE = re.compile(r"^10{3,}")
 VETO_DATA_IDENTITY = "VETO_DATA_IDENTITY"
 IDENTITY_REVIEW_REQUIRED = "IDENTITY_REVIEW_REQUIRED"
 MULTIPLIER_UNVERIFIED = "MULTIPLIER_UNVERIFIED"
+
+# ---------------------------------------------------------------------------
+# F04: safe chain-address normalization (design A6.3; plan F04.1-F04.4).
+#
+# ``normalize_chain_address`` is the ONLY place that interprets the case of
+# an on-chain address. EVM addresses are validated as 20-byte hex and
+# checksummed with Ethereum Keccak (``eth_hash``, never NIST SHA3 from
+# hashlib); the comparison key is lowercase while ``display`` keeps the
+# checksum. Solana addresses are base58-decoded to exactly 32 bytes and keep
+# their case byte-for-byte. Unknown chains are never lowered.
+# ---------------------------------------------------------------------------
+
+#: Validation statuses returned by :func:`normalize_chain_address`.
+CHAIN_ADDRESS_OK = "OK"
+CHECKSUM_VERIFIED = "CHECKSUM_VERIFIED"
+NO_CHECKSUM = "NO_CHECKSUM"
+BAD_CHECKSUM = "BAD_CHECKSUM"
+INVALID_ADDRESS = "INVALID_ADDRESS"
+ADDRESS_CHAIN_UNSUPPORTED = "ADDRESS_CHAIN_UNSUPPORTED"
+
+#: Chain labels whose addresses are 20-byte EVM hex (checked EIP-55).
+EVM_CHAINS = frozenset(
+    {
+        "ethereum",
+        "bsc",
+        "binance-smart-chain",
+        "arbitrum",
+        "arbitrum-one",
+        "arbitrum-nova",
+        "polygon",
+        "polygon-pos",
+        "optimism",
+        "optimistic-ethereum",
+        "avalanche",
+        "avalanche-c-chain",
+        "base",
+        "linea",
+        "scroll",
+        "zksync",
+        "era",
+        "mantle",
+        "blast",
+        "fantom",
+        "gnosis",
+        "celo",
+        "moonbeam",
+        "moonriver",
+        "manta-pacific",
+        "op-bnb",
+    }
+)
+
+#: Chain labels whose addresses are case-sensitive base58 (never lowered).
+SOLANA_CHAINS = frozenset({"solana"})
+
+_EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {ch: i for i, ch in enumerate(_B58_ALPHABET)}
+
+
+@dataclass(frozen=True)
+class NormalizedAddress:
+    """Case-safe view of one on-chain address.
+
+    ``canonical_key`` is the comparison key (lowercase for EVM, case-kept
+    for Solana/unknown chains so differently-cased keys never merge);
+    ``display`` keeps the checksum (EIP-55 for EVM, raw for the rest);
+    ``validation_status`` is one of the ``*_ADDRESS`` / ``CHECKSUM_*`` /
+    ``NO_CHECKSUM`` / ``OK`` codes above; ``chain`` is the normalized
+    chain label (or None when none was given).
+    """
+
+    canonical_key: str
+    display: str
+    validation_status: str
+    chain: str | None = None
+
+
+def _keccak_256(data: bytes) -> bytes:
+    """Ethereum Keccak-256 (NOT NIST SHA3-256: different padding/domain)."""
+    return _eth_keccak(data)
+
+
+def _eip55_encode(lower_body: str) -> str:
+    """EIP-55 checksum-encode 40 lowercase hex chars (no ``0x`` prefix)."""
+    digest = _keccak_256(lower_body.encode("ascii"))
+    out: list[str] = []
+    for i, ch in enumerate(lower_body):
+        if ch in "0123456789":
+            out.append(ch)
+        else:
+            nibble = (digest[i // 2] >> (4 if i % 2 == 0 else 0)) & 0xF
+            out.append(ch.upper() if nibble >= 8 else ch)
+    return "".join(out)
+
+
+def to_checksum_address(address: str) -> str:
+    """EIP-55 checksum-encode an EVM address (raises ``ValueError`` unless
+    it is 20-byte hex)."""
+    raw = address.strip() if isinstance(address, str) else ""
+    if not _EVM_ADDRESS_RE.match(raw):
+        raise ValueError(f"not a 20-byte EVM hex address: {address!r}")
+    return "0x" + _eip55_encode(raw[2:].lower())
+
+
+def _base58_decode_32(text: str) -> bytes | None:
+    """Base58-decode to exactly 32 bytes; ``None`` on any malformation."""
+    if not text or any(ch not in _B58_INDEX for ch in text):
+        return None
+    number = 0
+    for ch in text:
+        number = number * 58 + _B58_INDEX[ch]
+    hexed = format(number, "x")
+    if len(hexed) % 2:
+        hexed = "0" + hexed
+    body = bytes.fromhex(hexed)
+    pad = len(text) - len(text.lstrip("1"))
+    result = b"\x00" * pad + body.lstrip(b"\x00")
+    return result if len(result) == 32 else None
+
+
+def normalize_chain_address(chain_id: Any, address: Any) -> NormalizedAddress:
+    """Normalize one on-chain address without ever guessing across chains.
+
+    - Solana (``chain_id`` in :data:`SOLANA_CHAINS`): base58 must decode to
+      exactly 32 bytes; the key keeps the original case.
+    - EVM-looking (``0x`` + 40 hex): mixed case is EIP-55 verified via
+      Ethereum Keccak (``CHECKSUM_VERIFIED`` / ``BAD_CHECKSUM``); uniform
+      case is accepted as ``NO_CHECKSUM``. The key is always lowercase.
+    - EVM chain label but malformed: ``INVALID_ADDRESS`` (lowercase key
+      for backward-compatible comparison only -- never a verification).
+    - Anything else on an unknown/empty chain: ``ADDRESS_CHAIN_UNSUPPORTED``
+      with the raw, never-lowered key.
+    """
+    raw = address.strip() if isinstance(address, str) else ""
+    chain = chain_id.strip().lower() if isinstance(chain_id, str) else ""
+    chain = chain or ""
+    label = chain or None
+    if chain in SOLANA_CHAINS:
+        decoded = _base58_decode_32(raw)
+        if decoded is None or len(decoded) != 32:
+            return NormalizedAddress(raw, raw, INVALID_ADDRESS, label)
+        return NormalizedAddress(raw, raw, CHAIN_ADDRESS_OK, label)
+    if _EVM_ADDRESS_RE.match(raw):
+        body = raw[2:]
+        if body == body.lower() or body == body.upper():
+            return NormalizedAddress(
+                "0x" + body.lower(),
+                "0x" + _eip55_encode(body.lower()),
+                NO_CHECKSUM,
+                label,
+            )
+        if body == _eip55_encode(body.lower()):
+            return NormalizedAddress("0x" + body.lower(), raw, CHECKSUM_VERIFIED, label)
+        return NormalizedAddress(raw, raw, BAD_CHECKSUM, label)
+    if chain in EVM_CHAINS:
+        return NormalizedAddress(raw.lower(), raw, INVALID_ADDRESS, label)
+    return NormalizedAddress(raw, raw, ADDRESS_CHAIN_UNSUPPORTED, label)
 
 
 @dataclass(frozen=True)
@@ -139,17 +300,24 @@ def _extract_multiplier(
     return None, None
 
 
-def _norm_addr(value: Any) -> str | None:
+def _norm_chain(value: Any) -> str | None:
+    """Normalized chain label (lowercase); chain labels carry no case."""
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip().lower()
 
 
+def _norm_address(chain_norm: str | None, value: Any) -> str | None:
+    """Comparison key for one contract address via
+    :func:`normalize_chain_address` (EVM lowercase, Solana/unknown raw)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return normalize_chain_address(chain_norm or "", value).canonical_key
+
+
 def _contract_pair(meta: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    return (
-        _norm_addr(meta.get("contract_address")),
-        _norm_addr(meta.get("chain")),
-    )
+    chain = _norm_chain(meta.get("chain"))
+    return (_norm_address(chain, meta.get("contract_address")), chain)
 
 
 def _contract_conflicts(
@@ -221,6 +389,8 @@ def resolve_identity(
     if isinstance(entry, Mapping):
         multiplier, mult_src = _extract_multiplier(entry, meta)
         spot = entry.get("binance_spot_symbol")
+        manual_chain = _norm_chain(entry.get("chain")) or _norm_chain(meta.get("chain"))
+        manual_addr_raw = entry.get("contract_address") or meta.get("contract_address")
         return AssetIdentity(
             canonical_id=str(entry.get("canonical_id", futures_symbol.lower())),
             display_symbol=str(entry.get("display_symbol", futures_symbol)),
@@ -232,9 +402,8 @@ def resolve_identity(
             coingecko_id=entry.get("coingecko_id"),
             unlock_provider_id=entry.get("unlock_provider_id"),
             social_provider_id=entry.get("social_provider_id"),
-            chain=entry.get("chain") or _norm_addr(meta.get("chain")),
-            contract_address=entry.get("contract_address")
-            or _norm_addr(meta.get("contract_address")),
+            chain=manual_chain,
+            contract_address=_norm_address(manual_chain, manual_addr_raw),
             categories=list(entry.get("categories", [])),
             mapping_confidence=VERIFIED,
             mapping_source=MANUAL,
@@ -285,6 +454,8 @@ def resolve_identity(
     # Priority 3: exactly one candidate, exact normalized symbol only.
     if len(candidates) == 1:
         c = candidates[0]
+        cand_chain = _norm_chain(c.get("chain"))
+        cand_address = _norm_address(cand_chain, c.get("contract_address"))
         if c.get("requires_review"):
             return AssetIdentity(
                 canonical_id=str(
@@ -303,8 +474,8 @@ def resolve_identity(
                 coingecko_id=c.get("coingecko_id"),
                 unlock_provider_id=c.get("unlock_provider_id"),
                 social_provider_id=c.get("social_provider_id"),
-                chain=_norm_addr(c.get("chain")),
-                contract_address=_norm_addr(c.get("contract_address")),
+                chain=cand_chain,
+                contract_address=cand_address,
                 categories=list(c.get("categories", [])),
                 mapping_confidence=MEDIUM,
                 mapping_source=OTHER,
@@ -325,8 +496,10 @@ def resolve_identity(
                     coingecko_id=None,
                     unlock_provider_id=None,
                     social_provider_id=None,
-                    chain=_norm_addr(meta.get("chain")),
-                    contract_address=_norm_addr(meta.get("contract_address")),
+                    chain=_norm_chain(meta.get("chain")),
+                    contract_address=_norm_address(
+                        _norm_chain(meta.get("chain")), meta.get("contract_address")
+                    ),
                     categories=[],
                     mapping_confidence=LOW,
                     mapping_source=OTHER,
@@ -348,8 +521,8 @@ def resolve_identity(
                 coingecko_id=c.get("coingecko_id"),
                 unlock_provider_id=c.get("unlock_provider_id"),
                 social_provider_id=c.get("social_provider_id"),
-                chain=_norm_addr(c.get("chain")),
-                contract_address=_norm_addr(c.get("contract_address")),
+                chain=cand_chain,
+                contract_address=cand_address,
                 categories=list(c.get("categories", [])),
                 mapping_confidence=HIGH,
                 mapping_source=UNIQUE_SYMBOL,

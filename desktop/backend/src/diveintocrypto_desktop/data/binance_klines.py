@@ -21,8 +21,12 @@ import pandas as pd
 from crypcodile.exchanges.binance.backfill import _live_fetch_klines, parse_klines_page
 
 from diveintocrypto_desktop.data.http import FAPI_V1, TransientUpstreamError, run_with_retries
+from diveintocrypto_desktop.shortlab import observations as _obs
 
 logger = logging.getLogger(__name__)
+
+DAY_MS = 86_400_000
+_KLINE_SOURCE = "binance-futures-klines"
 
 # The canonical 12 timeframes of the Dive Into Crypto scanner.
 TF_LIST = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
@@ -196,6 +200,87 @@ async def fetch_all_tf(symbol: str, limit: int = 300, intervals: list[str] | Non
     tfs = intervals or TF_LIST
     results = await asyncio.gather(*(fetch_klines(symbol, tf, limit, end_ms=end_ms) for tf in tfs))
     return dict(zip(tfs, results))
+
+
+def _observed_for_candles(
+    candles: list[dict],
+    *,
+    cutoff_ms: int,
+    completed_ms: int,
+    identity_snapshot_id: str | None,
+) -> _obs.Observed[list[dict]]:
+    """Wrap legacy candles: completion ``known_at``, UTC-midnight window end."""
+    opens = sorted(
+        int(c["t"]) // 1_000_000 for c in candles or [] if c.get("t") is not None
+    )
+    resolved = sum(1 for c in candles or [] if c.get("qv") is not None)
+    total = len(candles or [])
+    return _obs.make_observation(
+        candles,
+        source=_KLINE_SOURCE,
+        source_as_of_ms=max(opens) if opens else None,
+        fetched_at_ms=completed_ms,
+        known_at_ms=completed_ms,
+        window_start_ms=min(opens) if opens else None,
+        window_end_ms=(int(cutoff_ms) // DAY_MS) * DAY_MS,
+        complete=bool(total) and resolved == total,
+        coverage_fraction=(resolved / total) if total else 0.0,
+        identity_snapshot_id=identity_snapshot_id,
+    )
+
+
+async def fetch_klines_observed(
+    symbol: str,
+    interval: str,
+    limit: int = 300,
+    end_ms: int | None = None,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[list[dict]]:
+    """Most recent FINISHED candles wrapped as an ``Observed`` (F02).
+
+    Legacy :func:`fetch_klines` keeps its signature and return type; the
+    wrapper only adds the PIT envelope. ``known_at_ms`` is the
+    response-completion time (``qv`` still reads raw index 7, aligned by open
+    time; missing/unclosed legs stay ``None``, never 0). Klines carry no
+    result cache, so every call is fresh. ``as_of_ms`` is accepted for the
+    downstream cutoff check and defaults to ``end_ms``.
+    """
+    candles = await fetch_klines(symbol, interval, limit, end_ms=end_ms)
+    effective_end = end_ms if end_ms is not None else (
+        int(as_of_ms) if as_of_ms is not None else int(time.time() * 1000)
+    )
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    return _observed_for_candles(
+        candles,
+        cutoff_ms=effective_end,
+        completed_ms=completed,
+        identity_snapshot_id=identity_snapshot_id,
+    )
+
+
+async def fetch_klines_range_observed(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+) -> _obs.Observed[list[dict]]:
+    """FINISHED candles over ``[start_ms, end_ms]`` wrapped as ``Observed``."""
+    candles = await fetch_klines_range(symbol, interval, start_ms, end_ms, limit)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    return _observed_for_candles(
+        candles,
+        cutoff_ms=end_ms,
+        completed_ms=completed,
+        identity_snapshot_id=identity_snapshot_id,
+    )
 
 
 def to_dataframe(candles: list[dict]) -> pd.DataFrame:

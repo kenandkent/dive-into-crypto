@@ -503,3 +503,100 @@ async def test_futures_leg_failure_is_partial(monkeypatch):
     assert res.data.futures_volume_30d is None
     assert res.data.futures_spot_volume_ratio_30d is None
     assert res.data.premium is None
+
+
+# ---------------------------------------------------------------------------
+# 8. F04: request_context threading (F03 handoff) + 403 is UNAVAILABLE, not N/A
+# ---------------------------------------------------------------------------
+
+
+class _CtxSpotJson:
+    """Fake ``get_json`` replacement capturing (url, params, request_context)."""
+
+    def __init__(self, *, symbols=("BTCUSDT",), klines=None) -> None:
+        self.symbols = list(symbols)
+        self.klines = klines
+        self.calls: list[tuple] = []
+
+    async def __call__(self, url, params=None, request_context=None):
+        self.calls.append((url, dict(params or {}), request_context))
+        if url.endswith("/exchangeInfo"):
+            return {"symbols": [{"symbol": s} for s in self.symbols]}
+        if "/klines" in url:
+            assert self.klines is not None
+            return self.klines
+        raise AssertionError(f"unexpected spot url {url!r}")
+
+
+@pytest.mark.asyncio
+async def test_spot_history_threads_request_context(monkeypatch, fake_futures):
+    from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+
+    fake = _CtxSpotJson(klines=_window_rows())
+    monkeypatch.setattr(spot_mod, "get_json", fake)
+    ctx = make_request_context(
+        None, job_type="entry", host="spot", trace_id="spot-trace-1",
+        identity_snapshot_id="isl-abc",
+    )
+    res = await spot_mod.spot_history(_ident(), AS_OF_MS, request_context=ctx)
+    assert res.status == "OK", res
+    assert len(fake.calls) == 2  # exchangeInfo + klines, zero real sends
+    for url, params, got_ctx in fake.calls:
+        assert got_ctx is not None
+        assert got_ctx.trace_id == "spot-trace-1"
+        assert got_ctx.identity_snapshot_id == "isl-abc"
+
+
+@pytest.mark.asyncio
+async def test_spot_history_budget_exhaustion_is_unavailable_not_raise(
+        monkeypatch, fake_futures):
+    """A denied send surfaces as UNAVAILABLE (queued), never an exception."""
+    from diveintocrypto_desktop.shortlab.request_budget import (
+        RequestBudget,
+        make_request_context,
+    )
+
+    class _DeadSession:
+        """Fake session failing fast: proves budget accounting, zero network."""
+
+        class _CM:
+            async def __aenter__(self):
+                raise OSError("no network in tests")
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def get(self, url, params=None):
+            return _DeadSession._CM()
+
+    async def _dead_session():
+        return _DeadSession()
+
+    monkeypatch.setattr(
+        "diveintocrypto_desktop.data.http.get_session", _dead_session)
+    monkeypatch.setattr(
+        "diveintocrypto_desktop.data.binance_klines.fetch_klines", _FakeFutures())
+    budget = RequestBudget(max_sends=1, window_ms=3_600_000)
+    ctx = make_request_context(budget, job_type="entry", host="spot",
+                               endpoint_family="spot")
+    first = await spot_mod.spot_history(_ident(), AS_OF_MS, request_context=ctx)
+    assert first.status == "UNAVAILABLE"
+    assert budget.sent_attempts == 1
+    second = await spot_mod.spot_history(_ident(), AS_OF_MS, request_context=ctx)
+    assert second.status == "UNAVAILABLE"
+    assert budget.sent_attempts == 1  # no hidden sends past the denial
+    assert spot_mod._negative_cache == {}  # budget denial never proves absence
+
+
+@pytest.mark.asyncio
+async def test_spot_403_is_unavailable_never_not_applicable(monkeypatch, fake_futures):
+    class _Forbidden(Exception):
+        status = 403
+
+    fake = _FakeSpot(symbols=["BTCUSDT"], klines=_window_rows(),
+                     exchange_error=_Forbidden("403 Client Error: Forbidden"))
+    monkeypatch.setattr(spot_mod, "_spot_json", fake)
+    res = await spot_mod.spot_history(_ident(), AS_OF_MS)
+    assert res.status == "UNAVAILABLE" and res.data is None
+    assert res.reason_code == "spot_unreachable"
+    assert spot_mod._negative_cache == {}

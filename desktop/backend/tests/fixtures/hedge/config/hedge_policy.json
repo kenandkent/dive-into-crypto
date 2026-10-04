@@ -1,0 +1,115 @@
+{
+  "funding_exit": {
+    "negative_settlement_streak": 2,
+    "weakening_7d_vs_30d_ratio": 0.3
+  },
+  "hedge": {
+    "basis": {
+      "exit_min_notional_ratio": 0.002,
+      "exit_min_usd": 20,
+      "exit_vs_accrued_funding": 1.0,
+      "fresh_max_skew_sec": 5,
+      "reference_max_skew_sec": 30,
+      "warning_min_notional_ratio": 0.001,
+      "warning_min_usd": 10,
+      "warning_vs_accrued_funding": 0.5
+    },
+    "execution": {
+      "max_manual_chunk_usd": 5000,
+      "max_price_impact_bps": 30
+    },
+    "freshness": {
+      "alpha_quote": {
+        "grace": 60,
+        "ttl": 20
+      },
+      "contract_status": {
+        "grace": 1800,
+        "ttl": 900
+      },
+      "funding_current": {
+        "grace": 300,
+        "ttl": 120
+      },
+      "futures_mark": {
+        "grace": 60,
+        "ttl": 20
+      },
+      "onchain_quote": {
+        "grace": 180,
+        "ttl": 90
+      },
+      "spot_depth": {
+        "grace": 180,
+        "ttl": 60
+      },
+      "spot_quote": {
+        "grace": 60,
+        "ttl": 20
+      }
+    },
+    "fx": {
+      "historical_policy": "AT_EVENT_NO_INTERPOLATION",
+      "max_age_sec": 60,
+      "policy": "OBSERVED_QUOTE_TO_USD"
+    },
+    "liquidation": {
+      "critical_distance": 0.1,
+      "emergency_distance": 0.05,
+      "user_price_max_age_sec": 86400,
+      "warning_distance": 0.2
+    },
+    "liquidity_monitor": {
+      "max_exit_slippage_bps": 100,
+      "min_exit_coverage_ratio": 1.0
+    },
+    "quality": {
+      "field_shares": {
+        "contract_time": {
+          "heartbeat": 20,
+          "lifecycle": 50,
+          "source_time": 10,
+          "time_alignment": 20
+        },
+        "funding": {
+          "current_rate_time": 20,
+          "history_30d": 30,
+          "history_7d": 10,
+          "history_90d": 20,
+          "next_time_interval": 10,
+          "std_rolling": 10
+        },
+        "futures": {
+          "exit_depth_vwap": 40,
+          "mark_time": 25,
+          "symbol_status": 10,
+          "trading_rules": 25
+        },
+        "identity_units": {
+          "asset_identity": 50,
+          "multiplier": 30,
+          "quote_usd_fx": 20
+        },
+        "spot_venue": {
+          "buy_quote": 25,
+          "cost_fee_gas": 20,
+          "rules_decimals": 20,
+          "sell_quote": 35
+        }
+      },
+      "group_weights": {
+        "contract_time": 10,
+        "funding": 30,
+        "futures": 20,
+        "identity_units": 15,
+        "spot_venue": 25
+      }
+    },
+    "ratio": {
+      "drift_critical_pct": 0.05,
+      "drift_warn_pct": 0.02
+    }
+  },
+  "hedge_formula_version": "hedge_v1",
+  "plan_safety_rules_version": "PLAN_SAFETY_V1"
+}

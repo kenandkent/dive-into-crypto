@@ -73,7 +73,7 @@ uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
 ```
 
 - Produces **`dist/short-lab/`**, an *onedir* bundle — start it with
-  `dist/short-lab/short-lab.exe` (serves `127.0.0.1:8780` and opens the UI).
+  `dist/short-lab/short-lab.exe` (serves `127.0.0.1:46408` and opens the UI).
   Both console scripts (`short-lab` and the legacy `dive-desktop` alias) map to
   the same `diveintocrypto_desktop.__main__:main` entry.
 - **Why not onefile:** single-exe self-extractors are a classic antivirus
@@ -86,14 +86,24 @@ uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
   math (`parents[4]/ui/dist`) resolves inside a frozen tree. Extract/release the whole
   `dist/` tree together and both resolvers work. See the `short-lab.spec` header for the
   full path math.
-- The spec also bundles the DuckDB native libraries and `shortlab/default.yaml`
-  (overridable at runtime via `SHORTLAB_CONFIG_PATH`).
+- The spec also bundles the DuckDB native libraries and the full 005 resource set,
+  all read via `diveintocrypto_desktop.resources.read_resource_text`
+  (`importlib.resources` with a `_MEIPASS` fallback that is only covered by
+  the frozen product smoke, never by unit-test fakes): `engine/config/default.yaml`,
+  `shortlab/default.yaml` (overridable at runtime via `SHORTLAB_CONFIG_PATH`),
+  `shortlab/identity/asset_overrides.yaml`, `shortlab/identity/verified_assets.yaml`
+  and `shortlab/migrations/001_init.sql` … `005_hedge_advisor.sql` (F01 base
+  001–004 plus the H01 Hedge advisor 005; H11 verifies the full manifest).
 - **Writable data:** the frozen app never writes next to its resources. Short-Lab state
   lives in the per-user data directory (`%LOCALAPPDATA%/short-lab` on Windows, holding
   `shortlab.duckdb`), so launching from a read-only extraction directory works and data
-  survives restarts. Smoke: extract to a read-only directory, launch twice, confirm the
-  same user DB is read/written and the old `/api/scan`, the Short Lab page and the cache
-  survive the restart.
+  survives restarts. Smoke (`scripts/smoke_shortlab_packaged.py`): read-only install
+  dir + empty user data dir, real-process `/api/health` + `/api/short/health`,
+  migrate to schema 5, engine resources, plan registration with the public-HTTP
+  fixture stub (never demo mode), clean shutdown, second boot recovering the
+  plan/monitor/alerts. The UI bundle (`desktop/ui/dist/`) is rebuilt from the
+  approved UI source by H11 and bound by source-commit + artifact SHA (node +
+  esbuild versions recorded in the verification manifest).
 - **Size honesty: expect roughly 150–250 MB unzipped.** pandas + numpy + FastAPI/uvicorn
   dominate; that is the price of shipping the full reference engine, not a packaging bug.
   The zip the packaging job uploads is smaller, but still comfortably in the
@@ -111,6 +121,11 @@ Desktop CI (`package-desktop` job in `release.yml`):
 - A `short-lab-v*` tag never starts the Android job; a `v*` tag never starts the Desktop
   job — see the routing matrix in
   `desktop/backend/tests/test_shortlab_release_workflow.py`.
+- Both upload steps (`short-lab-windows-x64` + `short-lab-verification-*`) run
+  `if: always()` with `if-no-files-found: error`, so evidence is downloadable
+  even when an earlier step failed. The verification artifact mirrors
+  `desktop/backend/runtime/verification/<build-id>/` (manifest + logs + SHAs);
+  CI run/artifact URLs are filled by real CI only, never invented locally.
 
 Upgrading in the same Python environment: uninstall the old `diveintocrypto-desktop`
 distribution first, then install `short-lab-desktop`. Do not install both side by side.

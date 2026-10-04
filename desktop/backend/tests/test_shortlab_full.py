@@ -154,6 +154,7 @@ def make_metadata(symbols: list[str], clock_ms: int) -> dict[str, dict]:
             "status": "TRADING",
             "contract_type": "PERPETUAL",
             "observed_at_ms": clock_ms,
+            "quote_to_usd": "1",  # Explicit FX for this offline happy-path fixture.
             "contract_multiplier": None,
             "multiplier_source": None,
         }
@@ -929,7 +930,7 @@ async def test_phase5_cap_never_runs_003(tmp_path) -> None:
 async def test_forward_migration_from_v1_and_repeat(tmp_path) -> None:
     repo = await ShortLabRepository.open(db_path=tmp_path / "fwd.duckdb")
     try:
-        assert await repo.migrate() == 1  # frozen Task 2 default
+        assert await repo.migrate(target_version=1) == 1  # explicit stepwise path
         assert await repo.migrate(target_version=2) == 2
         saved = await repo.save_unlock_events([
             UnlockEventRecord(
@@ -1044,14 +1045,15 @@ def test_schema_target_for_config_phasing() -> None:
     from diveintocrypto_desktop.shortlab.config import ProviderConfig
 
     base = load_shortlab_config()
-    assert schema_target_for_config(base) == 1
+    # F01: schema target decoupled from provider flags (always 4; hedge -> 5 in H01)
+    assert schema_target_for_config(base) == 4
     providers = dict(base.providers)
     providers["unlock"] = ProviderConfig(enabled=True, api_key_env="DIVE_TOKENOMIST_API_KEY")
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 2
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
     providers["social"] = ProviderConfig(enabled=True, api_key_env="DIVE_LUNARCRUSH_API_KEY")
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 2
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
     providers["catalyst"] = ProviderConfig(enabled=True, api_key_env=None)
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 3
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
 
 
 # ---------------------------------------------------------------------------

@@ -584,15 +584,18 @@ async def test_summary_four_states_sum_to_sample(tmp_path: Path) -> None:
         funding_fn=funding_fn_factory(make_funding(ENTRY_TS, last_tradable)),
         lifecycle_fn=lifecycle_delisted_factory(last_tradable, 95.0),
     )
-    # S_PENDING is never graded: it counts as PENDING (NOT_GRADED).
+    # S_PENDING is never graded. F07/A8: its 7D horizon is long due at the
+    # real-clock summary time, so it counts as UNAVAILABLE/NOT_GRADED_DUE
+    # (queue depth), not virtual PENDING. Only not-due missing rows are PENDING.
 
     report = await metrics.summary(repo, {"horizon": "7D"}, config=config)
     assert isinstance(report, EvidenceSummary)
     bucket = report.horizons["7D"]
     assert bucket["COMPLETE"] == 1
-    assert bucket["PENDING"] == 1
     assert bucket["CENSORED"] == 1
-    assert bucket["UNAVAILABLE"] == 1
+    assert bucket["UNAVAILABLE"] == 2
+    assert bucket["PENDING"] == 0
+    assert bucket.get("notGradedDue", bucket.get("not_graded_due", 0)) >= 1
     assert (
         bucket["PENDING"] + bucket["COMPLETE"] + bucket["CENSORED"] + bucket["UNAVAILABLE"]
         == bucket["total"] == 4 == report.total

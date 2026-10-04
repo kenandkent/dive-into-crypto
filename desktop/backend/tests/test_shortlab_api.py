@@ -913,3 +913,176 @@ async def test_coingecko_500_scan_still_ok(tmp_path) -> None:
                 assert r2.status_code == 200
     await repo.close()
 
+
+# ---------------------------------------------------------------------------
+# F08: health additive / job-status query / evidence routing / write guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_f08_health_additive_keeps_original_fields(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, clock)
+    await _seed_generation(repo, "gen-1", [{"symbol": "BTCUSDT", "ltss": 80.0, "entry": 75.0}])
+    app = _make_app(_make_service(repo, clock))
+    with TestClient(app) as client:
+        h = client.get("/api/short/health")
+        assert h.status_code == 200
+        body = h.json()
+        # Original F06a fields keep name + meaning.
+        for key in ("ok", "available", "analysisTier", "scoreVersion",
+                    "generationId", "generatedAtMs"):
+            assert key in body, f"original health field {key} must stay"
+        assert body["ok"] is True and body["available"] is True
+        assert body["generationId"] == "gen-1"
+        # F08 additive only.
+        assert body["schemaVersion"] == "shortlab.api.v1"
+        assert body["schema_version"] == "shortlab.api.v1"
+        assert isinstance(body["capabilities"], dict)
+        assert body["capabilities"]["scoreRefresh"] is True
+        assert body["capabilities"]["jobStatus"] is True
+        assert body["capabilities"]["generationPinning"] is True
+        assert "evidenceSummary" in body["capabilities"]
+        assert isinstance(body["jobs"], dict)
+        assert "score_refresh" in body["jobs"]["known"]
+        assert body["jobs"]["running"] == []
+        assert body["lastSuccessfulGeneration"] == "gen-1"
+        assert isinstance(body["missingDependencies"], list)
+    # Metrics wired flips only the additive capability (no router change).
+    service2 = _make_service(repo, clock)
+
+    async def _metrics(filters: Any) -> EvidenceSummary:
+        return EvidenceSummary(filters=dict(filters), horizons={"30D": {"n": 1}},
+                               total=1, generated_at_ms=clock())
+
+    service2._metrics_provider = _metrics
+    app2 = _make_app(service2)
+    with TestClient(app2) as client:
+        body2 = client.get("/api/short/health").json()
+        assert body2["capabilities"]["evidenceSummary"] is True
+        assert body2["lastSuccessfulGeneration"] == "gen-1"
+    await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_f08_refresh_202_is_task_not_completion(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, clock)
+    await _seed_generation(repo, "gen-1", [{"symbol": "BTCUSDT", "ltss": 80.0, "entry": 75.0}])
+    service = _make_service(repo, clock)
+
+    async def _fake_refresh(job_type: str = "score_refresh") -> JobRef:
+        return JobRef(job_id="job-task-1", job_type=job_type, existing=False)
+
+    service.refresh = _fake_refresh  # type: ignore[method-assign]
+    app = _make_app(service)
+    with TestClient(app) as client:
+        before = client.get("/api/short/candidates").json()["generationId"]
+        assert before == "gen-1"
+        r = client.post("/api/short/refresh")
+        assert r.status_code == 202
+        ref = r.json()
+        assert ref["jobId"] == "job-task-1"
+        assert ref["jobType"] == "score_refresh"
+        assert ref["existing"] is False
+        # 202 did not complete anything: latest generation is unchanged until
+        # the job itself SUCCEEDs and the page polls job-status.
+        after = client.get("/api/short/candidates").json()["generationId"]
+        assert after == "gen-1"
+        # Unknown job ids stay 404 (job-status query contract).
+        miss = client.get("/api/short/refresh/no-such-job")
+        assert miss.status_code == 404
+        assert miss.json()["error"] == "short_job_not_found"
+    await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_f08_job_status_run_to_succeeded_shape(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, clock)
+    await _seed_generation(repo, "gen-1", [{"symbol": "BTCUSDT", "ltss": 80.0, "entry": 75.0}],
+                           finished=NOW, started=NOW - 1_000)
+    app = _make_app(_make_service(repo, clock))
+    with TestClient(app) as client:
+        r = client.get("/api/short/refresh/gen-1")
+        assert r.status_code == 200
+        body = r.json()
+        for key in ("jobId", "jobType", "status", "stats",
+                    "startedAtMs", "finishedAtMs", "existing", "errorCode"):
+            assert key in body, f"job-status needs {key}"
+        assert body["jobId"] == "gen-1"
+        assert body["status"] == "SUCCEEDED"
+    await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_f08_evidence_routing_503_reason_visible_then_200(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, clock)
+    await _seed_generation(repo, "gen-1", [{"symbol": "BTCUSDT", "ltss": 80.0, "entry": 75.0}])
+    service = _make_service(repo, clock)
+    app = _make_app(service)
+    with TestClient(app) as client:
+        r = client.get("/api/short/evidence/summary")
+        assert r.status_code == 503
+        # Reason stays visible; never mocked.
+        assert r.json()["error"] == EVIDENCE_UNAVAILABLE_REASON
+    async def _metrics(filters: Any) -> EvidenceSummary:
+        return EvidenceSummary(filters=dict(filters), horizons={"30D": {"n": 5}},
+                               total=5, generated_at_ms=clock())
+    service._metrics_provider = _metrics
+    with TestClient(app) as client:
+        r = client.get("/api/short/evidence/summary?horizon=30D")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 5
+        assert body["filters"]["horizon"] == "30D"
+        assert "generatedAtMs" in body
+        assert "horizons" in body
+    await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_f08_cors_patch_preflight_and_write_guard(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, clock)
+    await _seed_generation(repo, "gen-1", [{"symbol": "BTCUSDT", "ltss": 80.0, "entry": 75.0}])
+    service = _make_service(repo, clock)
+
+    async def _fake_refresh(job_type: str = "score_refresh") -> JobRef:
+        return JobRef(job_id="job-1", job_type=job_type, existing=False)
+
+    service.refresh = _fake_refresh  # type: ignore[method-assign]
+    app = _make_app(service)
+    with TestClient(app) as client:
+        # Supported dev cross-origin preflight allows PATCH.
+        pre = client.options(
+            "/api/short/candidates",
+            headers={"Origin": "http://localhost:3000",
+                     "Access-Control-Request-Method": "PATCH"},
+        )
+        assert pre.status_code == 200
+        allow = pre.headers.get("access-control-allow-methods", "")
+        assert "PATCH" in allow
+        assert pre.headers.get("access-control-allow-origin") == "http://localhost:3000"
+        # Same-origin POST stays normal (202 task).
+        ok_same = client.post("/api/short/refresh",
+                              headers={"Origin": "http://127.0.0.1:46408"})
+        assert ok_same.status_code == 202
+        # Same-origin PATCH reaches the router (405/404), never a guard 403.
+        same_patch = client.patch("/api/short/candidates",
+                                  headers={"Origin": "http://127.0.0.1:46408"})
+        assert same_patch.status_code in (404, 405)
+        # Malicious cross-site write is rejected.
+        evil = client.post("/api/short/refresh", headers={"Origin": "https://evil.com"})
+        assert evil.status_code == 403
+        assert evil.json()["error"] == "short_forbidden_origin"
+        # Untrusted Host is rejected.
+        bad_host = client.post("/api/short/refresh", headers={"Host": "evil.com"})
+        assert bad_host.status_code == 403
+        # Non-JSON write body is rejected (empty POST without a body stays OK).
+        bad_json = client.post("/api/short/refresh", content=b"not-json",
+                               headers={"Content-Type": "text/plain"})
+        assert bad_json.status_code == 415
+    await repo.close()
+

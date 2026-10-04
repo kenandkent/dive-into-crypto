@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "description": "Short-Lab file ownership and handoff order (design C2/C3.2, seeded by F01). Each entry lists the path (exact or fnmatch glob), the ordered owner task sequence, prerequisite tasks whose handoff must be declared, and whether a handoff record is required. Paths with no entry need human review and fail the check. Later tasks extend owner_sequence in place; F01 entries are frozen.",
+  "branch_pattern": "^codex/[fh]\\d+-",
+  "paths": [
+    {
+      "path": "scripts/check_shortlab_owner.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/shortlab_ownership_policy.json",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/ownership.schema.json",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/shortlab_pr_evidence_template.md",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/repository.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/models.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/migrations/004_core_completion.sql",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/pyproject.toml",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/uv.lock",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repository.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_core_persistence.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_owner_check.py",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/observations.py",
+      "owner_sequence": ["F02"],
+      "prerequisite": ["F01"],
+      "handoff_required": true
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/data/*",
+      "owner_sequence": ["F02"],
+      "prerequisite": ["F01"],
+      "handoff_required": true
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/migrations/005_*.sql",
+      "owner_sequence": ["H01"],
+      "prerequisite": ["F01"],
+      "handoff_required": true
+    },
+    {
+      "path": "docs/ShortLab_*.md",
+      "owner_sequence": ["F01"],
+      "prerequisite": [],
+      "handoff_required": false,
+      "note": "Integrated plan/design docs are shared references; doc-only edits need human review."
+    }
+  ],
+  "default": {
+    "action": "review",
+    "message": "Unknown path: no policy entry covers it. Add an owner entry or request human review; the check fails closed."
+  }
+}

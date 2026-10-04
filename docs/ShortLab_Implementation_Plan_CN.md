@@ -1,5 +1,8 @@
 # short-lab Desktop Implementation Plan
 
+> **文档用途：只读参考，不用于当前升级开发。当前执行合同为 [一体化设计](ShortLab_Integrated_Upgrade_Design_CN.md) 与 [一体化实施计划](ShortLab_Integrated_Implementation_Plan_CN.md)。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在当前 `short-meme` 分支把 short-lab 作为现有 FastAPI 与 React 桌面应用的内部研究功能交付，保留旧接口和 `dive-desktop` 命令，Android 不在范围内。
@@ -14,7 +17,7 @@
 
 - 项目根目录：任务开始时 `git rev-parse --show-toplevel` 返回的 checkout 根目录。根目录外只读；任何 agent 不得改动、清理或新建根目录外文件。文件路径均相对此根目录解释。
 - 在当前分支实施，保留现有未提交文件；不得切到 `main`，不得改 Android。
-- 一个 FastAPI 进程；默认 `127.0.0.1:8780`；保留现有 `--host`/`--port`、旧 API、Python import 与 `uv run dive-desktop`；新增推荐别名 `uv run short-lab`。
+- 一个 FastAPI 进程；默认 `127.0.0.1:46408`；保留现有 `--host`/`--port`、旧 API、Python import 与 `uv run dive-desktop`；新增推荐别名 `uv run short-lab`。
 - 外部 provider 失败不得影响 `/api/scan`；缺失数据为 null + 原因，绝不伪造 0；无交易密钥或自动下单。
 - LITE 先上线；Unlock/Social 在 Phase 5 接入，Catalyst、FULL DQ 和 FULL score 在 Phase 6 一起启用。未齐全时仅展示 LITE。
 - Score、状态、收益和 DQ 遵从设计第 8.2、15、17、18、21 节；不按个人判断调整阈值。测试固定 fixture，不在普通 CI 访问公网。

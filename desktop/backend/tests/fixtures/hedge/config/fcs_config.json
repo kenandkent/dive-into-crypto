@@ -1,0 +1,295 @@
+{
+  "funding_capture": {
+    "entry_gate": {
+      "min_30d_coverage": 0.9,
+      "min_90d_coverage": 0.8,
+      "min_funding_30d": 0.0,
+      "min_funding_7d": 0.0,
+      "min_positive_ratio_30d": 0.75,
+      "min_positive_ratio_90d": 0.6,
+      "require_current_positive": true,
+      "require_last_settled_positive": true
+    },
+    "fcs_version": "fcs_v1",
+    "reference_notional_usd": 10000,
+    "score_rules": {
+      "basis": {
+        "negative_at_or_above": 3,
+        "negative_below": 0,
+        "negative_floor": -0.005,
+        "nonnegative_max_bins": [
+          [
+            0.005,
+            10
+          ],
+          [
+            0.015,
+            8
+          ],
+          [
+            0.03,
+            5
+          ]
+        ],
+        "positive_above": 2
+      },
+      "module_weights": {
+        "basis_quality": 10,
+        "funding_persistence": 25,
+        "funding_stability": 15,
+        "funding_yield": 25,
+        "hedge_venue_quality": 15,
+        "operational_safety": 10
+      },
+      "negative_streak": {
+        "exact_bins": [
+          [
+            0,
+            7
+          ],
+          [
+            1,
+            6
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        "fallback": 0
+      },
+      "operational": {
+        "funding_time": 1,
+        "identity": 2,
+        "multiplier": 2,
+        "no_delisting": 2,
+        "quote_fresh": 1,
+        "trading": 2
+      },
+      "positive_ratio_30d": {
+        "fallback": 0,
+        "min_inclusive_bins": [
+          [
+            0.9,
+            15
+          ],
+          [
+            0.8,
+            12
+          ],
+          [
+            0.75,
+            9
+          ],
+          [
+            0.65,
+            5
+          ]
+        ]
+      },
+      "positive_ratio_90d": {
+        "fallback": 0,
+        "min_inclusive_bins": [
+          [
+            0.9,
+            10
+          ],
+          [
+            0.8,
+            8
+          ],
+          [
+            0.7,
+            5
+          ],
+          [
+            0.6,
+            2
+          ]
+        ],
+        "not_applicable_score": 0
+      },
+      "std_30d": {
+        "fallback": 0,
+        "max_inclusive_bins": [
+          [
+            0.0003,
+            8
+          ],
+          [
+            0.0008,
+            5
+          ],
+          [
+            0.0015,
+            2
+          ]
+        ]
+      },
+      "venue": {
+        "cost_fallback": 0,
+        "coverage_fallback": 0,
+        "exit_scores": {
+          "CONFIRMED": 3,
+          "NO": 0,
+          "PARTIAL": 1,
+          "UNKNOWN": 0
+        },
+        "min_coverage_bins": [
+          [
+            1.0,
+            7
+          ],
+          [
+            0.75,
+            4
+          ],
+          [
+            0.5,
+            2
+          ]
+        ],
+        "roundtrip_cost_max_bins": [
+          [
+            0.003,
+            5
+          ],
+          [
+            0.006,
+            3
+          ],
+          [
+            0.01,
+            1
+          ]
+        ]
+      },
+      "yield_30d": {
+        "min_inclusive_bins": [
+          [
+            0.04,
+            25
+          ],
+          [
+            0.025,
+            20
+          ],
+          [
+            0.015,
+            15
+          ],
+          [
+            0.0075,
+            8
+          ]
+        ],
+        "non_positive": 0,
+        "positive_fallback": 3
+      }
+    },
+    "statistics": {
+      "min_windows_30d": 20,
+      "min_windows_90d": 60,
+      "p25_method": "LINEAR_N_MINUS_1",
+      "rolling_window_days": 7,
+      "std_ddof": 0,
+      "std_reference_hours": 8,
+      "window_boundary": "LEFT_OPEN_RIGHT_CLOSED"
+    }
+  },
+  "hedge": {
+    "basis_fresh_max_skew_sec": 5,
+    "costs": {
+      "alpha_entry_fee_rate": 0.001,
+      "alpha_exit_fee_rate": 0.001,
+      "futures_entry_fee_rate": 0.0005,
+      "futures_exit_fee_rate": 0.0005,
+      "onchain_extra_buffer_bps": 20,
+      "spot_entry_fee_rate": 0.001,
+      "spot_exit_fee_rate": 0.001
+    },
+    "freshness": {
+      "alpha_quote": {
+        "grace": 60,
+        "ttl": 20
+      },
+      "contract_status": {
+        "grace": 1800,
+        "ttl": 900
+      },
+      "funding_current": {
+        "grace": 300,
+        "ttl": 120
+      },
+      "futures_mark": {
+        "grace": 60,
+        "ttl": 20
+      },
+      "onchain_quote": {
+        "grace": 180,
+        "ttl": 90
+      },
+      "spot_depth": {
+        "grace": 180,
+        "ttl": 60
+      },
+      "spot_quote": {
+        "grace": 60,
+        "ttl": 20
+      }
+    },
+    "fx": {
+      "historical_policy": "AT_EVENT_NO_INTERPOLATION",
+      "max_age_sec": 60,
+      "policy": "OBSERVED_QUOTE_TO_USD"
+    },
+    "max_price_impact_bps": 30,
+    "quality": {
+      "field_shares": {
+        "contract_time": {
+          "heartbeat": 20,
+          "lifecycle": 50,
+          "source_time": 10,
+          "time_alignment": 20
+        },
+        "funding": {
+          "current_rate_time": 20,
+          "history_30d": 30,
+          "history_7d": 10,
+          "history_90d": 20,
+          "next_time_interval": 10,
+          "std_rolling": 10
+        },
+        "futures": {
+          "exit_depth_vwap": 40,
+          "mark_time": 25,
+          "symbol_status": 10,
+          "trading_rules": 25
+        },
+        "identity_units": {
+          "asset_identity": 50,
+          "multiplier": 30,
+          "quote_usd_fx": 20
+        },
+        "spot_venue": {
+          "buy_quote": 25,
+          "cost_fee_gas": 20,
+          "rules_decimals": 20,
+          "sell_quote": 35
+        }
+      },
+      "group_weights": {
+        "contract_time": 10,
+        "funding": 30,
+        "futures": 20,
+        "identity_units": 15,
+        "spot_venue": 25
+      }
+    },
+    "venue_selection_version": "VERIFIED_TWO_SIDED_COST_V1"
+  }
+}

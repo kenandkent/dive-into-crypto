@@ -239,8 +239,8 @@ test("view renders its own UNAVAILABLE page on 503 — no mock, no fake numbers"
     { initial: { error: "/api/short/candidates → 503 · shortlab_unavailable · db_not_migrated" } }));
   assert.ok(html.includes('data-testid="shortlab-unavailable"'), "own UNAVAILABLE marker");
   assert.ok(html.includes("UNAVAILABLE"), "says unavailable");
-  assert.ok(html.includes("TEKRAR DENE"), "retry button present");
-  assert.ok(html.includes("mock") && html.includes("uydurmaz"), "states it never fabricates");
+  assert.ok(html.includes("重试"), "retry button present (ZH default)");
+  assert.ok(html.includes("mock") && html.includes("不编造"), "states it never fabricates");
   assert.ok(!/84\.2|STRONG_SELL/.test(html), "no fabricated market values");
   assert.equal(globalThis.window.SGS_SHORT, null, "rendering the error page has no side effects on globals");
 });
@@ -279,10 +279,35 @@ test("detail renders the §26.4 blocks with independent N/A and UNAVAILABLE copy
   assert.ok(html.includes("N/A"), "confirmed absence renders N/A");
   assert.ok(html.includes("UNAVAILABLE"), "outage renders UNAVAILABLE — a different word");
   assert.ok(html.includes("STALE"), "stale snapshot flagged");
-  assert.ok(html.includes("entryScore null") || html.includes("hesaplanmadı"), "null entry is honest, never 0");
+  assert.ok(html.includes("entryScore null") || html.includes("未计算"), "null entry is honest, never 0");
 });
 
-/* ── 6. routing gate: boot failure blocks old views, not shortlab ─────────── */
+/* ── 6. i18n: ZH default, TR/EN explicit, shortlab chrome localized ───────── */
+test("shortlab chrome defaults to ZH and still serves TR/EN on selection", async () => {
+  await loadApp();
+  const w = globalThis.window;
+  assert.equal(w.diveLang(), "zh", "null storage → ZH default");
+  assert.equal(w.L("sl_title"), "做空研究");
+  assert.equal(w.L("sl_retry"), "重试 · RETRY");
+  assert.equal(w.L("sl_page", 2, 9), "第 2 页 / 共 9 页 · generation 固定（第二页用同一 generationId）");
+  assert.equal(w.SL_FORMAT.reasonText("VETO_LOW_LIQUIDITY"), "低于成交量/OI 硬下限或合约不可交易");
+  assert.equal(w.SL_FORMAT.reasonText("NO_SUCH_CODE"), "NO_SUCH_CODE", "unknown codes stay verbatim");
+  // explicit selection still works and is honored by both L() and reason glosses
+  const store = new Map([["dive_lang", "tr"]]);
+  globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => { store.set(k, String(v)); } };
+  assert.equal(w.diveLang(), "tr");
+  assert.equal(w.L("sl_retry"), "TEKRAR DENE · RETRY");
+  assert.equal(w.SL_FORMAT.reasonText("VETO_LOW_LIQUIDITY"), "below hard volume/OI floor or untradeable contract");
+  store.set("dive_lang", "en");
+  assert.equal(w.L("sl_retry"), "RETRY");
+  assert.equal(w.L("nav_scan"), "SCAN");
+  store.set("dive_lang", "zh");
+  assert.equal(w.L("nav_scan"), "扫描");
+  assert.equal(w.L("pal_shortlab"), "SHORT LAB · 做空扫描");
+  globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+});
+
+/* ── 7. routing gate: boot failure blocks old views, not shortlab ─────────── */
 test("shortlab is reachable by hash/NAV/palette/keys and bypasses the no-data gate", async () => {
   const app = await loadApp();
   const { renderToStaticMarkup } = await import("react-dom/server");

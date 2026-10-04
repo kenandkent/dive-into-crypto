@@ -50,6 +50,10 @@ __all__ = [
     "READY_REQUIRED_FIELDS_FULL",
     "CATALYST_REQUIRED",
     "FULL_PREREQUISITE_MISSING",
+    "QUALITY_POLICY_VERSION",
+    "QualityPolicy",
+    "default_quality_policy",
+    "quality_policy_from_config",
     "FieldState",
     "FieldCredit",
     "DQBreakdown",
@@ -62,6 +66,12 @@ __all__ = [
 
 CATALYST_REQUIRED = "CATALYST_REQUIRED"
 FULL_PREREQUISITE_MISSING = "FULL_PREREQUISITE_MISSING"
+
+#: Version stamp for the frozen DQ policy bundle (design A5.3). New
+#: production inputs are scored under this version; `policy=None` stays the
+#: v1 legacy replay path (module constants, future-timestamp quirk kept so
+#: stored history replays bit-identically).
+QUALITY_POLICY_VERSION = "quality-policy-v2"
 
 # ---------------------------------------------------------------------------
 # Group weights (design section 18 tables). Each sums to 100.
@@ -258,6 +268,127 @@ def is_ready_required(field_id: str, tier: str) -> bool:
     return field_id in READY_REQUIRED_FIELDS_LITE
 
 
+# ---------------------------------------------------------------------------
+# Frozen DQ policy (F05, design A5.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QualityPolicy:
+    """One frozen read of every DQ input (fail loud on garbage).
+
+    Carries copies of the group weights, intra-group shares, PARTIAL
+    denominators, freshness windows (group windows plus the
+    ``supply_float``-style field overrides, resolved so every field maps
+    through ``field_freshness``), the READY key-field sets and the
+    ``policy_hash`` of the frozen config bundle when built from a config
+    (``None`` for hand-built test policies). ``reject_future_timestamps``
+    is always True on v2: a ``fetched_at`` after ``as_of`` is invalid
+    (freshness 0), never clamped to FRESH.
+    """
+
+    group_weights_lite: Mapping[str, float]
+    group_weights_full: Mapping[str, float]
+    group_field_shares: Mapping[str, Mapping[str, float]]
+    field_required_counts: Mapping[str, int]
+    freshness_sec: Mapping[str, tuple[int, int]]
+    field_freshness: Mapping[str, str]
+    ready_required_lite: frozenset[str]
+    ready_required_full: frozenset[str]
+    version: str = QUALITY_POLICY_VERSION
+    policy_hash: str | None = None
+    reject_future_timestamps: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("group_weights_lite", "group_weights_full"):
+            weights = getattr(self, name)
+            total = sum(float(v) for v in weights.values())
+            if total != 100:
+                raise ValueError(f"{name} weights must sum to 100, got {total}")
+        for group, shares in self.group_field_shares.items():
+            total = sum(float(v) for v in shares.values())
+            if abs(total - 1.0) > 1e-9:
+                raise ValueError(
+                    f"group {group!r} shares must sum to 1.0, got {total}"
+                )
+            for field_id in shares:
+                window = self.field_freshness.get(field_id)
+                if window is None:
+                    raise ValueError(
+                        f"field {field_id!r} has no freshness window mapping"
+                    )
+                if window not in self.freshness_sec:
+                    raise ValueError(
+                        f"field {field_id!r} maps to unknown window {window!r}"
+                    )
+        for window, (ttl, grace) in self.freshness_sec.items():
+            if not grace > ttl > 0:
+                raise ValueError(
+                    f"freshness window {window!r} requires grace > ttl > 0, "
+                    f"got ttl={ttl} grace={grace}"
+                )
+        for field_id, required in self.field_required_counts.items():
+            if required is None or int(required) <= 0:
+                raise ValueError(
+                    f"required count for {field_id!r} must be positive"
+                )
+
+
+def default_quality_policy(*, policy_hash: str | None = None) -> QualityPolicy:
+    """v2 policy from the frozen module constants (code-owned math tables).
+
+    Freshness windows mirror ``shortlab/default.yaml``
+    ``quality_freshness_sec`` plus the ``supply_float`` override -- the same
+    values :func:`quality_policy_from_config` reads from a config, so the
+    default config reproduces this policy exactly.
+    """
+    return QualityPolicy(
+        group_weights_lite=dict(LITE_GROUP_WEIGHTS),
+        group_weights_full=dict(FULL_GROUP_WEIGHTS),
+        group_field_shares={
+            group: dict(shares) for group, shares in GROUP_FIELD_SHARES.items()
+        },
+        field_required_counts=dict(FIELD_REQUIRED_COUNTS),
+        freshness_sec={key: (ttl, grace) for key, (ttl, grace) in FRESHNESS_SEC.items()},
+        field_freshness=dict(FIELD_FRESHNESS),
+        ready_required_lite=frozenset(READY_REQUIRED_FIELDS_LITE),
+        ready_required_full=frozenset(READY_REQUIRED_FIELDS_FULL),
+        policy_hash=policy_hash,
+    )
+
+
+def quality_policy_from_config(
+    config: Any, *, policy_hash: str | None = None
+) -> QualityPolicy:
+    """One frozen DQ-policy read from a validated config (F05/F06 handoff).
+
+    TTL/grace windows come from ``config.quality_freshness_sec`` plus
+    ``config.quality_field_overrides_sec``; shares, denominators and key
+    sets stay the frozen code-owned tables. ``config`` is duck-typed (no
+    import of ``shortlab.config``) so tests can pass light doubles.
+    """
+    freshness = getattr(config, "quality_freshness_sec")
+    overrides = getattr(config, "quality_field_overrides_sec")
+    windows: dict[str, tuple[int, int]] = {}
+    for group, window in freshness.items():
+        windows[str(group)] = (int(window.ttl), int(window.grace))
+    for name, window in overrides.items():
+        windows[str(name)] = (int(window.ttl), int(window.grace))
+    return QualityPolicy(
+        group_weights_lite=dict(LITE_GROUP_WEIGHTS),
+        group_weights_full=dict(FULL_GROUP_WEIGHTS),
+        group_field_shares={
+            group: dict(shares) for group, shares in GROUP_FIELD_SHARES.items()
+        },
+        field_required_counts=dict(FIELD_REQUIRED_COUNTS),
+        freshness_sec=windows,
+        field_freshness=dict(FIELD_FRESHNESS),
+        ready_required_lite=frozenset(READY_REQUIRED_FIELDS_LITE),
+        ready_required_full=frozenset(READY_REQUIRED_FIELDS_FULL),
+        policy_hash=policy_hash,
+    )
+
+
 def _result_status_of(result: Any) -> str:
     status = getattr(result, "status", None)
     text = str(status).upper() if status is not None else "UNAVAILABLE"
@@ -442,7 +573,9 @@ def _clamp01(value: float) -> float:
     return float(value)
 
 
-def _coverage_for(state: FieldState) -> float:
+def _coverage_for(
+    state: FieldState, required_counts: Mapping[str, int] | None = None
+) -> float:
     status = str(state.status).upper()
     if status == "OK":
         return 1.0
@@ -459,9 +592,12 @@ def _coverage_for(state: FieldState) -> float:
         if state.valid_count is not None:
             required = state.required_count
             if required is None:
-                required = float(
-                    FIELD_REQUIRED_COUNTS.get(state.field_id, 1)
+                table = (
+                    required_counts
+                    if required_counts is not None
+                    else FIELD_REQUIRED_COUNTS
                 )
+                required = float(table.get(state.field_id, 1))
             try:
                 required_f = float(required)
             except (TypeError, ValueError):
@@ -477,11 +613,21 @@ def _coverage_for(state: FieldState) -> float:
     )
 
 
-def _freshness_for(field_id: str, fetched_at_ms: int | None, as_of_ms: int) -> tuple[float, str]:
-    window = FIELD_FRESHNESS.get(field_id)
+def _freshness_for(
+    field_id: str,
+    fetched_at_ms: int | None,
+    as_of_ms: int,
+    *,
+    field_windows: Mapping[str, str] | None = None,
+    freshness_sec: Mapping[str, tuple[int, int]] | None = None,
+    reject_future: bool = False,
+) -> tuple[float, str]:
+    windows = field_windows if field_windows is not None else FIELD_FRESHNESS
+    table = freshness_sec if freshness_sec is not None else FRESHNESS_SEC
+    window = windows.get(field_id)
     if window is None:
         raise ValueError(f"unknown field_id {field_id!r}")
-    ttl, grace = FRESHNESS_SEC[window]
+    ttl, grace = table[window]
     if fetched_at_ms is None:
         return 0.0, "UNAVAILABLE"
     try:
@@ -489,6 +635,10 @@ def _freshness_for(field_id: str, fetched_at_ms: int | None, as_of_ms: int) -> t
     except (TypeError, ValueError):
         return 0.0, "UNAVAILABLE"
     if age_sec < 0:
+        # v1 legacy replay keeps the historical clamp (fresh); the frozen
+        # v2 policy treats future timestamps as invalid, never FRESH.
+        if reject_future:
+            return 0.0, "UNAVAILABLE"
         age_sec = 0.0
     if age_sec <= ttl:
         return 1.0, "FRESH"
@@ -501,6 +651,7 @@ def data_quality(
     tier: str,
     field_states: Any,
     as_of_ms: int,
+    policy: QualityPolicy | None = None,
 ) -> DQBreakdown:
     """Compute Data Quality for ``tier`` (design section 18, exact formula).
 
@@ -509,9 +660,46 @@ def data_quality(
     ``UNAVAILABLE`` (credit 0, denominator kept). Groups absent from ``tier``
     are ignored. ``FULL`` with no catalyst fields at all raises ``ValueError``
     so callers cannot silently claim FULL without Catalyst coverage.
+
+    ``policy`` is the frozen v2 bundle from :func:`quality_policy_from_config`
+    (service, API and Entry read the same object once per decision); ``None``
+    replays the v1 legacy tables bit-identically, including the historical
+    future-timestamp clamp. The ``fraction * freshness`` formula, the
+    1/0.5/0 freshness steps and the single final ROUND_HALF_UP are identical
+    on both paths -- only the tables and the future-timestamp rule differ.
     """
     tier_key = str(tier).upper()
-    weights = group_weights(tier_key)
+    if policy is None:
+        weights = group_weights(tier_key)
+        shares_table: Mapping[str, Mapping[str, float]] = GROUP_FIELD_SHARES
+        required_counts: Mapping[str, int] = FIELD_REQUIRED_COUNTS
+        field_windows: Mapping[str, str] = FIELD_FRESHNESS
+        windows: Mapping[str, tuple[int, int]] = FRESHNESS_SEC
+        key_set = (
+            READY_REQUIRED_FIELDS_FULL if tier_key == "FULL" else READY_REQUIRED_FIELDS_LITE
+        )
+        reject_future = False
+    else:
+        if not isinstance(policy, QualityPolicy):
+            raise ValueError(
+                f"policy must be a QualityPolicy or None, got {type(policy).__name__}"
+            )
+        if tier_key == "LITE":
+            weights = dict(policy.group_weights_lite)
+        elif tier_key == "FULL":
+            weights = dict(policy.group_weights_full)
+        else:
+            raise ValueError(f"unknown tier {tier!r}; expected 'LITE' or 'FULL'")
+        shares_table = policy.group_field_shares
+        required_counts = policy.field_required_counts
+        field_windows = policy.field_freshness
+        windows = policy.freshness_sec
+        key_set = (
+            policy.ready_required_full
+            if tier_key == "FULL"
+            else policy.ready_required_lite
+        )
+        reject_future = bool(policy.reject_future_timestamps)
     as_of = int(as_of_ms)
 
     states: list[FieldState] = [_coerce_field(item) for item in (field_states or [])]
@@ -526,7 +714,7 @@ def data_quality(
 
     if tier_key == "FULL":
         has_catalyst = any(
-            fid in by_id for fid in GROUP_FIELD_SHARES["catalyst"]
+            fid in by_id for fid in shares_table["catalyst"]
         )
         if not has_catalyst:
             raise ValueError(
@@ -535,17 +723,13 @@ def data_quality(
                 "is wired)"
             )
 
-    key_set = (
-        READY_REQUIRED_FIELDS_FULL if tier_key == "FULL" else READY_REQUIRED_FIELDS_LITE
-    )
-
     group_credits: dict[str, float] = {}
     group_status: dict[str, str] = {}
     field_details: dict[str, FieldCredit] = {}
     stale_fields: list[str] = []
 
     for group, weight in weights.items():
-        shares = GROUP_FIELD_SHARES[group]
+        shares = shares_table[group]
         num = 0.0
         den = 0.0
         applicable = 0
@@ -575,12 +759,17 @@ def data_quality(
                 fetched: int | None = None
                 reason: str | None = "FIELD_MISSING"
             else:
-                coverage = _coverage_for(state)
+                coverage = _coverage_for(state, required_counts)
                 if status in ("UNAVAILABLE", "ERROR"):
                     freshness, label = 0.0, "UNAVAILABLE"
                 else:
                     freshness, label = _freshness_for(
-                        field_id, state.fetched_at_ms, as_of
+                        field_id,
+                        state.fetched_at_ms,
+                        as_of,
+                        field_windows=field_windows,
+                        freshness_sec=windows,
+                        reject_future=reject_future,
                     )
                 fetched = state.fetched_at_ms
                 reason = state.reason_code

@@ -80,6 +80,8 @@ __all__ = [
     "READY_TRADEABILITY",
     "VETO_DQ_THRESHOLD",
     "RiskResult",
+    "RiskPolicy",
+    "risk_policy_from_config",
     "evaluate_risks",
     "derive_status",
 ]
@@ -203,6 +205,54 @@ class RiskResult:
             object.__setattr__(self, name, items)
 
 
+@dataclass(frozen=True)
+class RiskPolicy:
+    """One frozen read of every risk/status threshold (F05, design A5.2).
+
+    ``risk_policy_from_config`` builds it from a validated config in a
+    single pass; callers splat the matching fields into :func:`evaluate_risks`
+    / :func:`derive_status` so a decision never mixes thresholds from two
+    config generations. Defaults mirror the frozen module constants (and
+    therefore ``default.yaml``) so omitting the policy replays history.
+    """
+
+    veto_dq_threshold: float = VETO_DQ_THRESHOLD
+    breakout_24h: float = BREAKOUT_24H
+    breakout_7d: float = BREAKOUT_7D
+    new_token_days: int = NEW_TOKEN_DAYS
+    hard_min_futures_qv: float = HARD_MIN_FUTURES_QV
+    hard_min_oi_usd: float = HARD_MIN_OI_USD
+    ready_ltss: float = READY_LTSS
+    ready_entry: float = READY_ENTRY
+    ready_dq: float = READY_DQ
+    ready_tradeability: float = READY_TRADEABILITY
+
+
+def risk_policy_from_config(config: Any) -> RiskPolicy:
+    """One frozen risk-threshold read from a validated config (F05/F06).
+
+    ``config`` is duck-typed (``candidate`` / ``veto`` / ``liquidity``
+    attributes, no import of ``shortlab.config``) so tests can pass light
+    doubles. Reads every threshold exactly once; the returned object is
+    immutable and safe to pin on a snapshot for replay.
+    """
+    candidate = getattr(config, "candidate")
+    veto = getattr(config, "veto")
+    liquidity = getattr(config, "liquidity")
+    return RiskPolicy(
+        veto_dq_threshold=VETO_DQ_THRESHOLD,
+        breakout_24h=float(veto.breakout_24h),
+        breakout_7d=float(veto.breakout_7d),
+        new_token_days=int(veto.new_token_days),
+        hard_min_futures_qv=float(liquidity.hard_min_futures_volume_usd),
+        hard_min_oi_usd=float(liquidity.hard_min_open_interest_usd),
+        ready_ltss=float(candidate.ready_ltss),
+        ready_entry=float(candidate.ready_entry),
+        ready_dq=float(candidate.ready_data_quality),
+        ready_tradeability=float(candidate.ready_tradeability_score),
+    )
+
+
 # -- small helpers -----------------------------------------------------------
 
 
@@ -304,7 +354,18 @@ def _sort_unique(codes: list[str], order: tuple[str, ...]) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
+def evaluate_risks(
+    features: Any,
+    metadata: Any,
+    dq: Any,
+    *,
+    veto_dq_threshold: float = VETO_DQ_THRESHOLD,
+    breakout_24h: float = BREAKOUT_24H,
+    breakout_7d: float = BREAKOUT_7D,
+    new_token_days: int = NEW_TOKEN_DAYS,
+    hard_min_futures_qv: float = HARD_MIN_FUTURES_QV,
+    hard_min_oi_usd: float = HARD_MIN_OI_USD,
+) -> RiskResult:
     """Evaluate BLOCK / PAUSE / WARN from traceable contract, funding, price
     and OI inputs. Same inputs always produce the same result.
 
@@ -312,7 +373,10 @@ def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
     mapping); ``metadata`` carries identity, lifecycle, market and provider
     flags (see module docstring for recognised keys); ``dq`` is a float or a
     ``DQBreakdown``-like object. ``metadata`` wins over ``features`` on key
-    collisions.
+    collisions. The keyword thresholds default to the frozen
+    ``default.yaml`` values; pass a frozen :class:`RiskPolicy`'s fields
+    (see :func:`risk_policy_from_config`) to score under a pinned policy
+    instead of today's config.
     """
     meta = metadata if isinstance(metadata, Mapping) else {}
     vetoes: list[str] = []
@@ -320,7 +384,7 @@ def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
     warnings: list[str] = []
 
     dq_num = _dq_value(dq)
-    if dq_num is None or dq_num < VETO_DQ_THRESHOLD:
+    if dq_num is None or dq_num < float(veto_dq_threshold):
         vetoes.append(VETO_LOW_DATA_QUALITY)
 
     confidence = _pick(features, meta, "mapping_confidence", "confidence")
@@ -337,9 +401,9 @@ def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
     contract_status = _pick(
         features, meta, "contract_status", "exchange_status", "status"
     )
-    if futures_qv is not None and futures_qv < HARD_MIN_FUTURES_QV:
+    if futures_qv is not None and futures_qv < float(hard_min_futures_qv):
         vetoes.append(VETO_LOW_LIQUIDITY)
-    if oi_usd is not None and oi_usd < HARD_MIN_OI_USD:
+    if oi_usd is not None and oi_usd < float(hard_min_oi_usd):
         vetoes.append(VETO_LOW_LIQUIDITY)
     if (
         isinstance(contract_status, str)
@@ -390,9 +454,9 @@ def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
     chg_7d = _finite(
         _pick(features, meta, "price_change_7d", "ret_7d", "return_7d", "chg_7d")
     )
-    if chg_24h is not None and chg_24h >= BREAKOUT_24H:
+    if chg_24h is not None and chg_24h >= float(breakout_24h):
         pauses.append(PAUSE_BREAKOUT_24H)
-    if chg_7d is not None and chg_7d >= BREAKOUT_7D:
+    if chg_7d is not None and chg_7d >= float(breakout_7d):
         pauses.append(PAUSE_BREAKOUT_7D)
 
     if evaluate_squeeze(features, meta):
@@ -424,7 +488,7 @@ def evaluate_risks(features: Any, metadata: Any, dq: Any) -> RiskResult:
         onboard_num = None
     if onboard_num is not None and onboard_num > 0 and as_of_num is not None:
         age_days = (int(as_of_num) - onboard_num) / DAY_MS
-        if 0 <= age_days < NEW_TOKEN_DAYS:
+        if 0 <= age_days < int(new_token_days):
             pauses.append(PAUSE_NEW_TOKEN)
 
     # -- unverified disappearance --------------------------------------------
@@ -550,6 +614,7 @@ def derive_status(
     ready_entry: float = READY_ENTRY,
     ready_dq: float = READY_DQ,
     ready_tradeability: float = READY_TRADEABILITY,
+    veto_dq_threshold: float = VETO_DQ_THRESHOLD,
 ) -> CandidateState:
     """Derive the dual status (design section 17, verbatim precedence).
 
@@ -559,8 +624,8 @@ def derive_status(
     :class:`RiskResult` (or mapping with ``vetoes``/``pauses``/``warnings``);
     ``stale`` is the top-level stale flag (key READY input stale or score
     snapshot expired). Extra keyword thresholds default to the frozen
-    ``default.yaml`` candidate gates and exist only for explicit boundary
-    tests.
+    ``default.yaml`` gates (plus the ``VETO_DQ_THRESHOLD`` safety net) and
+    exist for explicit boundary tests and pinned-policy replay.
     """
     ltss_num = _finite(ltss)
     entry_num = _finite(entry)
@@ -590,7 +655,7 @@ def derive_status(
     if bool(_get(identity, "identity_conflict", "provider_identity_conflict")):
         if VETO_DATA_IDENTITY not in effective_vetoes:
             effective_vetoes.append(VETO_DATA_IDENTITY)
-    if dq_num is None or dq_num < VETO_DQ_THRESHOLD:
+    if dq_num is None or dq_num < float(veto_dq_threshold):
         if VETO_LOW_DATA_QUALITY not in effective_vetoes:
             effective_vetoes.append(VETO_LOW_DATA_QUALITY)
     vetoes = _sort_unique(effective_vetoes, BLOCK_ORDER)

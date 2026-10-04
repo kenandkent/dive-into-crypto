@@ -190,3 +190,22 @@ def test_frozen_never_uses_install_dir_even_when_cwd_is_readonly(
     resolved = paths_mod.resolve_data_dir(frozen=False, env=env)
     assert str(fake_internal) not in str(resolved)
     assert "_internal" not in resolved.parts
+
+
+def test_f09_default_port_via_argparse_ast_not_comments() -> None:
+    """F09 base gate: argparse default is 46408 (AST, never a comment)."""
+    import ast as _ast
+
+    src = (BACKEND_DIR / "src" / "diveintocrypto_desktop" / "__main__.py").read_text(
+        encoding="utf-8"
+    )
+    tree = _ast.parse(src)
+    defaults: list[int] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call) and getattr(node.func, "attr", "") == "add_argument":
+            names = [a.value for a in node.args if isinstance(a, _ast.Constant)]
+            if "--port" in names:
+                for kw in node.keywords:
+                    if kw.arg == "default" and isinstance(kw.value, _ast.Constant):
+                        defaults.append(kw.value.value)
+    assert defaults == [46408]

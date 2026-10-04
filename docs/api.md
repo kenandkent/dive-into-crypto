@@ -1,7 +1,7 @@
 # HTTP & WebSocket API reference
 
 The desktop backend is a localhost-only FastAPI service (started by `uv run short-lab` —
-`uv run dive-desktop` stays as a compat alias — serving **127.0.0.1:8780**). Source of truth:
+`uv run dive-desktop` stays as a compat alias — serving **127.0.0.1:46408**). Source of truth:
 `desktop/backend/src/diveintocrypto_desktop/api/app.py`, with response assembly in
 `scan/symbol_builder.py` and `scan/scanner.py`; depth features live in `scan/evidence.py`
 (grading archive, v2 stats), `scan/structure.py` (BTC-beta / clusters / vol),
@@ -106,6 +106,39 @@ is already in flight — re-entrant). Unknown job types → 422
 Forward-evidence aggregation (7D/30D/90D) once the grader is wired; before that, 503
 `{"error": "short_evidence_unavailable"}`.
 
+Maintenance (retention sweep `diveintocrypto_desktop.shortlab.maintenance.maintain`,
+180-day base TTL, ≤ 1000 rows per call) is a background scheduler callback with
+no public HTTP endpoint; packaged resources are read via
+`diveintocrypto_desktop.resources.read_resource_text`.
+
+### Hedge (`/api/short/hedge/*`, needs `hedge.enabled: true`)
+
+Reference-parameter research only: no orders are placed. The only execution
+record is a user-entered fill (`PATCH legs`, `source: USER_ENTERED`);
+`activate`/`close` only flip local plan state. Unconfigured chains answer
+honestly (`UNAVAILABLE` + `CHAIN_PROVIDER_UNCONFIGURED`, `capabilities:
+{enabled: false}`) and `/api/short/health` reports them under
+`hedgeChains` — never a fabricated quote. Amount/quantity fields are
+decimal strings, unknown JSON fields are 422, idempotency/version conflicts
+are 409, a full write queue is 503 `LOCAL_WRITE_BUSY`.
+
+| Method & path | Meaning |
+|---|---|
+| `GET /api/short/funding-opportunities` | funding opportunity scan (frozen H01 inputs) |
+| `GET /api/short/hedge/venues/{symbol}?notional_usd=` | all venues side-by-side (`BINANCE_SPOT` / `BINANCE_ALPHA` / `ONCHAIN_DEX`); `notionalUsd` snake alias accepted |
+| `POST /api/short/hedge/simulate` | reference simulation, 60s quote expiry (`simulationId`, `formulaVersion: hedge_v1`); numeric quantities rejected, unknown fields 422 |
+| `GET /api/short/hedge/simulations/{id}` | one simulation; expired reads stay 200 with `expired: true`, unknown id 404 |
+| `POST /api/short/hedge/plans` | register a plan from a simulation (`simulationId` + `clientRequestId` required); first creation 201, identical retry 200 `existing: true`, key-reuse mismatch / content mismatch / expired quote 409, unknown plan id 404 |
+| `GET /api/short/hedge/plans` | list (`status` / `symbol` / `mode` / `venue` / `limit` / `offset`) |
+| `GET /api/short/hedge/plans/{id}` | full plan + actual legs + latest monitor + alerts |
+| `PATCH /api/short/hedge/plans/{id}/legs` | manual fill event (`event` + `clientEventId` + `expectedVersion`); idempotent retry returns the same event, version conflict 409 |
+| `POST /api/short/hedge/plans/{id}/activate` | local activate (409 when legs incomplete) |
+| `POST /api/short/hedge/plans/{id}/close` | local close (409 while open quantity remains) |
+| `GET /api/short/hedge/plans/{id}/monitor` | snapshot: ratio / exposure / PnL / funding / basis / liquidation distance / exit / safety / alerts (reference math, not a safety guarantee) |
+| `GET /api/short/hedge/alerts` | alerts (`plan_id` / `state` / `severity` / `code` filters) |
+| `POST /api/short/hedge/alerts/{id}/ack` | acknowledge (never resolves the condition as fixed) |
+| `GET /api/short/hedge/evidence/summary?strategy=&horizon=` | per-strategy buckets; unwired → 503 `HEDGE_EVIDENCE_UNAVAILABLE`; bad strategy / inverted window 422 |
+
 ### Short-Lab error codes
 
 | Code | HTTP | Meaning |
@@ -117,6 +150,13 @@ Forward-evidence aggregation (7D/30D/90D) once the grader is wired; before that,
 | `short_symbol_not_found` | 404 | unknown symbol |
 | `short_job_not_found` | 404 | unknown refresh job id |
 | `short_generation_not_found` | 404 | unknown or not-yet-SUCCEEDED generation |
+| `HEDGE_UNAVAILABLE` | 503 | hedge disabled (005 missing / `hedge.enabled: false`) — base 004 keeps serving |
+| `HEDGE_EVIDENCE_UNAVAILABLE` | 503 | hedge evidence not wired yet |
+| `CHAIN_PROVIDER_UNCONFIGURED` | 200 venue row | chain (Alpha / 0x) not configured — `UNAVAILABLE`, not counted as working |
+| `HEDGE_INPUT_INVALID` / `HEDGE_RATIO_INVALID` / `HEDGE_RISK_BUDGET_INVALID` / `HEDGE_MULTIPLIER_UNVERIFIED` | 422 | bad simulate/plan/leg payload (numeric quantity, unknown field, illegal ratio) |
+| `SIMULATION_INPUT_MISMATCH` / `IDEMPOTENCY_PAYLOAD_MISMATCH` / `QUOTE_EXPIRED` / version conflict | 409 | plan/leg precondition failed |
+| `HEDGE_PLAN_NOT_FOUND` / `HEDGE_SIMULATION_NOT_FOUND` | 404 | unknown plan / simulation id |
+| `LOCAL_WRITE_BUSY` | 503 | write queue full — committed nothing |
 
 ## GET /api/universe
 
