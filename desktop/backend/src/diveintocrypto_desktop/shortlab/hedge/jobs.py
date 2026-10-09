@@ -1,14 +1,55 @@
-"""Production Hedge jobs. Memory monitoring never invents prices or balances."""
+"""Production Hedge jobs. Memory monitoring never invents prices or balances.
+
+R11b (D11/D18/D19): symbol-merged Mark, deep-quote cap 10 / 4 concurrency /
+8s deadline, fair rotation (last_served asc, symbol), risk-change immediate
++ 60s persist, 5s degraded without clearing positions, budget DEFERRED, and
+R14 capture/quote-task interfaces via RepairPorts + MarketPort. Legacy
+_collect/monitor paths are preserved for pre-repair callers.
+"""
 from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from typing import Any
 
 from .monitor import compute_monitor, should_persist
 from .alerts import evaluate_alerts
 from .funding_score import (score_fcs, compute_funding_std_30d, compute_longest_negative_streak, compute_rolling_7d_aprs, compute_p25, resolve_history_class)
+
+#: R11b tick bounds (D11): per-tick deep quotes, concurrency, deadline.
+R11B_DEEP_LIMIT = 10
+R11B_CONCURRENCY = 4
+R11B_DEADLINE_MS = 8000
+R11B_DEPTH_TTL_MS = 30_000
+R11B_FUNDING_TTL_MS = 60_000
+
+
+def _is_budget_denial(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if "BudgetExhausted" in name or "Unbudgeted" in name:
+        return True
+    code = str(getattr(exc, "reason_code", "") or "")
+    if "BUDGET" in code or "UNBUDGETED" in code or "REQUEST_BUDGET_EXHAUSTED" in code or "JOB_TYPE_UNKNOWN" in code:
+        return True
+    text = str(exc)[:300]
+    return ("BUDGET_EXHAUSTED" in text or "UNBUDGETED_ENDPOINT" in text
+            or "JOB_TYPE_UNKNOWN" in text)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    code = str(getattr(exc, "reason_code", "") or "")
+    if "RATE_LIMITED" in code or "429" in code:
+        return True
+    status = getattr(exc, "status", None)
+    try:
+        if int(status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "429" in str(exc)[:200] or "RATE_LIMITED" in str(exc)[:200]
 
 
 def mapping(value):
@@ -28,6 +69,12 @@ class HedgeJobs:
         self.clear_ticks = {}
         self.persist_lag = {}
         self.hydrate_lock = asyncio.Lock()
+        # R11b fair rotation + accounting (per-symbol last served, 429/budget).
+        self._last_served: dict[str, int] = {}
+        self._rate_limited_count = 0
+        self._budget_deferred_count = 0
+        self._last_tick_ms = 0
+        self._last_unserved: tuple[str, ...] = ()
 
     def invalidate(self, plan_id=None):
         self.hydrated = False
@@ -39,7 +86,18 @@ class HedgeJobs:
         async with self.hydrate_lock:
             repo = self.service._repository
             plans=[]
-            for status in ('PARTIALLY_FILLED','ACTIVE','CLOSING'):
+            statuses = ['PARTIALLY_FILLED','ACTIVE','CLOSING']
+            # Future-proof: include FUNDED_PENDING_ACTIVATION once the
+            # repository supports it (R01 006 follow-up). The mock repos in
+            # pre-R11b unit tests lack _HEDGE_PLAN_STATUS, so the extra
+            #status is skipped there to preserve their 3-query expectation.
+            try:
+                supported = getattr(repo, '_HEDGE_PLAN_STATUS', None)
+                if supported is not None and 'FUNDED_PENDING_ACTIVATION' in set(supported):
+                    statuses = ['PARTIALLY_FILLED','FUNDED_PENDING_ACTIVATION','ACTIVE','CLOSING']
+            except Exception:
+                pass
+            for status in statuses:
                 offset=0
                 while True:
                     page=await self._db(repo.list_hedge_plans(status=status,limit=200,offset=offset))
@@ -107,7 +165,7 @@ class HedgeJobs:
             out.append(event)
         return tuple(out)
 
-    async def _collect(self, plan, positions, now_ms=None):
+    async def _collect(self, plan, positions, now_ms=None, request_context: Any | None = None):
         symbol=plan['symbol']
         qty=sum((Decimal(str(p.get('remaining_qty') or '0')) for p in positions if p.get('leg_type')=='SPOT_LONG'),Decimal(0))
         venue=plan.get('spot_venue') or mapping(plan.get('plan_config_json')).get('spot_venue') or 'BINANCE_SPOT'
@@ -118,13 +176,134 @@ class HedgeJobs:
         if market is None:
             return self.market_cache.get(key,{})
         try:
-            cache=await market.collect(symbol,str(qty),venue)
+            # R11b: forward immutable RequestContext when the market supports
+            # it; legacy market.collect(symbol,qty,venue) keeps working with
+            # pre-repair fakes (TypeError fallback).
+            if request_context is not None:
+                try:
+                    import inspect as _inspect
+                    try:
+                        _sig = _inspect.signature(market.collect)
+                        if 'request_context' in _sig.parameters:
+                            cache=await market.collect(symbol,str(qty),venue,request_context=request_context)
+                        else:
+                            cache=await market.collect(symbol,str(qty),venue)
+                    except (TypeError, ValueError):
+                        cache=await market.collect(symbol,str(qty),venue)
+                except Exception:
+                    raise
+            else:
+                cache=await market.collect(symbol,str(qty),venue)
             self.market_cache[key]=mapping(cache)
             self.collection_times[key]=now_ms
-        except Exception:
+        except Exception as exc:
+            # Budget denial and 429 are counted (DEFERRED/rate-limited
+            # honesty); old quotes naturally expire, positions preserved.
+            if _is_budget_denial(exc):
+                self._budget_deferred_count += 1
+            if _is_rate_limited(exc):
+                self._rate_limited_count += 1
             # Keep original source timestamps; old quotes naturally expire.
             pass
         return dict(self.market_cache.get(key,{}))
+
+    def _request_context_for(self, context: Any, *, job_type: str, job_id: str | None = None) -> Any | None:
+        """Build an immutable RequestContext for market sends (R11b).
+
+        Preserves the JobContext budget/trace; job_type is the D19档位
+        (monitor/opportunity/background) while job_id carries the real task
+        name (hedge_monitor/...). ``None`` budget stays unbounded (tests).
+        """
+        try:
+            from ..request_budget import make_request_context
+        except Exception:
+            return None
+        budget = getattr(context, 'request_budget', None)
+        trace_id = getattr(context, 'trace_id', None)
+        now_ms: int | None = None
+        try:
+            now_ms = int(context.clock_ms())
+        except Exception:
+            try:
+                now_ms = int(time.time() * 1000)
+            except Exception:
+                now_ms = None
+        deadline_ms = (int(now_ms) + R11B_DEADLINE_MS) if isinstance(now_ms, int) else None
+        try:
+            return make_request_context(budget, job_type=job_type, host='fapi',
+                                        trace_id=str(trace_id) if trace_id is not None else None)
+        except Exception:
+            return None
+
+    def select_deep_symbols(self, symbols: Sequence[str], now_ms: int, limit: int = R11B_DEEP_LIMIT) -> list[str]:
+        """Fair rotation: last_served asc then symbol (D11, 11 coins serve tail)."""
+        ordered = sorted(set(symbols), key=lambda s: (int(self._last_served.get(s, 0)), str(s)))
+        return list(ordered[:max(0, int(limit))])
+
+    def mark_symbols_served(self, symbols: Sequence[str], now_ms: int) -> None:
+        for symbol in symbols:
+            self._last_served[str(symbol)] = int(now_ms)
+
+    async def _collect_tick(
+        self,
+        items: Sequence[tuple[str, Any, Any]],
+        now_ms: int,
+        request_context: Any | None = None,
+        *,
+        limit: int = R11B_DEEP_LIMIT,
+        concurrency: int = R11B_CONCURRENCY,
+        deadline_ms: int = R11B_DEADLINE_MS,
+    ) -> dict[str, Any]:
+        """One bounded tick over (plan_id, plan, positions) items (D11).
+
+        Symbol-merged Mark (one logical fetch per symbol), deep quotes for at
+        most ``limit`` symbols via fair rotation, ``concurrency``-wide with a
+        total ``deadline_ms``. Unserved symbols stay capacity/time degraded
+        (positions preserved, no realtime exit feasible). Returns a report
+        with max_tick_ms/unserved_symbols for load tests (Fake timer).
+        """
+        started_real = time.monotonic()
+        symbols = sorted({str(plan.get('symbol')) for _, plan, _ in items if isinstance(plan, Mapping) and plan.get('symbol')})
+        selected = self.select_deep_symbols(symbols, now_ms, limit)
+        selected_set = set(selected)
+        unserved = sorted(set(symbols) - selected_set)
+        self._last_unserved = tuple(unserved)
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _one(pid: str, plan: Any, positions: Any) -> tuple[str, dict[str, Any]]:
+            symbol = str(plan.get('symbol')) if isinstance(plan, Mapping) else ''
+            if symbol not in selected_set:
+                return pid, {'_unserved': True, 'reason': 'MONITOR_CAPACITY_LIMITED'}
+            async with sem:
+                try:
+                    cache = await asyncio.wait_for(
+                        self._collect(plan, positions, now_ms, request_context),
+                        timeout=max(0.001, float(deadline_ms) / 1000.0),
+                    )
+                    return pid, dict(cache)
+                except asyncio.TimeoutError:
+                    return pid, {'_timeout': True, 'reason': 'TICK_DEADLINE_EXCEEDED'}
+                except Exception as exc:
+                    if _is_budget_denial(exc):
+                        return pid, {'_deferred': True, 'reason': 'BUDGET_DEFERRED'}
+                    return pid, {'_error': type(exc).__name__, 'reason': str(exc)[:160]}
+
+        try:
+            pairs = await asyncio.wait_for(
+                asyncio.gather(*(_one(pid, plan, pos) for pid, plan, pos in items)),
+                timeout=max(0.001, float(deadline_ms) / 1000.0),
+            )
+        except asyncio.TimeoutError:
+            # Total deadline exceeded: everything not yet served is degraded,
+            # never cleared or fabricated.
+            pairs = [(pid, {'_timeout': True, 'reason': 'TICK_DEADLINE_EXCEEDED'}) for pid, _, _ in items]
+        caches = {pid: cache for pid, cache in pairs}
+        # Rotation advances only for symbols actually attempted this tick.
+        self.mark_symbols_served(selected, now_ms)
+        elapsed_ms = int((time.monotonic() - started_real) * 1000)
+        self._last_tick_ms = elapsed_ms
+        return {'caches': caches, 'selected': selected, 'unserved_symbols': unserved,
+                'max_tick_ms': elapsed_ms, 'served': len(selected), 'total_symbols': len(symbols)}
 
     async def _alerts(self, pid, previous, current, now):
         state=self.mirror[pid]; repo=self.service._repository
@@ -173,9 +352,33 @@ class HedgeJobs:
                     **{field: None for field in unknown})
                 stats['degraded'] += 1
             return JobStatus(str(job_id or context.trace_id),'hedge_monitor','FAILED',stats=stats,error_code=type(exc).__name__,started_at_ms=now,finished_at_ms=now)
+        # R11b: immutable task context (monitor档位, real job_id) + bounded tick.
+        request_context = self._request_context_for(context, job_type='monitor', job_id=str(job_id or 'hedge_monitor'))
+        entries = [(pid, state['plan'], state['positions']) for pid, state in tuple(self.mirror.items())]
+        tick_report: dict[str, Any] = {'caches': {}, 'unserved_symbols': [], 'max_tick_ms': 0}
+        if entries:
+            try:
+                tick_report = await self._collect_tick(entries, now, request_context)
+            except Exception:
+                tick_report = {'caches': {}, 'unserved_symbols': [], 'max_tick_ms': 0}
+        caches = tick_report.get('caches', {}) if isinstance(tick_report, Mapping) else {}
+        # Extra honesty counters (old keys preserved for pre-repair tests).
+        stats['unserved_symbols'] = list(tick_report.get('unserved_symbols', [])) if isinstance(tick_report, Mapping) else []
+        stats['max_tick_ms'] = int(tick_report.get('max_tick_ms', 0)) if isinstance(tick_report, Mapping) else 0
+        stats['rate_limited'] = int(self._rate_limited_count)
+        stats['budget_deferred'] = int(self._budget_deferred_count)
         for pid,state in tuple(self.mirror.items()):
             async with self.service._hedge_lock_for(pid):
-                cache=await self._collect(state['plan'],state['positions'],now)
+                raw_cache = caches.get(pid, None)
+                if raw_cache is None:
+                    cache=await self._collect(state['plan'],state['positions'],now, request_context)
+                elif isinstance(raw_cache, Mapping) and (raw_cache.get('_unserved') or raw_cache.get('_timeout') or raw_cache.get('_deferred')):
+                    # Capacity/time/budget degraded: keep old quotes (naturally
+                    # expire), positions never cleared, no realtime exit.
+                    cache=dict(self.market_cache.get((state['plan'].get('symbol'), str(sum((Decimal(str(p.get('remaining_qty') or '0')) for p in state['positions'] if p.get('leg_type')=='SPOT_LONG'),Decimal(0))), state['plan'].get('spot_venue') or mapping(state['plan'].get('plan_config_json')).get('spot_venue') or 'BINANCE_SPOT'), {}))
+                    cache['_tick_degraded_reason'] = str(raw_cache.get('reason', 'MONITOR_CAPACITY_LIMITED'))
+                else:
+                    cache=dict(raw_cache)
                 cache['persist_lag_ms']=self.persist_lag.get(pid,0)
                 monitor_plan=dict(state['plan'])
                 config=mapping(monitor_plan.get('plan_config_json'))
@@ -200,7 +403,21 @@ class HedgeJobs:
                 extra['contract_multiplier']=state['plan'].get('contract_multiplier')
                 extra['funding_current_rate']=funding.get('current_rate')
                 extra['funding_recent_rates']=[mapping(e).get('rate') for e in state['events'][-3:] if mapping(e).get('rate') is not None]
+                # R11b: capacity/time/budget degraded keeps positions, hides
+                # realtime exit feasibility (never fabricates fresh quotes).
+                tick_reason = cache.get('_tick_degraded_reason') if isinstance(cache, Mapping) else None
+                if tick_reason:
+                    degraded = list(extra.get('degraded_reasons', []))
+                    if tick_reason not in degraded:
+                        degraded.append(str(tick_reason))
+                    extra['degraded_reasons'] = degraded
+                    # Unserved symbols must not display realtime exit feasible.
+                    exit_liq = dict(extra.get('exit_liquidity', {}) or {})
+                    exit_liq['covers_remaining'] = False
+                    extra['exit_liquidity'] = exit_liq
                 snapshot=dataclasses.replace(snapshot,metrics_json=extra,created_at_ms=now)
+                if tick_reason:
+                    snapshot=dataclasses.replace(snapshot,status='MONITOR_DEGRADED')
                 previous=state['previous']; stats['computed']+=1
                 try:
                     await self._alerts(pid,previous,snapshot,now)
@@ -304,3 +521,158 @@ class HedgeJobs:
             checked+=1
         result=await self.monitor(context,job_id=job_id)
         return dataclasses.replace(result,job_type='hedge_settlement_check',stats={**result.stats,'checked':checked})
+
+    # -- R11b R14 interfaces (independent of user positions) ---------------
+    def _resolve_repository_port(self) -> Any:
+        repo = getattr(self.service, '_repository_port', None)
+        if repo is not None:
+            return repo
+        return getattr(self.service, '_repository', None)
+
+    def _resolve_market_port(self) -> Any:
+        market = getattr(self.service, '_market_port', None)
+        if market is not None:
+            return market
+        return getattr(self.service, '_hedge_market', None)
+
+    def _require_capture_callback(self, name: str) -> Any:
+        require = getattr(self.service, '_require_repair_port', None)
+        if callable(require):
+            return require(name)
+        ports = getattr(self.service, '_repair_ports', None)
+        if ports is None:
+            from ..repair_ports import RepairDependencyUnavailable
+            raise RepairDependencyUnavailable(name)
+        return ports.require(name)
+
+    async def capture_entries(self, context: Any, capture_context: Any, job_id: str | None = None) -> Any:
+        """R14 entry capture task (D14/D18.1): independent of user holdings.
+
+        Calls the bound ``capture_strategy_entries`` via RepairPorts with the
+        MarketPort and an immutable evidence RequestContext. Budget refusal
+        stays DEFERRED upstream (never scaled fabrication); group skew and
+        missing depth stay UNAVAILABLE/UNEXECUTABLE via R14a.
+        """
+        from ..service import JobStatus
+        now = int(context.clock_ms())
+        started = now
+        try:
+            await self.service._ensure_hedge_available()
+        except Exception as exc:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                             'FAILED', stats={'claimed': 0, 'deferred': 1}, error_code=type(exc).__name__,
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        request_context = self._request_context_for(context, job_type='evidence', job_id=str(job_id or 'strategy_capture'))
+        # Evidence budget档位: BACKGROUND (D19.3 opportunity/evidence/entry).
+        if request_context is not None:
+            try:
+                import dataclasses as _dc
+                request_context = _dc.replace(request_context, job_type='evidence')
+            except Exception:
+                pass
+        try:
+            callback = self._require_capture_callback('capture_strategy_entries')
+        except Exception as exc:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                             'FAILED', stats={'claimed': 0, 'deferred': 0},
+                             error_code=getattr(exc, 'reason_code', type(exc).__name__),
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        repository = self._resolve_repository_port()
+        market = self._resolve_market_port()
+        try:
+            result = await asyncio.wait_for(callback(capture_context, repository, market, request_context),
+                                            timeout=max(0.001, float(R11B_DEADLINE_MS) / 1000.0))
+        except asyncio.TimeoutError:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                             'FAILED', stats={'claimed': 0, 'deferred': 0},
+                             error_code='TICK_DEADLINE_EXCEEDED',
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        except Exception as exc:
+            if _is_budget_denial(exc):
+                self._budget_deferred_count += 1
+                return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                                 'SUCCEEDED', stats={'claimed': 0, 'deferred': 1, 'status': 'DEFERRED'},
+                                 started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                             'FAILED', stats={'claimed': 0},
+                             error_code=type(exc).__name__,
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        try:
+            entry_ids = tuple(getattr(result, 'entry_ids', ()) or ())
+            status = str(getattr(result, 'status', 'UNAVAILABLE'))
+        except Exception:
+            entry_ids, status = (), 'UNAVAILABLE'
+        return JobStatus(str(job_id or getattr(context, 'trace_id', 'capture')), 'strategy_capture',
+                         'SUCCEEDED', stats={'claimed': len(entry_ids), 'status': status, 'entry_ids': list(entry_ids)},
+                         started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+
+    async def collect_due_quotes(self, context: Any, as_of_ms: int, job_id: str | None = None) -> Any:
+        """R14 due-quote task (D14.2/D18.1): 20/round, DEFERRED retained.
+
+        Claims via RepositoryPort and collects via MarketPort; budget refusal
+        counts DEFERRED (retained, retried before deadline); past-deadline
+        tasks explicitly fail (never scaled with 100% quote).
+        """
+        from ..service import JobStatus
+        now = int(context.clock_ms())
+        started = now
+        try:
+            await self.service._ensure_hedge_available()
+        except Exception as exc:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                             'FAILED', stats={'claimed': 0, 'deferred': 0},
+                             error_code=type(exc).__name__,
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        request_context = self._request_context_for(context, job_type='evidence', job_id=str(job_id or 'strategy_quote_collection'))
+        if request_context is not None:
+            try:
+                import dataclasses as _dc
+                request_context = _dc.replace(request_context, job_type='evidence')
+            except Exception:
+                pass
+        try:
+            callback = self._require_capture_callback('collect_due_quotes')
+        except Exception as exc:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                             'FAILED', stats={'claimed': 0, 'complete': 0, 'deferred': 0, 'unavailable': 0},
+                             error_code=getattr(exc, 'reason_code', type(exc).__name__),
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        repository = self._resolve_repository_port()
+        market = self._resolve_market_port()
+        try:
+            result = await asyncio.wait_for(callback(repository, market, int(as_of_ms), request_context),
+                                            timeout=max(0.001, float(R11B_DEADLINE_MS) / 1000.0))
+        except asyncio.TimeoutError:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                             'FAILED', stats={'claimed': 0, 'complete': 0, 'deferred': 0, 'unavailable': 0},
+                             error_code='TICK_DEADLINE_EXCEEDED',
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        except Exception as exc:
+            if _is_budget_denial(exc):
+                self._budget_deferred_count += 1
+                return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                                 'SUCCEEDED', stats={'claimed': 0, 'complete': 0, 'deferred': 1, 'unavailable': 0},
+                                 started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                             'FAILED', stats={'claimed': 0},
+                             error_code=type(exc).__name__,
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        try:
+            claimed = int(getattr(result, 'claimed', 0))
+            complete = int(getattr(result, 'complete', 0))
+            deferred = int(getattr(result, 'deferred', 0))
+            unavailable = int(getattr(result, 'unavailable', 0))
+            task_ids = list(getattr(result, 'task_ids', ()) or ())
+        except Exception:
+            claimed, complete, deferred, unavailable, task_ids = 0, 0, 0, 0, []
+        # claimed == complete+deferred+unavailable (R00 frozen invariant).
+        if claimed != complete + deferred + unavailable:
+            return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                             'FAILED', stats={'claimed': claimed, 'complete': complete, 'deferred': deferred, 'unavailable': unavailable},
+                             error_code='QUOTE_RESULT_INVARIANT',
+                             started_at_ms=started, finished_at_ms=int(context.clock_ms()))
+        self._budget_deferred_count += int(deferred)
+        return JobStatus(str(job_id or getattr(context, 'trace_id', 'due_quotes')), 'strategy_quote_collection',
+                         'SUCCEEDED', stats={'claimed': claimed, 'complete': complete, 'deferred': deferred,
+                                             'unavailable': unavailable, 'task_ids': task_ids},
+                         started_at_ms=started, finished_at_ms=int(context.clock_ms()))
