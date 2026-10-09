@@ -1,26 +1,39 @@
-"""Task 5: canonical asset identity resolver (design 4.1/4.2).
+"""Task 5 + R02a: canonical asset identity resolver (design 4.1/4.2, D04.1/D04.2).
 
 Security boundary: no fundamental/unlock/social datum may enter scoring
 until its futures symbol is bound to an explicit canonical asset. Symbol
 strings alone are never enough.
 
-Mapping priority (design 4.2):
+Mapping priority (design 4.2 / D04.1):
 
 1. MANUAL override in the versioned ``asset_overrides.yaml`` -> VERIFIED.
-2. Exact contract-address + chain match -> VERIFIED.
-3. Unique provider candidate with an exactly (prefix-normalized) matching
+2. Verified directory row (single MANUAL catalog candidate) -> VERIFIED.
+3. Exact contract-address + chain match -> VERIFIED.
+4. Unique provider candidate with an exactly (prefix-normalized) matching
    symbol -> HIGH. Only when there is a single candidate.
-4. ``1000``/``k``-style prefixed symbols that still yield several
+5. ``1000``/``k``-style prefixed symbols that still yield several
    candidates -> UNRESOLVED. Never guessed.
-5. Fuzzy/looks-like name matching is forbidden and is not implemented:
+6. Fuzzy/looks-like name matching is forbidden and is not implemented:
    names are never compared, only exact normalized symbols.
 
-Unit rule: ``contract_multiplier`` / ``multiplier_source`` come ONLY from
-explicit exchange unit metadata (``exchange_meta``) or from a manually
-verified YAML entry. A bare ``1000`` prefix or a close spot price never
-verifies a multiplier. Quote volumes and OI are already USD-notional and
-are NEVER scaled by the multiplier -- only prices go through
-:func:`canonical_price`.
+Unit rule (R02a/D04.1): ``contract_multiplier`` / ``multiplier_source``
+come ONLY from explicit exchange unit metadata (``exchange_meta`` with
+``multiplier_source`` in EXCHANGE/MANUAL) or from a manually verified
+YAML / verified-catalog entry (MANUAL). A bare ``1000`` prefix or a close
+spot price never verifies a multiplier. Trusted multipliers that disagree
+(override vs exchange, or across catalog candidates) resolve to
+UNRESOLVED with reason ``IDENTITY_UNIT_CONFLICT`` instead of silently
+picking one. Quote volumes and OI are already USD-notional and are NEVER
+scaled by the multiplier -- only prices go through :func:`canonical_price`.
+
+R02a contract: :func:`resolve_asset_context` is the primary entry
+``(symbol, exchange_meta, catalog_candidates, overrides) -> AssetIdentity``;
+:func:`resolve_identity` is a compatibility wrapper with the Task-5
+parameter names. ``mapping_confidence`` stays the single confidence field;
+Hedge callers adapt it to the existing ``identity_confidence`` vocabulary
+via :func:`hedge_identity_confidence` / :func:`as_hedge_identity` (both
+values are kept conflict-free). Multipliers are :class:`Decimal` (never
+float-derived amounts).
 """
 
 from __future__ import annotations
@@ -28,6 +41,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 from eth_hash.auto import keccak as _eth_keccak
@@ -44,6 +58,18 @@ UNIQUE_SYMBOL = "UNIQUE_SYMBOL"
 OTHER = "OTHER"
 
 EXCHANGE = "EXCHANGE"
+
+#: R02a/D04.1: recorded when trusted multipliers disagree (override vs
+#: exchange, or across catalog candidates). The identity resolves to
+#: UNRESOLVED with ``contract_multiplier=None`` instead of guessing.
+IDENTITY_UNIT_CONFLICT = "IDENTITY_UNIT_CONFLICT"
+
+#: Sources that can verify a multiplier. Anything else (including a bare
+#: number without provenance) is ignored so a ``1000`` prefix never sneaks in.
+_TRUSTED_MULTIPLIER_SOURCES = frozenset({EXCHANGE, MANUAL})
+
+#: Catalog layers that count as human-verified directory rows (D04.1).
+_VERIFIED_CATALOG_SOURCES = frozenset({"verified-assets", "override"})
 
 # Quote-asset suffixes stripped before symbol comparison. Order matters:
 # longer suffixes first so "USDT" wins over "USD".
@@ -222,7 +248,13 @@ def normalize_chain_address(chain_id: Any, address: Any) -> NormalizedAddress:
 
 @dataclass(frozen=True)
 class AssetIdentity:
-    """Design 4.1 identity record (snake_case; Task 14 maps to camelCase)."""
+    """Design 4.1 identity record (snake_case; Task 14 maps to camelCase).
+
+    R02a: ``contract_multiplier`` is :class:`Decimal` when verified (never a
+    float-derived amount); ``mapping_confidence`` stays the single
+    confidence field (Hedge adapts it to ``identity_confidence`` without
+    duplicating it on this record).
+    """
 
     canonical_id: str
     display_symbol: str
@@ -231,7 +263,7 @@ class AssetIdentity:
     # Set ONLY from a VERIFIED/HIGH binding. Never prefix-guessed, so the
     # spot client (Task 6) can never receive an unverified symbol.
     binance_spot_symbol: str | None
-    contract_multiplier: float | None
+    contract_multiplier: Decimal | None
     multiplier_source: str | None  # EXCHANGE | MANUAL | None
     coingecko_id: str | None
     unlock_provider_id: str | None
@@ -262,27 +294,110 @@ def _symbols_equal(a: str, b: str) -> bool:
     return normalize_base(a) == normalize_base(b)
 
 
-def _valid_multiplier(value: Any) -> float | None:
+def _valid_multiplier(value: Any) -> Decimal | None:
+    """Validate one multiplier value into :class:`Decimal` (R02a).
+
+    Accepts int/float/str/Decimal; rejects bool, non-finite, missing and
+    non-positive values. Float inputs go through ``str(value)`` so no binary
+    float artefact enters the amount path. Returns ``None`` when unverified
+    so callers never guess a ``1000`` prefix.
+    """
     if isinstance(value, bool):
         return None
     try:
-        f = float(value)
-    except (TypeError, ValueError):
+        if isinstance(value, Decimal):
+            d = value
+        elif isinstance(value, int):
+            d = Decimal(value)
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                return None
+            d = Decimal(str(value))
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            d = Decimal(text)
+        else:
+            return None
+    except (InvalidOperation, ValueError, ArithmeticError, TypeError):
         return None
-    if not math.isfinite(f) or f <= 0:
+    try:
+        if not d.is_finite() or d <= 0:
+            return None
+    except (InvalidOperation, TypeError):
         return None
-    return f
+    return d
+
+
+def _trusted_exchange_multiplier(
+    exchange_meta: Mapping[str, Any],
+) -> tuple[Decimal | None, str | None]:
+    """Trusted multiplier from explicit exchange metadata (R02a).
+
+    Requires ``multiplier_source`` in EXCHANGE/MANUAL; a bare number without
+    provenance is ignored.
+    """
+    m = _valid_multiplier(exchange_meta.get("contract_multiplier"))
+    if m is not None and exchange_meta.get("multiplier_source") in _TRUSTED_MULTIPLIER_SOURCES:
+        src = exchange_meta["multiplier_source"]
+        return m, src
+    return None, None
+
+
+def _candidate_trusted_multiplier(
+    candidate: Mapping[str, Any],
+) -> tuple[Decimal | None, str | None]:
+    """Trusted multiplier carried by one catalog candidate (R02a/D04.1).
+
+    Only EXCHANGE/MANUAL provenance counts; directory rows without an
+    explicit source never verify a multiplier.
+    """
+    m = _valid_multiplier(candidate.get("contract_multiplier"))
+    if m is not None and candidate.get("multiplier_source") in _TRUSTED_MULTIPLIER_SOURCES:
+        return m, candidate["multiplier_source"]
+    return None, None
+
+
+def _is_verified_candidate(candidate: Mapping[str, Any]) -> bool:
+    """True for human-verified directory rows (override / verified-assets).
+
+    Either ``mapping_source == MANUAL`` or ``catalog_source`` in the verified
+    set marks the row as verified. Plain network-directory rows are never
+    verified even when they carry a single exact symbol.
+    """
+    if candidate.get("mapping_source") == MANUAL:
+        return True
+    return candidate.get("catalog_source") in _VERIFIED_CATALOG_SOURCES
+
+
+def _lookup_override(
+    symbol: str, overrides: Mapping[str, Any] | None
+) -> Mapping[str, Any] | None:
+    """Find the manual entry for ``symbol`` (versioned doc or bare mapping).
+
+    Exact (case-normalized) key match only -- no prefix stripping, no fuzzy
+    matching.
+    """
+    table: Mapping[str, Any] = overrides or {}
+    if isinstance(table.get("overrides"), Mapping):
+        table = table["overrides"]  # type: ignore[assignment]
+    entry = table.get(symbol)
+    if entry is None and isinstance(symbol, str):
+        entry = table.get(symbol.upper())
+    return entry if isinstance(entry, Mapping) else None
 
 
 def _extract_multiplier(
     override: Mapping[str, Any] | None,
     exchange_meta: Mapping[str, Any],
-) -> tuple[float | None, str | None]:
+) -> tuple[Decimal | None, str | None]:
     """Manual override wins; otherwise explicit exchange unit metadata.
 
     ``exchange_meta`` must carry an explicit ``multiplier_source`` of
     EXCHANGE (or MANUAL for already-merged metadata); a bare number without
     provenance is ignored so a ``1000`` prefix can never sneak in.
+    Returns :class:`Decimal` (R02a), never a float-derived amount.
     """
     if override:
         m = _valid_multiplier(override.get("contract_multiplier"))
@@ -291,13 +406,100 @@ def _extract_multiplier(
             if src not in (EXCHANGE, MANUAL):
                 src = MANUAL  # YAML entries are human-verified by definition
             return m, src
-    m = _valid_multiplier(exchange_meta.get("contract_multiplier"))
-    if m is not None and exchange_meta.get("multiplier_source") in (
-        EXCHANGE,
-        MANUAL,
-    ):
-        return m, exchange_meta["multiplier_source"]
-    return None, None
+    return _trusted_exchange_multiplier(exchange_meta)
+
+
+def has_unit_conflict(
+    symbol: str,
+    exchange_meta: Mapping[str, Any] | None,
+    catalog_candidates: Sequence[Mapping[str, Any]] | None,
+    overrides: Mapping[str, Any] | None,
+) -> bool:
+    """True when trusted multipliers disagree (R02a/D04.1).
+
+    Compares the manual override entry, the explicit exchange metadata, and
+    every catalog candidate that carries EXCHANGE/MANUAL provenance. More
+    than one distinct :class:`Decimal` value means the unit is disputed and
+    the resolver must stay UNRESOLVED instead of silently picking one.
+    """
+    meta: Mapping[str, Any] = exchange_meta or {}
+    cands = list(catalog_candidates or [])
+    entry = _lookup_override(symbol, overrides)
+    values: set[Decimal] = set()
+    if isinstance(entry, Mapping):
+        m = _valid_multiplier(entry.get("contract_multiplier"))
+        if m is not None:
+            values.add(m)
+    em, _ = _trusted_exchange_multiplier(meta)
+    if em is not None:
+        values.add(em)
+    for cand in cands:
+        if not isinstance(cand, Mapping):
+            continue
+        cm, _ = _candidate_trusted_multiplier(cand)
+        if cm is not None:
+            values.add(cm)
+    return len(values) > 1
+
+
+def asset_context_reasons(
+    symbol: str,
+    exchange_meta: Mapping[str, Any] | None,
+    catalog_candidates: Sequence[Mapping[str, Any]] | None,
+    overrides: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """Machine reasons for the current unit binding (R02a).
+
+    Returns ``(IDENTITY_UNIT_CONFLICT,)`` when :func:`has_unit_conflict` is
+    true, else ``()``. Callers combine this with
+    :func:`identity_execution_hint` (which owns VETO/REVIEW/MULTIPLIER
+    semantics) instead of treating a conflict as a silent pick.
+    """
+    if has_unit_conflict(symbol, exchange_meta, catalog_candidates, overrides):
+        return (IDENTITY_UNIT_CONFLICT,)
+    return ()
+
+
+def hedge_identity_confidence(identity: Any) -> str:
+    """Adapt ``mapping_confidence`` to Hedge's ``identity_confidence`` (D04.1).
+
+    ``mapping_confidence`` stays the single stored field; this helper maps it
+    1:1 onto the pre-existing Hedge vocabulary (VERIFIED/HIGH/MEDIUM/LOW/
+    UNRESOLVED) for boundary payloads. Unknown inputs fall back to
+    UNRESOLVED, never to a guessed READY.
+    """
+    if isinstance(identity, Mapping):
+        value = identity.get("mapping_confidence", identity.get("identity_confidence"))
+    else:
+        value = getattr(identity, "mapping_confidence", getattr(identity, "identity_confidence", UNRESOLVED))
+    text = str(value) if value is not None else UNRESOLVED
+    if text in (VERIFIED, HIGH, MEDIUM, LOW, UNRESOLVED):
+        return text
+    return UNRESOLVED
+
+
+def as_hedge_identity(identity: AssetIdentity) -> dict[str, Any]:
+    """Boundary view keeping ``mapping_confidence``/``identity_confidence`` conflict-free.
+
+    Returns a plain mapping with both keys set to the same adapted value so
+    persistence layers that read either name cannot disagree (D04.1). The
+    multiplier stays :class:`Decimal` (or ``None`` when unverified).
+    """
+    confidence = hedge_identity_confidence(identity)
+    return {
+        "canonical_id": identity.canonical_id,
+        "binance_futures_symbol": identity.binance_futures_symbol,
+        "binance_spot_symbol": identity.binance_spot_symbol,
+        "contract_multiplier": identity.contract_multiplier,
+        "multiplier_source": identity.multiplier_source,
+        "coingecko_id": identity.coingecko_id,
+        "chain": identity.chain,
+        "contract_address": identity.contract_address,
+        "categories": list(identity.categories),
+        "mapping_confidence": confidence,
+        "identity_confidence": confidence,
+        "mapping_source": identity.mapping_source,
+    }
 
 
 def _norm_chain(value: Any) -> str | None:
@@ -339,7 +541,7 @@ def _contract_conflicts(
 
 def _unresolved(
     futures_symbol: str,
-    multiplier: float | None,
+    multiplier: Decimal | None,
     multiplier_source: str | None,
     source: str = OTHER,
 ) -> AssetIdentity:
@@ -362,40 +564,80 @@ def _unresolved(
     )
 
 
-def resolve_identity(
+def _verified_identity_from_candidate(
     futures_symbol: str,
+    candidate: Mapping[str, Any],
+    multiplier: Decimal | None,
+    multiplier_source: str | None,
+) -> AssetIdentity:
+    """Build a VERIFIED identity from one human-verified catalog row (R02a)."""
+    cand_chain = _norm_chain(candidate.get("chain"))
+    cand_address = _norm_address(cand_chain, candidate.get("contract_address"))
+    provider_symbol = candidate.get("provider_symbol", futures_symbol)
+    return AssetIdentity(
+        canonical_id=str(candidate.get("canonical_id") or candidate.get("coingecko_id") or provider_symbol.lower()),
+        display_symbol=str(candidate.get("display_symbol") or provider_symbol),
+        name=candidate.get("name"),
+        binance_futures_symbol=futures_symbol,
+        binance_spot_symbol=candidate.get("binance_spot_symbol")
+        if isinstance(candidate.get("binance_spot_symbol"), str)
+        else None,
+        contract_multiplier=multiplier,
+        multiplier_source=multiplier_source,
+        coingecko_id=candidate.get("coingecko_id"),
+        unlock_provider_id=candidate.get("unlock_provider_id"),
+        social_provider_id=candidate.get("social_provider_id"),
+        chain=cand_chain,
+        contract_address=cand_address,
+        categories=list(candidate.get("categories", [])),
+        mapping_confidence=VERIFIED,
+        mapping_source=MANUAL,
+    )
+
+
+def resolve_asset_context(
+    symbol: str,
     exchange_meta: Mapping[str, Any] | None,
-    provider_candidates: Sequence[Mapping[str, Any]] | None,
+    catalog_candidates: Sequence[Mapping[str, Any]] | None,
     overrides: Mapping[str, Any] | None,
 ) -> AssetIdentity:
-    """Bind a Binance futures symbol to its canonical asset.
+    """Resolve one futures symbol to its canonical asset (R02a/D04.1, D18.1).
 
-    Priority: MANUAL override > CONTRACT address+chain > UNIQUE_SYMBOL
-    (single exact-matching candidate). Multi-candidate and empty sets are
-    UNRESOLVED; names are never fuzzily compared.
+    Priority: manual ``overrides`` entry > verified catalog row (single
+    MANUAL candidate) > exact contract address+chain > unique exact-symbol
+    candidate > unresolved. ``catalog_candidates`` are opaque R00 candidate
+    mappings (never Catalog privates); only their documented keys
+    (``provider_symbol``/``coingecko_id``/``chain``/``contract_address``/
+    ``contract_multiplier``/``multiplier_source``/``catalog_source``/
+    ``mapping_source``/``categories``/...) are read.
+
+    Unit rule: only EXCHANGE/MANUAL provenance verifies
+    ``contract_multiplier`` (stored as :class:`Decimal`). Trusted values
+    that disagree resolve to UNRESOLVED with ``contract_multiplier=None``
+    (see :func:`has_unit_conflict` / ``IDENTITY_UNIT_CONFLICT``) instead of
+    silently picking one. A bare ``1000`` prefix never verifies a
+    multiplier. ``mapping_confidence`` stays the single confidence field.
     """
     meta: Mapping[str, Any] = exchange_meta or {}
-    candidates = list(provider_candidates or [])
-    table = overrides or {}
-
-    # Accept both the full versioned doc {"version":..,"overrides":{..}}
-    # and a bare {futures_symbol: entry} mapping.
-    if isinstance(table.get("overrides"), Mapping):
-        table = table["overrides"]
-    entry = table.get(futures_symbol)
-    if entry is None:
-        entry = table.get(futures_symbol.upper())
+    candidates = list(catalog_candidates or [])
+    entry = _lookup_override(symbol, overrides)
 
     if isinstance(entry, Mapping):
+        # Manual wins, but a disagreeing explicit exchange multiplier is a
+        # unit conflict (fail closed, never silently prefer one side).
+        entry_mult = _valid_multiplier(entry.get("contract_multiplier"))
+        exch_mult, _ = _trusted_exchange_multiplier(meta)
+        if entry_mult is not None and exch_mult is not None and entry_mult != exch_mult:
+            return _unresolved(symbol, None, None)
         multiplier, mult_src = _extract_multiplier(entry, meta)
         spot = entry.get("binance_spot_symbol")
         manual_chain = _norm_chain(entry.get("chain")) or _norm_chain(meta.get("chain"))
         manual_addr_raw = entry.get("contract_address") or meta.get("contract_address")
         return AssetIdentity(
-            canonical_id=str(entry.get("canonical_id", futures_symbol.lower())),
-            display_symbol=str(entry.get("display_symbol", futures_symbol)),
+            canonical_id=str(entry.get("canonical_id", symbol.lower())),
+            display_symbol=str(entry.get("display_symbol", symbol)),
             name=entry.get("name"),
-            binance_futures_symbol=futures_symbol,
+            binance_futures_symbol=symbol,
             binance_spot_symbol=str(spot) if isinstance(spot, str) else None,
             contract_multiplier=multiplier,
             multiplier_source=mult_src,
@@ -409,6 +651,9 @@ def resolve_identity(
             mapping_source=MANUAL,
         )
 
+    # No manual entry: trusted-unit conflict fails closed first.
+    if has_unit_conflict(symbol, meta, candidates, overrides):
+        return _unresolved(symbol, None, None)
     multiplier, mult_src = _extract_multiplier(None, meta)
 
     # Priority 2: exact contract address + chain.
@@ -417,26 +662,32 @@ def resolve_identity(
         matched = [
             c
             for c in candidates
-            if _contract_pair(c) == (meta_addr, meta_chain)
+            if isinstance(c, Mapping) and _contract_pair(c) == (meta_addr, meta_chain)
         ]
         if len(matched) == 1:
             c = matched[0]
+            # Merge verified candidate multiplier when present (no conflict:
+            # has_unit_conflict already excluded disagreement).
+            cand_mult, cand_src = _candidate_trusted_multiplier(c)
+            use_mult, use_src = (cand_mult, cand_src) if cand_mult is not None and multiplier is None else (multiplier, mult_src)
+            if cand_mult is not None and multiplier is not None:
+                use_mult, use_src = multiplier, mult_src
             return AssetIdentity(
                 canonical_id=str(
                     c.get("coingecko_id")
-                    or c.get("provider_symbol", futures_symbol).lower()
+                    or c.get("provider_symbol", symbol).lower()
                 ),
                 display_symbol=str(
                     c.get("display_symbol")
-                    or c.get("provider_symbol", futures_symbol)
+                    or c.get("provider_symbol", symbol)
                 ),
                 name=c.get("name"),
-                binance_futures_symbol=futures_symbol,
+                binance_futures_symbol=symbol,
                 binance_spot_symbol=c.get("binance_spot_symbol")
                 if isinstance(c.get("binance_spot_symbol"), str)
                 else None,
-                contract_multiplier=multiplier,
-                multiplier_source=mult_src,
+                contract_multiplier=use_mult,
+                multiplier_source=use_src,
                 coingecko_id=c.get("coingecko_id"),
                 unlock_provider_id=c.get("unlock_provider_id"),
                 social_provider_id=c.get("social_provider_id"),
@@ -447,30 +698,53 @@ def resolve_identity(
                 mapping_source=CONTRACT,
             )
         if len(matched) > 1:
-            return _unresolved(futures_symbol, multiplier, mult_src)
+            return _unresolved(symbol, multiplier, mult_src)
         # Zero matches: fall through to the unique-symbol rule, unless the
         # lone candidate actively contradicts the known contract pair.
 
+    # Priority 2b (R02a): single human-verified catalog row -> VERIFIED.
+    # Verified rows carry MANUAL provenance (override / verified-assets) and
+    # an explicit contract_multiplier/multiplier_source (D04.1). They outrank
+    # the generic unique-symbol HIGH binding.
+    if len(candidates) == 1:
+        sole = candidates[0] if isinstance(candidates[0], Mapping) else {}
+        if _is_verified_candidate(sole):
+            provider_symbol = sole.get("provider_symbol", "")
+            if isinstance(provider_symbol, str) and _symbols_equal(symbol, provider_symbol):
+                cand_mult, cand_src = _candidate_trusted_multiplier(sole)
+                # Verified multiplier enters the result (D04.1); exchange
+                # metadata fills in only when the row carries none (conflict
+                # already excluded above).
+                use_mult, use_src = (cand_mult, cand_src) if cand_mult is not None else (multiplier, mult_src)
+                return _verified_identity_from_candidate(symbol, sole, use_mult, use_src)
+
     # Priority 3: exactly one candidate, exact normalized symbol only.
     if len(candidates) == 1:
-        c = candidates[0]
+        c = candidates[0] if isinstance(candidates[0], Mapping) else {}
         cand_chain = _norm_chain(c.get("chain"))
         cand_address = _norm_address(cand_chain, c.get("contract_address"))
+        # Merge candidate trusted multiplier (R02a): verified MANUAL rows
+        # contribute their unit; exchange metadata otherwise. Disagreement
+        # already returned as conflict above.
+        cand_mult, cand_src = _candidate_trusted_multiplier(c)
+        merged_mult, merged_src = multiplier, mult_src
+        if cand_mult is not None and merged_mult is None:
+            merged_mult, merged_src = cand_mult, cand_src
         if c.get("requires_review"):
             return AssetIdentity(
                 canonical_id=str(
                     c.get("coingecko_id")
-                    or c.get("provider_symbol", futures_symbol).lower()
+                    or c.get("provider_symbol", symbol).lower()
                 ),
                 display_symbol=str(
                     c.get("display_symbol")
-                    or c.get("provider_symbol", futures_symbol)
+                    or c.get("provider_symbol", symbol)
                 ),
                 name=c.get("name"),
-                binance_futures_symbol=futures_symbol,
+                binance_futures_symbol=symbol,
                 binance_spot_symbol=None,
-                contract_multiplier=multiplier,
-                multiplier_source=mult_src,
+                contract_multiplier=merged_mult,
+                multiplier_source=merged_src,
                 coingecko_id=c.get("coingecko_id"),
                 unlock_provider_id=c.get("unlock_provider_id"),
                 social_provider_id=c.get("social_provider_id"),
@@ -482,17 +756,17 @@ def resolve_identity(
             )
         provider_symbol = c.get("provider_symbol", "")
         if isinstance(provider_symbol, str) and _symbols_equal(
-            futures_symbol, provider_symbol
+            symbol, provider_symbol
         ):
             if _contract_conflicts(meta, c):
                 return AssetIdentity(
-                    canonical_id=futures_symbol.lower(),
-                    display_symbol=futures_symbol,
+                    canonical_id=symbol.lower(),
+                    display_symbol=symbol,
                     name=None,
-                    binance_futures_symbol=futures_symbol,
+                    binance_futures_symbol=symbol,
                     binance_spot_symbol=None,
-                    contract_multiplier=multiplier,
-                    multiplier_source=mult_src,
+                    contract_multiplier=merged_mult,
+                    multiplier_source=merged_src,
                     coingecko_id=None,
                     unlock_provider_id=None,
                     social_provider_id=None,
@@ -512,12 +786,12 @@ def resolve_identity(
                     c.get("display_symbol") or provider_symbol
                 ),
                 name=c.get("name"),
-                binance_futures_symbol=futures_symbol,
+                binance_futures_symbol=symbol,
                 binance_spot_symbol=c.get("binance_spot_symbol")
                 if isinstance(c.get("binance_spot_symbol"), str)
                 else None,
-                contract_multiplier=multiplier,
-                multiplier_source=mult_src,
+                contract_multiplier=merged_mult,
+                multiplier_source=merged_src,
                 coingecko_id=c.get("coingecko_id"),
                 unlock_provider_id=c.get("unlock_provider_id"),
                 social_provider_id=c.get("social_provider_id"),
@@ -529,13 +803,13 @@ def resolve_identity(
             )
         # Unique candidate whose symbol does not match: weak evidence.
         return AssetIdentity(
-            canonical_id=futures_symbol.lower(),
-            display_symbol=futures_symbol,
+            canonical_id=symbol.lower(),
+            display_symbol=symbol,
             name=None,
-            binance_futures_symbol=futures_symbol,
+            binance_futures_symbol=symbol,
             binance_spot_symbol=None,
-            contract_multiplier=multiplier,
-            multiplier_source=mult_src,
+            contract_multiplier=merged_mult,
+            multiplier_source=merged_src,
             coingecko_id=None,
             unlock_provider_id=None,
             social_provider_id=None,
@@ -547,7 +821,26 @@ def resolve_identity(
         )
 
     # Priority 4: zero or several candidates (incl. 1000/k-prefix families).
-    return _unresolved(futures_symbol, multiplier, mult_src)
+    # Ambiguous families never guess a multiplier from candidates: only the
+    # explicit exchange metadata survives (D04.1).
+    return _unresolved(symbol, multiplier, mult_src)
+
+
+def resolve_identity(
+    futures_symbol: str,
+    exchange_meta: Mapping[str, Any] | None,
+    provider_candidates: Sequence[Mapping[str, Any]] | None,
+    overrides: Mapping[str, Any] | None,
+) -> AssetIdentity:
+    """Compatibility wrapper for the Task-5 entry point (R02a).
+
+    Delegates to :func:`resolve_asset_context` unchanged; retained so
+    existing callers and the F04 catalog suite keep working. New code should
+    call :func:`resolve_asset_context` directly.
+    """
+    return resolve_asset_context(
+        futures_symbol, exchange_meta, provider_candidates, overrides
+    )
 
 
 def identity_execution_hint(
@@ -579,7 +872,7 @@ def identity_execution_hint(
 
 
 def canonical_price(
-    futures_price: float | None, multiplier: float | None
+    futures_price: Any, multiplier: Any
 ) -> float | None:
     """Convert a leveraged-contract quote to a per-coin canonical price.
 
@@ -587,14 +880,95 @@ def canonical_price(
     non-finite multipliers yield None (caller treats dependent cross-source
     metrics as null + MULTIPLIER_UNVERIFIED). Volumes and OI must never be
     passed through here.
+
+    R02a: the division itself runs in :class:`Decimal` (``Decimal(str(..))``
+    for float inputs, so no binary float artefact enters the amount path);
+    the return stays ``float`` for Task-5 compatibility. Use
+    :func:`canonical_price_decimal` when a Decimal amount is required.
     """
     if futures_price is None or multiplier is None:
         return None
     try:
-        p = float(futures_price)
-        m = float(multiplier)
-    except (TypeError, ValueError):
+        if isinstance(futures_price, bool) or isinstance(multiplier, bool):
+            return None
+        # Parse via Decimal(str(..)) for floats, exact for Decimal/int/str.
+        def _to_dec(value: Any) -> Decimal | None:
+            if isinstance(value, Decimal):
+                return value
+            if isinstance(value, int):
+                return Decimal(value)
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    return None
+                return Decimal(str(value))
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                try:
+                    return Decimal(text)
+                except (InvalidOperation, ValueError):
+                    return None
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+                return None
+
+        p = _to_dec(futures_price)
+        m = _to_dec(multiplier)
+        if p is None or m is None:
+            return None
+        if not p.is_finite() or not m.is_finite() or m <= 0:
+            return None
+        result = p / m
+        if not result.is_finite():
+            return None
+        return float(result)
+    except (TypeError, ValueError, InvalidOperation, ArithmeticError):
         return None
-    if not math.isfinite(p) or not math.isfinite(m) or m <= 0:
+
+
+def canonical_price_decimal(futures_price: Any, multiplier: Any) -> Decimal | None:
+    """Decimal variant of :func:`canonical_price` (R02a amount path).
+
+    Returns :class:`Decimal` (or ``None`` when unknown) so Hedge/economics
+    callers never route amounts through binary float.
+    """
+    if futures_price is None or multiplier is None:
         return None
-    return p / m
+    if isinstance(futures_price, bool) or isinstance(multiplier, bool):
+        return None
+
+    def _to_dec(value: Any) -> Decimal | None:
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, int):
+            return Decimal(value)
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return None
+            return Decimal(str(value))
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return Decimal(text)
+            except (InvalidOperation, ValueError):
+                return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+            return None
+
+    try:
+        p = _to_dec(futures_price)
+        m = _to_dec(multiplier)
+        if p is None or m is None:
+            return None
+        if not p.is_finite() or not m.is_finite() or m <= 0:
+            return None
+        result = p / m
+        return result if result.is_finite() else None
+    except (TypeError, ValueError, InvalidOperation, ArithmeticError):
+        return None

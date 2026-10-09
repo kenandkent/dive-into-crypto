@@ -41,7 +41,13 @@ _ENTRY_KEYS = {
     "chain",
     "contract_address",
     "categories",
+    # R02a/D04.2: optional human-verified scoring profile (no LITE/FULL suffix;
+    # the tier suffix is decided by analysis_tier, not stored here).
+    "profile",
 }
+
+#: R02a/D04.2: allowed manual profile values (tier-independent base only).
+ALLOWED_PROFILES = frozenset({"MEME", "GENERAL", "LOW_FLOAT_VC"})
 
 
 def load_overrides(path: str | pathlib.Path | None = None) -> dict:
@@ -81,16 +87,36 @@ def load_overrides(path: str | pathlib.Path | None = None) -> dict:
     return {"version": version, "overrides": dict(table)}
 
 
+def normalize_profile(value: Any) -> str | None:
+    """Normalize one profile value to its tier-independent base (R02a/D04.2).
+
+    Accepts only ``MEME``/``GENERAL``/``LOW_FLOAT_VC`` (case-insensitive,
+    surrounding whitespace ignored); ``LITE``/``FULL`` suffixed forms and any
+    other string return ``None`` (caller rejects them as schema violations).
+    ``GENERAL_ALT`` is accepted as an alias of ``GENERAL`` for scorer
+    compatibility but normalizes to ``GENERAL``.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip().upper()
+    if text == "GENERAL_ALT":
+        return "GENERAL"
+    if text in ALLOWED_PROFILES:
+        return text
+    return None
+
+
 def validate_override_entry(symbol: Any, entry: Any) -> None:
     """Validate one manual mapping entry against the frozen schema.
 
-    Covers keys, types and multiplier provenance only. Chain/address
-    *structure* is checked separately by :func:`validate_override_address`:
-    the Task-5 built-in table is frozen ground truth (e.g. it carries a
-    41-hex SHIB address that F04 may neither silently rewrite nor guess a
-    replacement for), so structural rejection applies to NEW human input
-    (overlay documents) while the resolver still case-safely normalizes
-    every address at comparison time.
+    Covers keys, types, multiplier provenance and the optional R02a
+    ``profile`` (``MEME``/``GENERAL``/``LOW_FLOAT_VC`` only, no LITE/FULL
+    suffix). Chain/address *structure* is checked separately by
+    :func:`validate_override_address`: the Task-5 built-in table is frozen
+    ground truth (e.g. it carries a 41-hex SHIB address that F04 may neither
+    silently rewrite nor guess a replacement for), so structural rejection
+    applies to NEW human input (overlay documents) while the resolver still
+    case-safely normalizes every address at comparison time.
     """
     if not isinstance(symbol, str) or not symbol.strip():
         raise ValueError(f"override key must be a non-empty symbol: {symbol!r}")
@@ -118,6 +144,12 @@ def validate_override_entry(symbol: Any, entry: Any) -> None:
     cats = entry.get("categories", [])
     if not isinstance(cats, list) or any(not isinstance(c, str) for c in cats):
         raise ValueError(f"override for {symbol!r}: categories must be a list[str]")
+    if "profile" in entry:
+        if normalize_profile(entry.get("profile")) is None:
+            raise ValueError(
+                f"override for {symbol!r}: profile must be one of "
+                f"{sorted(ALLOWED_PROFILES)} (no LITE/FULL suffix)"
+            )
 
 
 def validate_override_address(symbol: Any, entry: Any) -> None:
@@ -172,6 +204,131 @@ def get_override(
     if entry is None:
         entry = table.get(futures_symbol.upper())
     return dict(entry) if isinstance(entry, Mapping) else None
+
+
+def _categories_of(*sources: Any) -> list[str]:
+    """Collect category strings from identity/fundamentals mappings or objects."""
+    out: list[str] = []
+    for source in sources:
+        if source is None:
+            continue
+        cats: Any = None
+        if isinstance(source, Mapping):
+            cats = source.get("categories")
+        else:
+            cats = getattr(source, "categories", None)
+        if not cats:
+            continue
+        try:
+            items = list(cats)
+        except TypeError:
+            continue
+        for item in items:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+    return out
+
+
+def _is_meme_category(categories: list[str]) -> bool:
+    """True when any category marks a Meme asset (case-insensitive)."""
+    for item in categories:
+        lowered = item.strip().lower()
+        if lowered == "meme" or "meme" in lowered:
+            return True
+    return False
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    import math as _math
+
+    if not _math.isfinite(result):
+        return None
+    return result
+
+
+def _low_float_hit(fundamentals: Any) -> bool:
+    """True for the verified low-float condition (float<0.35, FDV/MC>=2)."""
+    if fundamentals is None:
+        return False
+    if isinstance(fundamentals, Mapping):
+        mc = _as_float(fundamentals.get("market_cap_usd"))
+        fdv = _as_float(fundamentals.get("fdv_usd"))
+        circ = _as_float(fundamentals.get("circulating_supply"))
+        total = _as_float(fundamentals.get("total_supply"))
+    else:
+        mc = _as_float(getattr(fundamentals, "market_cap_usd", None))
+        fdv = _as_float(getattr(fundamentals, "fdv_usd", None))
+        circ = _as_float(getattr(fundamentals, "circulating_supply", None))
+        total = _as_float(getattr(fundamentals, "total_supply", None))
+    float_ratio = circ / total if circ is not None and total not in (None, 0) and total > 0 else None
+    fdv_mc = fdv / mc if fdv is not None and mc is not None and mc > 0 else None
+    return (
+        float_ratio is not None
+        and fdv_mc is not None
+        and float_ratio < 0.35
+        and fdv_mc >= 2
+    )
+
+
+def get_manual_profile(override_entry: Mapping[str, Any] | None) -> str | None:
+    """Manual profile from one override entry, or ``None`` (R02a/D04.2).
+
+    Only the tier-independent ``MEME``/``GENERAL``/``LOW_FLOAT_VC`` values
+    count; anything else (including LITE/FULL suffixes) is not a manual
+    override.
+    """
+    if not isinstance(override_entry, Mapping):
+        return None
+    return normalize_profile(override_entry.get("profile"))
+
+
+def effective_profile(
+    override_entry: Mapping[str, Any] | None = None,
+    identity: Any = None,
+    fundamentals: Any = None,
+) -> tuple[str, str, bool]:
+    """Resolve the tier-independent profile (R02a/D04.2).
+
+    Priority: manual ``profile`` in the override entry > verified Meme
+    category on the identity (or fundamentals) > verified low-float
+    condition > ``GENERAL``. A known Meme never degrades to ``GENERAL``
+    merely because fundamentals/MC/ATH are temporarily missing -- missing
+    data only changes DQ, never the class. Returns
+    ``(profile, reason, is_manual)`` with ``profile`` in
+    ``MEME``/``GENERAL``/``LOW_FLOAT_VC`` and ``reason`` in
+    ``MANUAL_OVERRIDE``/``MEME_CATEGORY``/``LOW_FLOAT_CONDITION``/
+    ``DEFAULT_GENERAL*``.
+    """
+    manual = get_manual_profile(override_entry)
+    if manual is not None:
+        return manual, "MANUAL_OVERRIDE", True
+    categories = _categories_of(identity, fundamentals)
+    # Verified Meme persists even when fundamentals are missing/failed.
+    if _is_meme_category(categories):
+        # Require the Meme mark to come from the identity side when
+        # fundamentals are absent, so a transient fundamentals failure
+        # cannot flip a verified Meme to GENERAL.
+        identity_cats = _categories_of(identity)
+        fund_cats = _categories_of(fundamentals)
+        if _is_meme_category(identity_cats) or (
+            fundamentals is not None and _is_meme_category(fund_cats)
+        ):
+            return "MEME", "MEME_CATEGORY", False
+        # Fallthrough safety: any meme string still counts as Meme.
+        return "MEME", "MEME_CATEGORY", False
+    if _low_float_hit(fundamentals):
+        return "LOW_FLOAT_VC", "LOW_FLOAT_CONDITION", False
+    if fundamentals is None:
+        return "GENERAL", "DEFAULT_GENERAL_NO_FUNDAMENTALS", False
+    if not categories:
+        return "GENERAL", "DEFAULT_GENERAL_UNVERIFIED", False
+    return "GENERAL", "DEFAULT_GENERAL", False
 
 
 def _load_overlay_document(path: str | pathlib.Path) -> dict:

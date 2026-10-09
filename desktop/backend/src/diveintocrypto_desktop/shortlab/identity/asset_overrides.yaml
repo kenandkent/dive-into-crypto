@@ -11,7 +11,11 @@
 # - Quote volumes and OI are USD-notional and must NEVER be scaled by this
 #   multiplier; only prices go through canonical_price = futures_price /
 #   multiplier.
-version: 1
+# - R02a/D04.2: optional tier-independent `profile` (MEME/GENERAL/LOW_FLOAT_VC
+#   only, no LITE/FULL suffix; the tier suffix is decided by analysis_tier).
+#   Manual profile outranks verified categories; a known Meme never degrades
+#   to GENERAL merely because MC/ATH are temporarily missing.
+version: 2
 overrides:
   "1000PEPEUSDT":
     canonical_id: "pepe"
@@ -24,6 +28,7 @@ overrides:
     chain: "ethereum"
     contract_address: "0x6982508145454ce325ddbe47a25d4ec3d2311933"
     categories: ["meme"]
+    profile: "MEME"
   "1000SHIBUSDT":
     canonical_id: "shiba-inu"
     display_symbol: "SHIB"
@@ -35,3 +40,4 @@ overrides:
     chain: "ethereum"
     contract_address: "0x95ad61b0a150d79219dcf64e1e6ccfad2e6e7f3af"
     categories: ["meme"]
+    profile: "MEME"
