@@ -11,7 +11,12 @@ from typing import Any, Mapping, Sequence
 
 from diveintocrypto_desktop.shortlab.hedge.models import DQResult, FCSResult
 
-__all__ = ["compute_hedge_quality", "rank_opportunities"]
+__all__ = [
+    "compute_hedge_quality",
+    "rank_opportunities",
+    "build_projection_v2",
+    "build_risk_json",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +384,73 @@ def rank_opportunities(
         i = j
     ordered.extend(sorted(nulls, key=lambda d: (d[2], d[3])))
     return tuple(d[4] for d in ordered)
+
+
+# ---------------------------------------------------------------------------
+# R09 risk_json.projection_v2 output (D08, pure, delegates to projection.py).
+# ---------------------------------------------------------------------------
+
+_REQUIRED_PROJECTION_KEYS = frozenset(
+    {
+        "snapshot_id",
+        "symbol",
+        "canonical_id",
+        "as_of_ms",
+        "expires_at_ms",
+        "stale",
+        "fcs",
+        "fcs_config_hash",
+        "funding_7d",
+        "funding_30d",
+        "positive_ratio_30d",
+        "history_class",
+        "best_venue",
+        "break_even_days",
+        "conservative_apr",
+        "readiness_breakdown",
+        "reasons",
+    }
+)
+
+
+def build_projection_v2(snapshot: Mapping[str, Any], as_of_ms: int) -> dict[str, Any]:
+    """Build the typed ``projection_v2`` mapping for one capture snapshot.
+
+    Pure delegate of :func:`hedge.projection.project_opportunity` (the
+    frozen ``project_opportunity`` producer). The result carries the D08
+    snake_case keys consumed by ``save_funding_capture_snapshot`` callers
+    and read back by ``list_current_funding_opportunities``; ``as_of_ms``
+    is the query time for the dynamic stale check only.
+    """
+    from diveintocrypto_desktop.shortlab.hedge.projection import (  # noqa: WPS433
+        project_opportunity as _project,
+    )
+
+    if not isinstance(snapshot, Mapping):
+        raise TypeError(f"snapshot must be a mapping, got {type(snapshot).__name__}")
+    projected = dict(_project(dict(snapshot), int(as_of_ms)))
+    missing = sorted(_REQUIRED_PROJECTION_KEYS - set(projected))
+    if missing:
+        raise ValueError(f"projection_v2 misses required keys: {missing}")
+    return projected
+
+
+def build_risk_json(
+    snapshot: Mapping[str, Any],
+    as_of_ms: int,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the ``risk_json`` envelope holding ``projection_v2``.
+
+    Pure: ``{"projection_v2": build_projection_v2(...)}`` plus any caller
+    ``extra`` keys (e.g. ``identity``). ``projection_v2`` always wins on
+    key conflict so the frozen typed projection cannot be shadowed.
+    """
+    projection = build_projection_v2(snapshot, as_of_ms)
+    merged: dict[str, Any] = {}
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            raise TypeError(f"extra must be a mapping or None, got {type(extra).__name__}")
+        merged.update(dict(extra))
+    merged["projection_v2"] = projection
+    return merged
