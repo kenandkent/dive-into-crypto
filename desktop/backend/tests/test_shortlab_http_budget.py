@@ -431,7 +431,8 @@ class TestSingleRetryLayer:
 
 class TestWeights:
     def test_weights_versioned_and_limit_aware(self):
-        assert ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v1"
+        # R11a: weights v2 per D19.3 (was endpoint-weights-v1).
+        assert ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v2"
         w_small = endpoint_weight("klines", {"limit": 10})
         w_mid = endpoint_weight("klines", {"limit": 500})
         w_big = endpoint_weight("klines", {"limit": 1000})

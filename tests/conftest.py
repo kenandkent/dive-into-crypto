@@ -341,14 +341,14 @@ def generate_mock_agg_trades(symbol: str, limit: int = 1000) -> list:
         })
     return out
 
-async def mock_list_universe(limit: int | None = None) -> list[dict]:
+async def mock_list_universe(limit: int | None = None, request_context=None) -> list[dict]:
     return [
         {"s": "BTCUSDT", "name": "BTC", "price": 95000.0, "ch": 1.2, "quote_volume": 100000000.0},
         {"s": "ETHUSDT", "name": "ETH", "price": 3000.0, "ch": -0.8, "quote_volume": 50000000.0},
         {"s": "SOLUSDT", "name": "SOL", "price": 150.0, "ch": 5.4, "quote_volume": 20000000.0},
     ][:limit]
 
-async def mock_ticker_24hr(symbol: str) -> dict:
+async def mock_ticker_24hr(symbol: str, request_context=None) -> dict:
     return {"price": 95000.0, "ch": 1.2}
 
 @pytest.fixture(scope="session", autouse=True)
@@ -358,39 +358,39 @@ def mock_data_layer():
         if not ("BTC" in s or "ETH" in s or "SOL" in s or "KEYSTORE" in s):
             raise ValueError(f"Invalid symbol: {symbol}")
 
-    async def mock_fetch_klines(symbol, interval, limit=300, end_ms=None):
+    async def mock_fetch_klines(symbol, interval, limit=300, end_ms=None, request_context=None):
         check_symbol(symbol)
         return generate_mock_candles(symbol, interval, limit)
-    async def mock_fetch_oi_hist(symbol, period="5m", limit=48):
+    async def mock_fetch_oi_hist(symbol, period="5m", limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_oi_hist(symbol, period, limit)
-    async def mock_global_account_ls(symbol, period="5m", limit=48):
+    async def mock_global_account_ls(symbol, period="5m", limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_ratios(symbol, period, limit)["glob"]
-    async def mock_top_account_ls(symbol, period="5m", limit=48):
+    async def mock_top_account_ls(symbol, period="5m", limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_ratios(symbol, period, limit)["acc"]
-    async def mock_top_position_ls(symbol, period="5m", limit=48):
+    async def mock_top_position_ls(symbol, period="5m", limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_ratios(symbol, period, limit)["pos"]
-    async def mock_taker_ls(symbol, period="5m", limit=48):
+    async def mock_taker_ls(symbol, period="5m", limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_ratios(symbol, period, limit)["taker"]
-    async def mock_position_ls_timeseries(symbol, period, limit=60):
+    async def mock_position_ls_timeseries(symbol, period, limit=60, request_context=None):
         check_symbol(symbol)
         return generate_mock_position_ls_timeseries(symbol, period, limit)
-    async def mock_premium_index(symbol):
+    async def mock_premium_index(symbol, request_context=None):
         check_symbol(symbol)
         return {"mark_price": 95000.0, "index_price": 94900.0, "last_funding_rate": 0.0001, "next_funding_time": 0}
-    async def mock_funding_hist(symbol, limit=48):
+    async def mock_funding_hist(symbol, limit=48, request_context=None):
         check_symbol(symbol)
         return generate_mock_funding_hist(symbol, limit)
 
-    async def mock_fetch_agg_trades(symbol, limit=1000):
+    async def mock_fetch_agg_trades(symbol, limit=1000, request_context=None):
         check_symbol(symbol)
         return generate_mock_agg_trades(symbol, limit)
 
-    async def mock_premium_index_all():
+    async def mock_premium_index_all(request_context=None):
         # one batch premiumIndex payload for every mocked symbol
         rows = {}
         for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "KEYSTOREUSDT"):
@@ -400,19 +400,19 @@ def mock_data_layer():
                 continue
         return rows
 
-    async def mock_premium_index_klines(symbol, interval="5m", limit=200):
+    async def mock_premium_index_klines(symbol, interval="5m", limit=200, request_context=None):
         # drifting premium-percent series (−0.02% → +0.02%) for the z-score
         n = 100
         return [{"t": 1_700_000_000_000 + i * 300_000, "premium_pct": -0.02 + 0.04 * i / n}
                 for i in range(n)]
 
-    async def mock_delivery_symbols():
+    async def mock_delivery_symbols(request_context=None):
         return {}  # no quarterly contracts in the mock exchange
 
-    async def mock_orderbook_snapshot(symbol):
+    async def mock_orderbook_snapshot(symbol, request_context=None):
         return {"unavailable": "book_too_thin"}
 
-    async def mock_spot_snapshot(symbol, perp_price, perp_closes):
+    async def mock_spot_snapshot(symbol, perp_price, perp_closes, request_context=None):
         return {"unavailable": "no_spot_market"}
 
     kl.fetch_klines = mock_fetch_klines

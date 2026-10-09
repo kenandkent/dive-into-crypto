@@ -821,16 +821,18 @@ async def test_runtime_tables_and_indexes_match_design(repo):
 # ---------------------------------------------------------------------------
 
 
-def test_h01_schema_constants_point_at_version_5():
+def test_h01_schema_constants_point_at_version_6():
     from diveintocrypto_desktop.shortlab import repository as repo_mod
 
-    assert repo_mod.SCHEMA_VERSION == 5
+    # R01: unified target 6 (was H01 5-split).
+    assert repo_mod.SCHEMA_VERSION == 6
     assert repo_mod.MIGRATIONS == (
         (1, "001_init.sql"),
         (2, "002_unlock_social.sql"),
         (3, "003_catalyst.sql"),
         (4, "004_core_completion.sql"),
         (5, "005_hedge_advisor.sql"),
+        (6, "006_optimization_repair.sql"),
     )
     assert repo_mod.QUEUE_CAPACITY == 256
     assert repo_mod.QUEUE_AGING_SEC == 30.0
@@ -843,11 +845,12 @@ def test_h01_schema_constants_point_at_version_5():
     ) == (0, 1, 2, 3, 4)
 
 
-def test_f01_schema_target_defaults_to_base_4():
+def test_f01_schema_target_unified_to_6():
     from diveintocrypto_desktop.shortlab.config import load_shortlab_config
     from diveintocrypto_desktop.shortlab.repository import schema_target_for_config
 
-    assert schema_target_for_config(load_shortlab_config()) == 4
+    # R01: unified target 6 (was base-4 default).
+    assert schema_target_for_config(load_shortlab_config()) == 6
 
 
 def test_f01_22_contract_methods_are_async_and_exported():

@@ -55,11 +55,16 @@ def test_smoke_database_requires_schema_version_and_all_hedge_tables():
             smoke.validate_product_db(db)
         for table in smoke.REQUIRED_HEDGE_TABLES:
             db.execute(f'CREATE TABLE IF NOT EXISTS {table} (id INTEGER)')
+        for table in smoke.REQUIRED_REPAIR_TABLES:
+            db.execute(f'CREATE TABLE IF NOT EXISTS {table} (id INTEGER)')
         db.execute('CREATE TABLE sl_schema_version (version INTEGER)')
         db.execute('INSERT INTO sl_schema_version VALUES (4)')
         with pytest.raises(RuntimeError,match='version'):
             smoke.validate_product_db(db)
         db.execute('INSERT INTO sl_schema_version VALUES (5)')
+        with pytest.raises(RuntimeError,match='version'):
+            smoke.validate_product_db(db)
+        db.execute('INSERT INTO sl_schema_version VALUES (6)')
         smoke.validate_product_db(db)
 
 
