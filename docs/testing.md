@@ -68,6 +68,8 @@ scoring, status, entry, runtime, API, evidence, FULL) plus, for naming/packaging
 | `test_shortlab_packaging.py` | distribution `short-lab-desktop` with both `short-lab` and `dive-desktop` scripts on one entry; UI package `short-lab-desktop-ui`; `/api/health` keeps `service` and gains `product: "short-lab"`; `short-lab.spec` EXE/COLLECT names, DuckDB + `default.yaml` + UI dist, fixed build command, no stale product paths; frozen read-only boots share one writable `shortlab.duckdb` home |
 | `test_shortlab_release_workflow.py` | `v*` = Android-only, `short-lab-v*` = Desktop-only, ticked manual dispatch = Desktop artifact only; tag Desktop builds publish `short-lab-windows-x64.zip` to the Release |
 | `test_shortlab_retention.py` | F09 base gate only (schema 4, no Hedge/005): `resources.read_resource_text` reads engine/default/identity/001–004 without a source checkout; spec lists exactly those resources with no 005 placeholder; read-only install + empty data dir boots twice consistently; `maintenance.maintain` (import `diveintocrypto_desktop.shortlab.maintenance`) only calls `maintain_retention` with 180-day TTL and limit ≤ 1000; tag mutual exclusion and argparse default `46408` (AST, not comments) |
+| `tests/test_shortlab_repair_packaging.py` (R16, 根) | spec 全集 001–006/default/identity/DuckDB/UI；smoke 含 006 七表 + schema 6 + 二次启动同一 DB/只读树不变；UI dist 路由资源；CLI argparse 冻结；006 七表八索引 |
+| `tests/static_analysis/test_shortlab_repair_release.py` (R16) | tag 互斥矩阵；frozen smoke 在 zip/发布前失败阻断；P06 证据 `if-no-files-found: error`；Node `>=22 <23` + `@playwright/test 1.56.0` + `test:repair-e2e` + release `setup-node: 22`；生产构建无 test 别名；中文边界 BLOCKED 禁宣传 |
 
 Release acceptance (design §35–36, plan H11) runs, offline where possible:
 
@@ -82,11 +84,17 @@ uv run --project desktop/backend pytest tests/ -q
 cd desktop/ui && node --test test/shortlab.test.mjs test/shortlab-refresh.test.mjs test/hedge.test.mjs test/v3.test.mjs
 npm test && npm run build
 
-# 成品smoke (只读安装目录 + 空用户数据, 真实进程health, 迁移到5,
-# engine资源, plan登记, 重启恢复; fixture stub, 非demo模式)
+# 成品smoke (只读安装目录 + 空用户数据, 真实进程health, 迁移到6,
+# engine资源 + 006七表, plan登记, 二次启动同一DB/只读树不变; fixture stub, 非demo模式)
+# CLI 参数以 argparse 为准 (--executable/--output-dir/--fixture)，交付 manifest.command 只记真实选项。
 desktop/backend/.venv/bin/python scripts/smoke_shortlab_packaged.py \
+  --executable <frozen-exe> --fixture \
   --output-dir desktop/backend/runtime/verification/<build-id>
 ```
+
+### R16 默认能力、启用与边界（中文）
+
+默认能力：Short-Lab 默认 `LITE`、默认 `hedge.enabled: false`，Funding/Hedge 开关默认关闭；grader/metrics 无默认自动作业，未接线证据端 503。启用靠 `SHORTLAB_CONFIG_PATH` + 环境变量 Key。研究评分为 `RULE_BASED_UNVALIDATED`；正费率检查默认开启，双负不得 READY；数量与强平按原生交易单位（含 1000 倍合约、tick/Dust），缺保护能力 UNKNOWN；执行靠手工录入 fill，支持部分退出；数据过期投射为 `CANDIDATE`/`NOT_READY`，`NO_HEDGE` 不能保存配对计划，证据不足为 `PENDING`/`CENSORED`/`UNAVAILABLE`。任何 BLOCKED 功能不得宣传为已实现；`deselected`/`live` 分别报告，缺网/缺 Key 记为 UNVERIFIED/UNCONFIGURED，不计入通过。工具链：Node `>=22 <23`，`@playwright/test 1.56.0` 为 dev 依赖（`test:repair-e2e`），不打进生产包。
 
 Record the command, exit code and commit for every row of the §35 matrix; a row without
 evidence is not marked done. `desktop/backend/runtime/verification/<build-id>/`

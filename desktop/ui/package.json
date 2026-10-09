@@ -5,13 +5,15 @@
   "description": "Dive Into Crypto — Desktop UI (terminal-themed scanner front-end)",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=22 <23"
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "test:repair-e2e": "playwright test --config playwright.repair.config.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.56.0",
     "esbuild": "^0.24.2",
     "react": "18.3.1",
     "react-dom": "18.3.1"

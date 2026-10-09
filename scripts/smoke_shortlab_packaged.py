@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""AC22 smoke of a REAL frozen ONEDIR executable, never Python source.
+"""AC22 smoke of a REAL frozen ONEDIR executable, never Python source (R16, schema 6).
 
 Run after PyInstaller: python scripts/smoke_shortlab_packaged.py
 --executable desktop/backend/dist/short-lab/short-lab.exe --output-dir ...
 The copied bundle boots twice from an isolated directory with no PYTHONPATH;
-resource presence, UI, schema 5 and writable persistent DuckDB are required.
+resource presence, UI, schema 6 (001-006, D13 seven tables + eight indexes)
+and writable persistent DuckDB are required. The second boot must observe the
+same user-data DB file with the first-boot probe row intact, and the
+read-only install tree must be byte-identical before/after both boots.
 No live trading or fabricated provider results are used.
 """
 from __future__ import annotations
@@ -25,11 +28,15 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
+# R16 frozen resource set (D13/D16 V16): engine + shortlab defaults, both
+# identity tables, and the full 001-006 migration chain (R01 delivered
+# 006_optimization_repair.sql; R16 only asserts it on the release side).
 REQUIRED_RESOURCES = [
     'engine/config/default.yaml', 'shortlab/default.yaml',
     'shortlab/identity/asset_overrides.yaml', 'shortlab/identity/verified_assets.yaml',
     *[f'shortlab/migrations/{name}.sql' for name in (
-        '001_init','002_unlock_social','003_catalyst','004_core_completion','005_hedge_advisor')],
+        '001_init','002_unlock_social','003_catalyst','004_core_completion','005_hedge_advisor',
+        '006_optimization_repair')],
 ]
 
 
@@ -40,16 +47,30 @@ REQUIRED_HEDGE_TABLES = {
     'sl_hedge_monitor_snapshot', 'sl_hedge_alert',
 }
 
+# R16 repair tables (D13 seven tables, applied by 006_optimization_repair.sql).
+REQUIRED_REPAIR_TABLES = {
+    'sl_market_observation',
+    'sl_funding_schedule',
+    'sl_fx_observation',
+    'sl_hedge_decision_snapshot',
+    'sl_hedge_protection_confirmation',
+    'sl_strategy_entry_snapshot',
+    'sl_strategy_quote_task',
+}
+
 
 def validate_product_db(db):
     tables = {r[0] for r in db.execute('SHOW TABLES').fetchall()}
     missing = REQUIRED_HEDGE_TABLES - tables
     if missing:
         raise RuntimeError(f'005 migration tables missing from frozen product: {sorted(missing)}')
+    missing_repair = REQUIRED_REPAIR_TABLES - tables
+    if missing_repair:
+        raise RuntimeError(f'006 repair tables missing from frozen product: {sorted(missing_repair)}')
     version = (db.execute('SELECT max(version) FROM sl_schema_version').fetchone()[0]
                if 'sl_schema_version' in tables else None)
-    if version is None or version < 5:
-        raise RuntimeError('product schema version did not commit 005')
+    if version is None or version < 6:
+        raise RuntimeError('product schema version did not commit 006')
 
 
 def snapshot(directory):
@@ -212,12 +233,23 @@ def main():
             if not db_path.is_file():
                 raise RuntimeError('product did not create its writable DuckDB')
             with duckdb.connect(str(db_path)) as db:
+                # R16: every boot must see the full 006 schema (D13 seven
+                # tables) at version 6; a 006 failure must never silently
+                # present a 005-only ledger as healthy.
                 validate_product_db(db)
                 if index == 0:
                     db.execute('CREATE TABLE smoke_restart_probe (value INTEGER)')
                     db.execute('INSERT INTO smoke_restart_probe VALUES (22)')
                 elif db.execute('SELECT value FROM smoke_restart_probe').fetchall() != [(22,)]:
                     raise RuntimeError('data did not survive second boot')
+        # R16 secondary-start assertions: exactly two successful boots, each
+        # with a live health probe, sharing one writable DB file while the
+        # read-only install tree stays byte-identical.
+        if len(report['boots']) != 2:
+            raise RuntimeError(f'second boot missing: got {len(report["boots"])} boots')
+        for boot_report in report['boots']:
+            if boot_report.get('health', {}).get('ok') is not True:
+                raise RuntimeError('frozen boot health probe did not report ok:true')
         if snapshot(install) != before:
             raise RuntimeError('product modified read-only install tree')
         report['result'] = 'PASS'

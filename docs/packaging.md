@@ -86,24 +86,26 @@ uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
   math (`parents[4]/ui/dist`) resolves inside a frozen tree. Extract/release the whole
   `dist/` tree together and both resolvers work. See the `short-lab.spec` header for the
   full path math.
-- The spec also bundles the DuckDB native libraries and the full 005 resource set,
+- The spec also bundles the DuckDB native libraries and the full 006 resource set,
   all read via `diveintocrypto_desktop.resources.read_resource_text`
   (`importlib.resources` with a `_MEIPASS` fallback that is only covered by
   the frozen product smoke, never by unit-test fakes): `engine/config/default.yaml`,
   `shortlab/default.yaml` (overridable at runtime via `SHORTLAB_CONFIG_PATH`),
   `shortlab/identity/asset_overrides.yaml`, `shortlab/identity/verified_assets.yaml`
-  and `shortlab/migrations/001_init.sql` … `005_hedge_advisor.sql` (F01 base
-  001–004 plus the H01 Hedge advisor 005; H11 verifies the full manifest).
+  and `shortlab/migrations/001_init.sql` … `006_optimization_repair.sql` (F01 base
+  001–004 plus the H01 Hedge advisor 005 plus the R01 repair 006: D13 seven tables +
+  eight indexes; H11 verifies the 005 manifest, R16 verifies the 006 set).
 - **Writable data:** the frozen app never writes next to its resources. Short-Lab state
   lives in the per-user data directory (`%LOCALAPPDATA%/short-lab` on Windows, holding
   `shortlab.duckdb`), so launching from a read-only extraction directory works and data
   survives restarts. Smoke (`scripts/smoke_shortlab_packaged.py`): read-only install
   dir + empty user data dir, real-process `/api/health` + `/api/short/health`,
-  migrate to schema 5, engine resources, plan registration with the public-HTTP
-  fixture stub (never demo mode), clean shutdown, second boot recovering the
-  plan/monitor/alerts. The UI bundle (`desktop/ui/dist/`) is rebuilt from the
-  approved UI source by H11 and bound by source-commit + artifact SHA (node +
-  esbuild versions recorded in the verification manifest).
+  migrate to schema 6, engine resources, full 006 resource/D13-table check, plan
+  registration with the public-HTTP fixture stub (never demo mode), clean shutdown,
+  second boot recovering the same DB file and probe row with a byte-identical install
+  tree. The UI bundle (`desktop/ui/dist/`) is rebuilt from the approved UI source by
+  R16 and bound by source-commit + artifact SHA (node + esbuild versions recorded in
+  the verification manifest).
 - **Size honesty: expect roughly 150–250 MB unzipped.** pandas + numpy + FastAPI/uvicorn
   dominate; that is the price of shipping the full reference engine, not a packaging bug.
   The zip the packaging job uploads is smaller, but still comfortably in the
@@ -129,6 +131,10 @@ Desktop CI (`package-desktop` job in `release.yml`):
 
 Upgrading in the same Python environment: uninstall the old `diveintocrypto-desktop`
 distribution first, then install `short-lab-desktop`. Do not install both side by side.
+
+### R16 默认能力、启用与边界（中文）
+
+默认能力：桌面包默认 `LITE` 评分、默认 `hedge.enabled: false`，Funding/Hedge 开关默认关闭；`binance_alpha` 与 `onchain` 默认关闭，未配置记为 UNCONFIGURED。启用方式为 `SHORTLAB_CONFIG_PATH` 覆盖文件 + 环境变量 Key，包内不带 Key。研究评分为 `RULE_BASED_UNVALIDATED`，READY 非下单指令；正费率检查默认开启，双负不得 READY；数量与强平按原生交易单位（含 1000 倍合约、tick/Dust），缺保护能力返回 UNKNOWN；执行靠手工录入 fill，支持部分退出；数据过期投射为 `CANDIDATE`/`NOT_READY`，`NO_HEDGE` 不能保存配对计划，证据不足为 `PENDING`/`CENSORED`/`UNAVAILABLE`。任何 BLOCKED 功能不得宣传为已实现；缺网/缺 Key 记为 UNVERIFIED/UNCONFIGURED。工具链：Node `>=22 <23`（CI `setup-node: 22`），`@playwright/test 1.56.0` 仅为 dev 依赖，不打进生产包；成品门禁为 Windows frozen smoke（两次启动、schema 006）在 zip/发布前失败阻断，P06 证据缺失以 `if-no-files-found: error` 阻断。
 
 ## This machine: `git push` over 1 MB is broken
 

@@ -142,6 +142,38 @@ jobs:
           enable-cache: true
           cache-dependency-glob: desktop/backend/uv.lock
 
+      # R16 reproducible UI toolchain (design D17): Node 22.x only
+      # (engines >=22 <23, lock root in sync). The committed dist/ is a
+      # runtime artefact served by the backend, so the release build
+      # reinstalls from the lockfile without drifting R15a deps, runs the
+      # Node suite, then rebuilds dist/ from source before packaging.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+
+      - name: Install, test and rebuild UI dist (Node 22, locked)
+        working-directory: desktop/ui
+        run: |
+          node --version
+          npm --version
+          npm ci
+          npm test
+          npm run build
+
+      - name: Verify UI dist routes and resources
+        working-directory: desktop/ui
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/bundle.js)) { throw "missing dist/bundle.js" }
+          if (-not (Test-Path dist/index.html)) { throw "missing dist/index.html" }
+          if (-not (Test-Path dist/styles.css)) { throw "missing dist/styles.css" }
+          $bundle = Get-Content dist/bundle.js -Raw
+          foreach ($needle in @("shortlab", "hedge-monitor", "hedge-planner")) {
+            if ($bundle -notmatch $needle) { throw "dist bundle missing route resource: $needle" }
+          }
+
       - name: Sync backend dependencies (locked)
         working-directory: desktop/backend
         run: uv sync
@@ -169,11 +201,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/ui | Out-Null
           Copy-Item -Recurse -Force ..\ui\dist dist\ui\dist
 
-      - name: Verify real frozen product (two boots, schema 005, UI and writable data)
+      # R16 product gate: this frozen smoke MUST pass before the zip and the
+      # GitHub Release publish below. The three steps (verify -> zip ->
+      # publish) intentionally carry no `if: always()` so a smoke failure
+      # blocks both artefacts. The two upload steps at the end are the only
+      # ones allowed `if: always()` (with `if-no-files-found: error` so a
+      # missing P06 evidence tree fails the run instead of passing silent).
+      - name: Verify real frozen product (two boots, schema 006, UI and writable data)
         working-directory: desktop/backend
         shell: pwsh
         run: uv run python ../../scripts/smoke_shortlab_packaged.py --executable dist/short-lab/short-lab.exe --fixture --output-dir runtime/verification/packaged-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # Gate: no `if: always()` here — a failed smoke above blocks this zip.
       - name: Zip the packaged tree
         working-directory: desktop/backend
         shell: pwsh
@@ -183,7 +222,8 @@ jobs:
       # Tag builds publish the zip to the GitHub Release for this tag.
       # Desktop-only, research build: not an automated trader; provider keys
       # stay in env, never in the bundle. The Android version does not move
-      # with Desktop tags.
+      # with Desktop tags. Gate: no `if: always()` — a failed smoke above
+      # blocks this publish.
       - name: Publish desktop zip to the GitHub Release (tag builds only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/short-lab-v')
         env:
@@ -219,11 +259,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # H11 delivery gate (design C3.4): the same verification tree the smoke
-      # and packaging tests write locally (desktop/backend/runtime/
-      # verification/) is uploaded as its own artifact — even when an
-      # earlier step failed — so every C3 row stays downloadable. Android
-      # job untouched.
+      # H11 delivery gate (design C3.4) + R16 P06 evidence gate: the same
+      # verification tree the smoke and packaging tests write locally
+      # (desktop/backend/runtime/verification/) is uploaded as its own
+      # artifact — even when an earlier step failed — so every P06 row stays
+      # downloadable. `if-no-files-found: error` makes a missing evidence
+      # tree fail the run. Android job untouched.
       - name: Upload desktop verification evidence
         if: always()
         uses: actions/upload-artifact@v4

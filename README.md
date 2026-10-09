@@ -8,7 +8,7 @@ short-lab 是面向 Binance USDT-M 永续合约的本地行情分析与做空研
 
 ## 快速启动
 
-桌面端需要 Python **3.12+** 和 `uv`。预构建 UI 位于 `desktop/ui/dist/`，直接运行后端不需要 Node.js；修改 UI 或重新构建时需要 Node.js **18+**。
+桌面端需要 Python **3.12+** 和 `uv`。预构建 UI 位于 `desktop/ui/dist/`，直接运行后端不需要 Node.js；修改 UI 或重新构建时需要 Node.js **22.x**（`engines >=22 <23`，CI `setup-node: 22`；浏览器验收另需 `@playwright/test 1.56.0` dev 依赖，不打进生产包）。
 
 在项目根目录执行：
 
@@ -130,6 +130,20 @@ Short-Lab 是同一 FastAPI 内的 Python 模块，新增 API 均位于 `/api/sh
 
 **明确局限（不宣传）：** 项目不做自动交易；不承诺无损、对冲后保本或强平免疫；强平距离是基于当时标记价格与用户录入仓位的参考计算，未经“强平已验证”类实盘验证，不得作为安全保证引用。READY/计划存在不等于建议下单。
 
+### Short-Lab 发布能力、启用与边界（R16）
+
+默认能力：Short-Lab 默认 `LITE` 评分、默认 `hedge.enabled: false` 且 Funding/Hedge 相关开关默认关闭；默认 runtime 只注册 `score_refresh`，7D/30D/90D grader 与 metrics 无默认自动作业，未接线时 `/api/short/evidence/summary` 返回 503。`binance_spot` 默认启用，`binance_alpha` 与 `onchain`（0x）默认关闭；未配置的场所一律返回 `UNAVAILABLE` + `CHAIN_PROVIDER_UNCONFIGURED`，记为 UNCONFIGURED，不计入通过。
+
+启用方式：复制 `shortlab/default.yaml` 后以 `SHORTLAB_CONFIG_PATH` 指向覆盖文件显式启用对应 provider/hedge/funding；provider Key 只经环境变量（如 `DIVE_COINGECKO_API_KEY`、`SHORTLAB_0X_API_KEY`）注入，不写入包内。仅填 Key 而 endpoint 仍为 `.example` 占位时不算接通，以 API 实际返回为准。
+
+研究评分边界：全部建议初始标 `RULE_BASED_UNVALIDATED`，是规则建议不是收益概率；READY 是规则结果，不是下单指令。正费率检查默认开启：Funding Gate 要求当前费率为正，双负不得 READY；历史覆盖不足时降为 `HISTORY_BOOTSTRAPPING`/`NOT_READY`，不向前延伸生效时点。
+
+原生强平单位：强平距离与数量按原生交易单位计算，1000 倍合约（如 1000PEPE）不改变名义口径；USDC 现货与 Base 费用不改变原生单位；舍入按 tick（如 0.005）与 Dust 规则执行，未经验证的倍率标 `HEDGE_MULTIPLIER_UNVERIFIED` 并拒绝。
+
+手工保护与成交：保护能力缺失时如实返回 `UNKNOWN`，不宣称已挂单；唯一的执行记录是用户手工录入 fill（`USER_ENTERED`），activate/close 只改本地状态；保护确认以位置 hash 为准，版本递增不误失效。
+
+部分退出与数据过期：退出指导按当前剩余数量计算，支持部分退出；剩余为零后不再给出有效终值。数据过期按 TTL/grace 处理：陈旧 READY 投射为 `CANDIDATE`/`NOT_READY`（`stale: true`）而不改写历史；`NO_HEDGE` 状态不能保存配对计划；证据不足时返回 `PENDING`/`CENSORED`/`UNAVAILABLE`，缺 mark/FX 或退市不缩放补造。任何 BLOCKED 功能不得宣传为已实现；离线缺网/缺 Key 记为 UNVERIFIED/UNCONFIGURED，不计入通过。
+
 ## 数据源与配置
 
 | 数据源 | 用途 | 代码入口 |
@@ -230,7 +244,7 @@ Short-Lab 内部职责：
 | 目录/文件 | 职责 |
 | --- | --- |
 | `models.py`、`config.py`、`default.yaml` | 统一 DTO、配置校验与配置 hash |
-| `paths.py`、`repository.py`、`migrations/` | 可写路径、串行 DuckDB 访问、001–005 迁移（含 H01 对冲顾问 005） |
+| `paths.py`、`repository.py`、`migrations/` | 可写路径、串行 DuckDB 访问、001–006 迁移（含 H01 对冲顾问 005 与 R01 修复 006） |
 | `resources.py` | 唯一打包资源入口 `read_resource_text`（importlib.resources，`_MEIPASS` 回退仅成品实测） |
 | `maintenance.py` | 基础保留回调 `async maintain(context)`，仅调 `maintain_retention`，交 F06b 接线 |
 | `identity/` | Canonical 映射、倍率和人工覆盖 |
@@ -274,7 +288,7 @@ cd desktop/backend
 uv run --with pyinstaller pyinstaller short-lab.spec --noconfirm
 ```
 
-输出目录为 `desktop/backend/dist/short-lab/`，Windows 发布包为 `short-lab-windows-x64.zip`。打包包括 React dist、DuckDB 运行库以及 `resources.read_resource_text` 可读的 engine 配置、Short-Lab 默认配置、两套 identity YAML 与 001–005 迁移 SQL（含 H01 对冲顾问 005）；运行数据写入用户目录。跨平台打包应在目标系统验证，当前 release workflow 的 Desktop job 使用 Windows runner。
+输出目录为 `desktop/backend/dist/short-lab/`，Windows 发布包为 `short-lab-windows-x64.zip`。打包包括 React dist、DuckDB 运行库以及 `resources.read_resource_text` 可读的 engine 配置、Short-Lab 默认配置、两套 identity YAML 与 001–006 迁移 SQL（含 H01 对冲顾问 005 与 R01 修复 006：D13 七表八索引）；运行数据写入用户目录。跨平台打包应在目标系统验证，当前 release workflow 的 Desktop job 使用 Windows runner（Node 22 重建 UI dist，frozen smoke 两次启动 schema 6 在 zip/发布前失败阻断）。
 
 `.github/workflows/release.yml` 分开处理两种 tag：`short-lab-v*` 发布 Desktop 包，`v*` 发布 Android APK/AAB。手动 `workflow_dispatch` 勾选 `package_desktop` 仅生成 Desktop artifact。具体路径、签名和 smoke 方法见 [docs/packaging.md](docs/packaging.md)。
 

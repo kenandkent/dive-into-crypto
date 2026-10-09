@@ -136,7 +136,8 @@ a = Analysis(
         # Human-verified identity tables (F09 base resources).
         (_IDENTITY_OVERRIDES_YAML, "diveintocrypto_desktop/shortlab/identity"),
         (_VERIFIED_ASSETS_YAML, "diveintocrypto_desktop/shortlab/identity"),
-        # F01 base migrations 001-004 plus H01 Hedge 005 (explicit).
+        # F01 base migrations 001-004 plus H01 Hedge 005 plus R01 repair 006
+        # (explicit list; no placeholder file may satisfy the bundle).
         *[(path, "diveintocrypto_desktop/shortlab/migrations") for path in _MIGRATIONS],
         # DuckDB package data, if any ships alongside the extension.
         *collect_data_files("duckdb", include_py_files=False),

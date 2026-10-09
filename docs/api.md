@@ -158,6 +158,12 @@ are 409, a full write queue is 503 `LOCAL_WRITE_BUSY`.
 | `HEDGE_PLAN_NOT_FOUND` / `HEDGE_SIMULATION_NOT_FOUND` | 404 | unknown plan / simulation id |
 | `LOCAL_WRITE_BUSY` | 503 | write queue full — committed nothing |
 
+### Short-Lab 默认能力、启用与边界（R16，中文）
+
+默认能力：Short-Lab 默认 `LITE`、默认 `hedge.enabled: false`，Funding/Hedge 开关默认关闭；grader/metrics 无默认自动作业，未接线时证据端返回 503。`binance_spot` 默认启用，`binance_alpha` 与 `onchain` 默认关闭，未配置记为 UNCONFIGURED，不计入通过。
+
+启用方式：以 `SHORTLAB_CONFIG_PATH` 指向覆盖文件显式启用，Key 只经环境变量注入。研究评分均为 `RULE_BASED_UNVALIDATED`，READY 不是下单指令。正费率检查默认开启，双负不得 READY；数量与强平按原生交易单位计算（含 1000 倍合约口径、tick 与 Dust），缺保护能力返回 UNKNOWN；执行唯一靠手工录入 fill（`USER_ENTERED`），支持部分退出；数据过期按 TTL 投射为 `CANDIDATE`/`NOT_READY`，`NO_HEDGE` 不能保存配对计划，证据不足返回 `PENDING`/`CENSORED`/`UNAVAILABLE`。任何 BLOCKED 功能不得宣传为已实现；缺网/缺 Key 记为 UNVERIFIED/UNCONFIGURED。
+
 ## GET /api/universe
 
 The tradable universe: USDT-M perpetuals with status `TRADING`, quote asset `USDT`,
