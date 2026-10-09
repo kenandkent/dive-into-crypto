@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Mapping
 
@@ -61,6 +63,7 @@ __all__ = [
     "Ledger",
     "LedgerError",
     "aggregate_events",
+    "build_event_fx_records",
     "canonical_event_type",
     "describe_position",
     "effective_qty_str",
@@ -704,6 +707,97 @@ def sum_funding_receipts(events: Any) -> dict[str, str]:
     return {ccy: _format_decimal(total) for ccy, total in totals.items()}
 
 
+def build_event_fx_records(
+    events: Any,
+    event_fx: Mapping[str, Mapping[str, Any]],
+    symbol: str,
+    known_at_ms: int,
+    *,
+    source_as_of_ms: int | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Build ``EVENT_FX`` persistence records (R08b/D18.1, pure).
+
+    Each input event yields one ``sl_market_observation``-ready record with
+    ``kind="EVENT_FX"`` whose ``value_json`` holds the ``event_id`` plus the
+    D18.1 FX mapping (``price_fx``/``fee_fx``/``funding_fx`` + ids) and the
+    event currencies (``price_currency``/``fee_currency``/``currency``).
+    Records are saveable via
+    ``repository.save_market_observation`` (``EVENT_FX`` requires
+    ``event_id`` in ``value_json``) and listable via
+    ``list_market_observations(symbol, "EVENT_FX", ...)``. Pure: no DB, no
+    network, no clock reads.
+    """
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise LedgerError("symbol must be a non-empty str")
+    if isinstance(known_at_ms, bool) or not isinstance(known_at_ms, int):
+        raise LedgerError("known_at_ms must be an int")
+    if known_at_ms < 0:
+        raise LedgerError("known_at_ms must be >= 0")
+    if event_fx is None or not isinstance(event_fx, Mapping):
+        raise LedgerError("event_fx must be a mapping")
+    seq = list(events) if events is not None else []
+    out: list[dict[str, Any]] = []
+    for idx, raw in enumerate(seq):
+        data = _event_to_dict(raw)
+        eid = data.get("event_id")
+        if not isinstance(eid, str) or not eid:
+            eid = f"pure-{idx}"
+        fx_entry = event_fx.get(eid)
+        fx_dict: dict[str, Any] = dict(fx_entry) if isinstance(
+            fx_entry, Mapping) else {}
+        exec_ms = data.get("executed_at_ms")
+        src: int | None = None
+        if isinstance(exec_ms, int) and not isinstance(exec_ms, bool):
+            src = exec_ms
+        elif source_as_of_ms is not None:
+            try:
+                src = int(source_as_of_ms)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                src = None
+        if src is None and source_as_of_ms is not None:
+            try:
+                src = int(source_as_of_ms)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                src = None
+        value: dict[str, Any] = {"event_id": eid}
+        for key in ("price_currency", "fee_currency", "currency", "amount"):
+            if data.get(key) is not None:
+                value[key] = data.get(key)
+        # D18.1 FX mapping verbatim (ids + rates).
+        for key in ("price_fx_id", "price_fx", "fee_fx_id", "fee_fx",
+                    "funding_fx_id", "funding_fx"):
+            if fx_dict.get(key) is not None:
+                value[key] = fx_dict.get(key)
+        # Compat aliases (camelCase fixtures) mirrored to snake.
+        for camel, snake in (("priceFx", "price_fx"), ("feeFx", "fee_fx"),
+                             ("fundingFx", "funding_fx")):
+            if fx_dict.get(camel) is not None and value.get(snake) is None:
+                value[snake] = fx_dict.get(camel)
+        meta: dict[str, Any] = {
+            "status": "OK",
+            "source": "LEDGER_EVENT_FX",
+            "source_schema_version": "observations-v1",
+            "source_as_of_ms": src,
+            "known_at_ms": int(known_at_ms),
+            "repair_schema_version": "repair-contract-v1",
+            "schema_version": "hedge-source-v1",
+        }
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False, default=str)
+        raw_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        out.append({
+            "observation_id": f"{symbol.strip()}:EVENT_FX:{eid}:{int(known_at_ms)}",
+            "symbol": symbol.strip(),
+            "kind": "EVENT_FX",
+            "source_as_of_ms": src,
+            "known_at_ms": int(known_at_ms),
+            "value_json": value,
+            "meta_json": meta,
+            "raw_sha256": raw_sha,
+        })
+    return tuple(out)
+
+
 # ---------------------------------------------------------------------------
 # State machine (B19.3/B21) + independent exit suggestion.
 # ---------------------------------------------------------------------------
@@ -790,6 +884,7 @@ def evaluate_position_state(
     updated_at_ms: int = 0,
     prior_status: str | None = None,
     rules: Any = None,
+    activated: bool | None = None,
 ) -> PlanState:
     """Evaluate the持仓 state machine (B19.3/B21, H06.2-H06.4).
 
@@ -810,6 +905,15 @@ def evaluate_position_state(
       leg; see :func:`recommend_exit_action` for the independent
       ``CRITICAL_ORPHAN_*`` code -- the code never rewrites this
       status).
+
+    R08b (D12/D18.1): ``activated`` selects the funded-but-not-activated
+    state. ``None`` (default) preserves the pre-repair ``ACTIVE`` for
+    legacy callers; ``False`` returns ``FUNDED_PENDING_ACTIVATION`` for a
+    healthy both-legs-filled position that has not passed the explicit
+    activation re-check (six items + ``ACTIVATION_CHECK`` + protection
+    hash); ``True`` returns ``ACTIVE`` after explicit activation. Only the
+    healthy no-close branch is affected -- ``CLOSING``/``CLOSED``/
+    ``PARTIALLY_FILLED`` are unchanged.
     """
     if mode not in ("ABSOLUTE", "RELATIVE"):
         raise LedgerError(f"mode={mode!r} must be ABSOLUTE/RELATIVE")
@@ -824,7 +928,8 @@ def evaluate_position_state(
     assert isinstance(fut_rem_raw, Decimal) and isinstance(spot_rem_raw, Decimal)
 
     if fut_open == 0 and spot_open == 0:
-        if prior_status in ("DRAFT", "READY", "INVALID"):
+        if prior_status in ("DRAFT", "READY", "INVALID",
+                            "FUNDED_PENDING_ACTIVATION"):
             status = prior_status
         else:
             status = "DRAFT"
@@ -857,7 +962,11 @@ def evaluate_position_state(
             # Paired exit already started but both legs still hold.
             status = "CLOSING"
         elif drift is not None and drift <= DRIFT_TOLERANCE:
-            status = "ACTIVE"
+            if activated is False:
+                # R08b: both legs filled but not explicitly activated.
+                status = "FUNDED_PENDING_ACTIVATION"
+            else:
+                status = "ACTIVE"
         else:
             status = "PARTIALLY_FILLED"
     else:

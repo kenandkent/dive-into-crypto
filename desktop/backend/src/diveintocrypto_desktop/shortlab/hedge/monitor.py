@@ -14,6 +14,8 @@ touches DuckDB.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Mapping, Sequence
 
@@ -26,7 +28,9 @@ __all__ = [
     "FRESH_SKEW_SEC",
     "REFERENCE_SKEW_SEC",
     "HIGH_FREQUENCY_STATUSES",
+    "EXTENDED_HIGH_FREQUENCY_STATUSES",
     "MonitorError",
+    "build_activation_check_record",
     "compute_monitor",
     "should_persist",
     "risk_key",
@@ -47,6 +51,14 @@ REFERENCE_SKEW_SEC = 30
 
 #: Only these持仓 states get the high-frequency 10s monitor (B30).
 HIGH_FREQUENCY_STATUSES = frozenset({"PARTIALLY_FILLED", "ACTIVE", "CLOSING"})
+
+#: R08b (D12/D13.2): funded-but-not-activated plans carry real exposure and
+#: join the same 10s tick. ``HIGH_FREQUENCY_STATUSES`` stays frozen for
+#: pre-repair decoders; :func:`is_high_frequency_status` checks the extended
+#: set so legacy equality assertions keep passing while new callers observe
+#: the funded state at high frequency.
+EXTENDED_HIGH_FREQUENCY_STATUSES = HIGH_FREQUENCY_STATUSES | frozenset(
+    {"FUNDED_PENDING_ACTIVATION"})
 
 
 class MonitorError(ValueError):
@@ -307,8 +319,14 @@ def _settled_field(event: Any, *names: str) -> Any:
 
 
 def is_high_frequency_status(status: str | None) -> bool:
-    """Whether ``status`` gets the 10s high-frequency monitor (B30)."""
-    return str(status or "") in HIGH_FREQUENCY_STATUSES
+    """Whether ``status`` gets the 10s high-frequency monitor (B30 + R08b).
+
+    R08b extends the frozen set with ``FUNDED_PENDING_ACTIVATION`` (real
+    exposure before explicit activation). The frozen
+    :data:`HIGH_FREQUENCY_STATUSES` is unchanged for legacy decoders; this
+    predicate checks :data:`EXTENDED_HIGH_FREQUENCY_STATUSES`.
+    """
+    return str(status or "") in EXTENDED_HIGH_FREQUENCY_STATUSES
 
 
 def basis_readiness_for_new_plan(
@@ -401,6 +419,58 @@ def _compute_funding_carry(
     return (total_str, _fmt(known_total), known, unknown, total, flags)
 
 
+def _ledger_field(ledger_pnl: Any, *names: str, default: Any = None) -> Any:
+    """Read a LedgerPnl field (DTO attribute or mapping key, snake/camel)."""
+    if ledger_pnl is None:
+        return default
+    for name in names:
+        if isinstance(ledger_pnl, Mapping):
+            if name in ledger_pnl and ledger_pnl[name] is not None:
+                # Preserve explicit None vs missing: caller distinguishes
+                # via has_ledger flag; here return the value as-is.
+                return ledger_pnl[name]
+            # camelCase fallback.
+            parts = name.split("_")
+            camel = parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+            if camel in ledger_pnl and ledger_pnl[camel] is not None:
+                return ledger_pnl[camel]
+        elif hasattr(ledger_pnl, name):
+            value = getattr(ledger_pnl, name)
+            if value is not None:
+                return value
+    # Explicit None on the DTO (unknown) vs missing: return None when the
+    # DTO carries the attribute, else default. Presence check below uses
+    # has_ledger, so returning default here is safe for missing keys.
+    if isinstance(ledger_pnl, Mapping):
+        for name in names:
+            if name in ledger_pnl:
+                return ledger_pnl[name]
+    elif any(hasattr(ledger_pnl, n) for n in names):
+        return None
+    return default
+
+
+def _protection_view(protection: Any) -> tuple[str | None, tuple[str, ...]]:
+    """Return ``(status, reasons)`` for a protection GateResult/view."""
+    if protection is None:
+        return (None, ())
+    if isinstance(protection, Mapping):
+        status = protection.get("status", protection.get("protection_status"))
+        reasons = protection.get("reasons",
+                                 protection.get("protection_reasons", ()))
+    else:
+        status = getattr(protection, "status", None)
+        if status is None:
+            status = getattr(protection, "protection_status", None)
+        reasons = getattr(protection, "reasons", ())
+        if reasons is None:
+            reasons = getattr(protection, "protection_reasons", ())
+    if not isinstance(status, str):
+        return (None, ())
+    seq = tuple(reasons) if isinstance(reasons, (list, tuple)) else ()
+    return (status.strip().upper(), tuple(str(r) for r in seq))
+
+
 # ---------------------------------------------------------------------------
 # Main compute (10s in-memory, read-only).
 # ---------------------------------------------------------------------------
@@ -413,8 +483,11 @@ def compute_monitor(
     settled_events: Any,
     policy: Any = None,
     now_ms: int = 0,
+    *,
+    ledger_pnl: Any = None,
+    protection: Any = None,
 ) -> HedgeMonitor:
-    """Compute one in-memory monitor snapshot (H07.1, B25).
+    """Compute one in-memory monitor snapshot (H07.1, B25 + R08b).
 
     Read-only over the H06 position mirror, ``market_cache`` and settled
     public funding events. Funding uses each event's *then* short quantity
@@ -426,6 +499,16 @@ def compute_monitor(
     added a second time; cross-currency legs record an independent
     ``fx_pnl_adjustment_usd`` and null the complete USD net when FX is
     missing. USDT/USDC are never assumed to equal 1 USD.
+
+    R08b (D09/D12): ``ledger_pnl`` is the R08a :class:`LedgerPnl` output
+    (DTO or mapping). Actual realised/cost/funding legs flow into the
+    snapshot instead of hand-filled cache numbers; ``unknown`` stays
+    ``None`` (never zero-filled) and estimated/unconfirmed funding is
+    never added to actual receipts (``funding_double_count_prevented``).
+    ``protection`` is the :class:`GateResult` from
+    :func:`protection.validate_protection_confirmation` (or its mapping
+    view); ``FAIL`` degrades to ``MONITOR_DEGRADED`` with
+    ``PROTECTION_INVALID`` and feeds :mod:`hedge.alerts`.
     """
     hedge = _hedge_subtree(policy)
     basis_cfg = hedge.get("basis") if isinstance(hedge.get("basis"), Mapping) else {}
@@ -657,11 +740,33 @@ def compute_monitor(
             spot_unreal_settle = Decimal(0)
 
         # Realized: closed qty needs an explicit exit snapshot; without it
-        # the complete leg PnL stays null (never invent 0).
-        realized_spot = _parse_opt_decimal(
-            "realized_spot", cache.get("realized_spot_pnl_usd"))
-        realized_fut = _parse_opt_decimal(
-            "realized_futures", cache.get("realized_futures_pnl_usd"))
+        # the complete leg PnL stays null (never invent 0). R08b prefers the
+        # R08a LedgerPnl realised legs when bound (actual, not hand-filled).
+        has_ledger = ledger_pnl is not None
+        if has_ledger:
+            _spot_raw = _ledger_field(ledger_pnl, "realized_spot_usd",
+                                      default="__missing__")
+            _fut_raw = _ledger_field(ledger_pnl, "realized_futures_usd",
+                                     default="__missing__")
+            if _spot_raw == "__missing__":
+                realized_spot = _parse_opt_decimal(
+                    "realized_spot", cache.get("realized_spot_pnl_usd"))
+            elif _spot_raw is None:
+                realized_spot = None
+            else:
+                realized_spot = _parse_opt_decimal("realized_spot", _spot_raw)
+            if _fut_raw == "__missing__":
+                realized_fut = _parse_opt_decimal(
+                    "realized_futures", cache.get("realized_futures_pnl_usd"))
+            elif _fut_raw is None:
+                realized_fut = None
+            else:
+                realized_fut = _parse_opt_decimal("realized_futures", _fut_raw)
+        else:
+            realized_spot = _parse_opt_decimal(
+                "realized_spot", cache.get("realized_spot_pnl_usd"))
+            realized_fut = _parse_opt_decimal(
+                "realized_futures", cache.get("realized_futures_pnl_usd"))
         if spot_closed > 0 and realized_spot is None:
             metrics["realized_spot_unknown"] = True
         if fut_closed > 0 and realized_fut is None:
@@ -750,10 +855,63 @@ def compute_monitor(
     projected_str = _fmt(projected) if projected is not None else None
 
     # -- costs + net ---------------------------------------------------------
-    known_cost = _parse_opt_decimal("known_cost", cache.get("known_cost_usd",
-                                                            cache.get("knownCostUsd")))
-    exit_cost = _parse_opt_decimal("exit_cost", cache.get("estimated_exit_cost_usd",
-                                                          cache.get("estimatedExitCostUsd")))
+    # R08b: actual costs come from the bound LedgerPnl (unknown stays null,
+    # never zero-filled); unbound callers keep the legacy cache behaviour.
+    if has_ledger:
+        _kc_raw = _ledger_field(ledger_pnl, "known_cost_usd", default="__missing__")
+        _ec_raw = _ledger_field(ledger_pnl, "estimated_exit_cost_usd",
+                                default="__missing__")
+        if _kc_raw == "__missing__":
+            known_cost = _parse_opt_decimal(
+                "known_cost", cache.get("known_cost_usd",
+                                        cache.get("knownCostUsd")))
+        elif _kc_raw is None:
+            known_cost = None
+        else:
+            known_cost = _parse_opt_decimal("known_cost", _kc_raw)
+        if _ec_raw == "__missing__":
+            exit_cost = _parse_opt_decimal(
+                "exit_cost", cache.get("estimated_exit_cost_usd",
+                                       cache.get("estimatedExitCostUsd")))
+        elif _ec_raw is None:
+            exit_cost = None
+        else:
+            exit_cost = _parse_opt_decimal("exit_cost", _ec_raw)
+        # Ledger transparency: realised/unrealised/cost/funding legs stay
+        # visible separately; estimated and actual funding are never summed.
+        for _lname in ("realized_futures_usd", "realized_spot_usd",
+                       "unrealized_futures_usd", "unrealized_spot_usd",
+                       "actual_funding_usd",
+                       "estimated_unconfirmed_funding_usd",
+                       "known_cost_usd", "estimated_exit_cost_usd",
+                       "known_net_subtotal_usd", "net_before_exit_usd",
+                       "net_after_exit_usd", "funding_basis"):
+            _lraw = _ledger_field(ledger_pnl, _lname, default="__missing__")
+            if _lraw != "__missing__":
+                metrics[f"ledger_{_lname}"] = (
+                    dict(_lraw) if isinstance(_lraw, Mapping)
+                    else (list(_lraw) if isinstance(_lraw, (list, tuple))
+                          else _lraw))
+        _lunk = _ledger_field(ledger_pnl, "unknown_components", default=())
+        try:
+            metrics["ledger_unknown_components"] = tuple(
+                str(v) for v in (tuple(_lunk) if isinstance(_lunk, (list, tuple))
+                                 else (() if _lunk is None else (_lunk,))))
+        except (TypeError, ValueError):
+            metrics["ledger_unknown_components"] = ()
+        _lcov = _ledger_field(ledger_pnl, "coverage", default="__missing__")
+        if _lcov != "__missing__":
+            metrics["ledger_coverage"] = dict(_lcov) if isinstance(
+                _lcov, Mapping) else _lcov
+        _lbasis = _ledger_field(ledger_pnl, "funding_basis", default=None)
+        metrics["ledger_funding_basis"] = _lbasis
+        metrics["funding_double_count_prevented"] = True
+    else:
+        known_cost = _parse_opt_decimal("known_cost", cache.get("known_cost_usd",
+                                                                cache.get("knownCostUsd")))
+        exit_cost = _parse_opt_decimal("exit_cost", cache.get("estimated_exit_cost_usd",
+                                                              cache.get("estimatedExitCostUsd")))
+        metrics["funding_double_count_prevented"] = True
     if known_cost is None:
         metrics["known_cost_unknown"] = True
     if exit_cost is None:
@@ -788,6 +946,30 @@ def compute_monitor(
                 net_after = _fmt(Decimal(net_before) - exit_cost)
             except (InvalidOperation, ValueError, ArithmeticError):
                 net_after = None
+    # R08b: ledger unknown propagates -- a partial known_cost (e.g. one
+    # UNKNOWN_FEE) still nulls the complete net, never a zero-filled total.
+    if has_ledger:
+        _lb_raw = _ledger_field(ledger_pnl, "net_before_exit_usd",
+                                default="__missing__")
+        _la_raw = _ledger_field(ledger_pnl, "net_after_exit_usd",
+                                default="__missing__")
+        _lunk_raw = _ledger_field(ledger_pnl, "unknown_components",
+                                  default=())
+        try:
+            _lunk_seq = tuple(_lunk_raw) if isinstance(
+                _lunk_raw, (list, tuple)) else ()
+        except (TypeError, ValueError):
+            _lunk_seq = ()
+        if _lb_raw is None and _lunk_seq:
+            if net_before is not None:
+                metrics["ledger_net_unknown_propagated"] = True
+            net_before = None
+            metrics.setdefault("net_before_missing", []).append(
+                "ledger_unknown")
+        if _la_raw is None and _lunk_seq:
+            if net_after is not None:
+                metrics["ledger_net_unknown_propagated"] = True
+            net_after = None
 
     # -- ratio / residual -----------------------------------------------------
     actual_ratio: str | None = None
@@ -879,6 +1061,38 @@ def compute_monitor(
     metrics["exit_liquidity"] = exit_liq
 
     # -- status ---------------------------------------------------------------
+    # R08b protection state machine (D06.3/D12): FAIL degrades, UNKNOWN flags.
+    prot_status, prot_reasons = _protection_view(protection)
+    if prot_status is not None:
+        metrics["protection_status"] = prot_status
+        metrics["protection_reasons"] = list(prot_reasons)
+        # Surface the stored hash when the caller passes a record view.
+        if isinstance(protection, Mapping):
+            for _hk in ("protected_position_hash", "protectedPositionHash"):
+                if protection.get(_hk) is not None:
+                    metrics["protected_position_hash"] = str(protection.get(_hk))
+                    break
+            for _hk in ("confirmation_id", "confirmationId"):
+                if protection.get(_hk) is not None:
+                    metrics["protection_confirmation_id"] = str(
+                        protection.get(_hk))
+                    break
+        else:
+            for _hk in ("protected_position_hash", "confirmation_id"):
+                if hasattr(protection, _hk):
+                    _hv = getattr(protection, _hk)
+                    if _hv is not None:
+                        metrics[_hk] = str(_hv)
+        if prot_status == "FAIL":
+            metrics["protection_valid"] = False
+        elif prot_status == "PASS":
+            metrics["protection_valid"] = True
+        else:
+            metrics["protection_valid"] = None
+    else:
+        metrics["protection_status"] = None
+        metrics["protection_reasons"] = []
+        metrics["protection_valid"] = None
     persist_lag = cache.get("persist_lag_ms", cache.get("persistLagMs", 0))
     try:
         persist_lag_ms = int(persist_lag) if persist_lag is not None else 0
@@ -892,6 +1106,19 @@ def compute_monitor(
         degraded_reasons.append("BASIS_ASYNC_STALE")
     if persist_lag_ms > lag_limit_ms:
         degraded_reasons.append("PERSISTENCE_LAG")
+    if prot_status == "FAIL":
+        degraded_reasons.append("PROTECTION_INVALID")
+    elif prot_status == "UNKNOWN":
+        degraded_reasons.append("PROTECTION_UNKNOWN")
+    # Capacity degrade: spot exit cannot cover the remaining native qty.
+    try:
+        _covers = exit_liq.get("covers_remaining") if isinstance(
+            exit_liq, Mapping) else None
+    except Exception:
+        _covers = None
+    if _covers is False:
+        if "CAPACITY_DEGRADED" not in degraded_reasons:
+            degraded_reasons.append("CAPACITY_DEGRADED")
     status = "OK"
     if fut_expired or spot_expired:
         status = "NOT_READY"
@@ -943,11 +1170,11 @@ def compute_monitor(
 
 
 def risk_key(snapshot: Any) -> tuple[str, ...]:
-    """Return the persist-relevant risk key (B28.8/B30).
+    """Return the persist-relevant risk key (B28.8/B30 + R08b).
 
     Changes in liquidation band, basis alert state, ratio alert, orphan
-    hint, degraded status or quote-expiry force an out-of-cycle persist
-    even before the 60s sampler fires.
+    hint, degraded status, quote-expiry **or protection status** force an
+    out-of-cycle persist even before the 60s sampler fires.
     """
     if isinstance(snapshot, Mapping):
         metrics = snapshot.get("metrics_json", snapshot.get("metrics", {}))
@@ -961,10 +1188,14 @@ def risk_key(snapshot: Any) -> tuple[str, ...]:
             orphan = str(metrics.get("orphan_hint", ""))
             expired = (bool(metrics.get("futures_mark_expired", False)),
                        bool(metrics.get("spot_quote_expired", False)))
+            prot = str(metrics.get("protection_status", "") or "")
+            prot_reasons = ",".join(sorted(
+                str(r) for r in (metrics.get("protection_reasons", []) or [])))
         else:
             degraded, basis, ratio, orphan, expired = (), "", "", "", (False, False)
+            prot, prot_reasons = "", ""
         return (str(status), liq, basis, ratio, orphan,
-                ",".join(degraded), str(expired))
+                ",".join(degraded), str(expired), prot, prot_reasons)
     metrics = getattr(snapshot, "metrics_json", {}) or {}
     status = getattr(snapshot, "status", "OK")
     liq = str(metrics.get("liq_state", ""))
@@ -974,8 +1205,99 @@ def risk_key(snapshot: Any) -> tuple[str, ...]:
     orphan = str(metrics.get("orphan_hint", ""))
     expired = (bool(metrics.get("futures_mark_expired", False)),
                bool(metrics.get("spot_quote_expired", False)))
+    prot = str(metrics.get("protection_status", "") or "")
+    try:
+        prot_reasons = ",".join(sorted(
+            str(r) for r in (metrics.get("protection_reasons", []) or [])))
+    except (TypeError, ValueError):
+        prot_reasons = ""
     return (str(status), liq, basis, ratio, orphan,
-            ",".join(degraded), str(expired))
+            ",".join(degraded), str(expired), prot, prot_reasons)
+
+
+def build_activation_check_record(
+    *,
+    plan_id: str,
+    symbol: str,
+    cutoff_ms: int,
+    known_at_ms: int,
+    checks: Mapping[str, Any],
+    source_refs: Mapping[str, Any] | None = None,
+    observation_id: str | None = None,
+    source_as_of_ms: int | None = None,
+) -> dict[str, Any]:
+    """Build an ACTIVATION_CHECK observation record (R08b/D12, pure).
+
+    The D12 activation re-check runs at a single cutoff over six items --
+    resolved identity/multiplier, current Mark vs native liquidation price,
+    exact-remaining two-way depth, shared Funding gate, actual-remaining
+    capital/risk/horizon economics, and protected_position_hash plus
+    confirmation expiry -- and persists the result as an ACTIVATION_CHECK
+    market observation for audit. This helper packs the six checks plus
+    source_refs into a save_market_observation-ready record
+    (kind=ACTIVATION_CHECK); it performs no DB/network/clock reads. Checks
+    must at least carry protected_position_hash (never invented).
+    """
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        raise MonitorError("plan_id must be a non-empty str")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise MonitorError("symbol must be a non-empty str")
+    if isinstance(cutoff_ms, bool) or not isinstance(cutoff_ms, int):
+        raise MonitorError("cutoff_ms must be an int")
+    if isinstance(known_at_ms, bool) or not isinstance(known_at_ms, int):
+        raise MonitorError("known_at_ms must be an int")
+    if cutoff_ms < 0 or known_at_ms < 0:
+        raise MonitorError("cutoff/known_at must be >= 0")
+    if not isinstance(checks, Mapping):
+        raise MonitorError("checks must be a mapping of the six re-check items")
+    checks_dict = dict(checks)
+    if "protected_position_hash" not in checks_dict:
+        alt = dict(source_refs or {}).get("protected_position_hash")
+        if isinstance(alt, str) and alt.strip():
+            checks_dict["protected_position_hash"] = alt.strip()
+        else:
+            raise MonitorError(
+                "checks must hold protected_position_hash (D06.3 binding)")
+    refs = dict(source_refs) if isinstance(source_refs, Mapping) else {}
+    src = source_as_of_ms
+    if src is None:
+        src = cutoff_ms
+    try:
+        src_int: int | None = int(src) if src is not None else None
+    except (TypeError, ValueError):
+        raise MonitorError("source_as_of_ms must be an int or None")
+    oid = observation_id
+    if not isinstance(oid, str) or not oid.strip():
+        oid = f"{symbol.strip()}:ACTIVATION_CHECK:{plan_id.strip()}:{int(cutoff_ms)}"
+    value: dict[str, Any] = {
+        "plan_id": plan_id.strip(),
+        "symbol": symbol.strip(),
+        "cutoff_ms": int(cutoff_ms),
+        "checks": checks_dict,
+        "source_refs": refs,
+    }
+    meta: dict[str, Any] = {
+        "status": "OK",
+        "source": "ACTIVATION_CHECK",
+        "source_schema_version": "observations-v1",
+        "source_as_of_ms": src_int,
+        "known_at_ms": int(known_at_ms),
+        "repair_schema_version": "repair-contract-v1",
+        "schema_version": "hedge-source-v1",
+    }
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False, allow_nan=False, default=str)
+    raw_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {
+        "observation_id": oid.strip(),
+        "symbol": symbol.strip(),
+        "kind": "ACTIVATION_CHECK",
+        "source_as_of_ms": src_int,
+        "known_at_ms": int(known_at_ms),
+        "value_json": value,
+        "meta_json": meta,
+        "raw_sha256": raw_sha,
+    }
 
 
 def should_persist(

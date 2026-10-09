@@ -436,6 +436,69 @@ def evaluate_alerts(
                            active=False, fresh=not feeds_failed,
                            context={"slippage_bps": slip_f}))
 
+    # -- protection confirmation state machine (R08b/D06.3/D12) ---------------
+    # FAIL (expired/hash/qty/cancelled) fires; PASS emits clear ticks so the
+    # manager can count the 2-tick recovery; missing protection emits
+    # stale (fresh=False) clears that never resolve. ACK never resolves --
+    # see AlertManager.apply/ack (OPEN+ACK stay in open_alerts).
+    prot_status = metrics.get("protection_status")
+    prot_reasons = list(metrics.get("protection_reasons", []) or [])
+    if isinstance(prot_status, str):
+        prot_status = prot_status.strip().upper()
+    else:
+        prot_status = None
+    if prot_status == "FAIL":
+        is_expired = any(str(r) == "PROTECTION_EXPIRED" for r in prot_reasons)
+        # Expired has a dedicated code; other FAILs share INVALID.
+        # Both are CRITICAL/REVIEW (human must re-confirm, not auto-exit).
+        if is_expired:
+            out.append(_change(plan_id, "PROTECTION_EXPIRED", "CRITICAL",
+                               "REVIEW", active=True,
+                               fresh=not feeds_failed,
+                               context={"protection_status": "FAIL",
+                                        "reasons": prot_reasons}))
+            out.append(_change(plan_id, "PROTECTION_INVALID", "CRITICAL",
+                               "REVIEW", active=False,
+                               fresh=not feeds_failed,
+                               context={"protection_status": "FAIL"}))
+        else:
+            out.append(_change(plan_id, "PROTECTION_INVALID", "CRITICAL",
+                               "REVIEW", active=True,
+                               fresh=not feeds_failed,
+                               context={"protection_status": "FAIL",
+                                        "reasons": prot_reasons}))
+            out.append(_change(plan_id, "PROTECTION_EXPIRED", "CRITICAL",
+                               "REVIEW", active=False,
+                               fresh=not feeds_failed,
+                               context={"protection_status": "FAIL"}))
+        out.append(_change(plan_id, "PROTECTION_UNKNOWN", "WARN",
+                           "REVIEW", active=False,
+                           fresh=not feeds_failed, context={}))
+    elif prot_status == "PASS":
+        for _code, _sev in (("PROTECTION_EXPIRED", "CRITICAL"),
+                            ("PROTECTION_INVALID", "CRITICAL"),
+                            ("PROTECTION_UNKNOWN", "WARN")):
+            out.append(_change(plan_id, _code, _sev, "REVIEW",
+                               active=False, fresh=True,
+                               context={"protection_status": "PASS"}))
+    elif prot_status == "UNKNOWN":
+        out.append(_change(plan_id, "PROTECTION_UNKNOWN", "WARN",
+                           "REVIEW", active=True, fresh=not feeds_failed,
+                           context={"protection_status": "UNKNOWN",
+                                    "reasons": prot_reasons}))
+        out.append(_change(plan_id, "PROTECTION_EXPIRED", "CRITICAL",
+                           "REVIEW", active=False, fresh=not feeds_failed,
+                           context={}))
+        out.append(_change(plan_id, "PROTECTION_INVALID", "CRITICAL",
+                           "REVIEW", active=False, fresh=not feeds_failed,
+                           context={}))
+    else:
+        # No protection bound (legacy snapshots): stale clears, never resolve.
+        for _code, _sev in (("PROTECTION_EXPIRED", "CRITICAL"),
+                            ("PROTECTION_INVALID", "CRITICAL"),
+                            ("PROTECTION_UNKNOWN", "WARN")):
+            out.append(_change(plan_id, _code, _sev, "REVIEW",
+                               active=False, fresh=False, context={}))
     # -- stale / degraded signals (never wipe positions) ----------------------
     if bool(metrics.get("futures_mark_stale", False)) or bool(
             metrics.get("spot_quote_stale", False)):
