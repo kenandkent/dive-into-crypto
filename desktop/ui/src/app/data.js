@@ -419,6 +419,11 @@ window.SGS_HEDGE_PLAN = {};         // planId → GET plans/{planId}
 window.SGS_HEDGE_MONITOR = {};      // planId → GET plans/{planId}/monitor
 window.SGS_HEDGE_ALERTS = null;     // GET /api/short/hedge/alerts page
 window.SGS_HEDGE_EVIDENCE = null;   // GET /api/short/hedge/evidence/summary (success only)
+window.SGS_HEDGE_DECISIONS = {};    // decisionId → GET /api/short/hedge/decisions/{id} (success only)
+window.SGS_HEDGE_DECISION_LAST = null; // last POST /api/short/hedge/decisions body (success only)
+window.SGS_HEDGE_EXIT_GUIDANCE = {}; // planId → GET /api/short/hedge/plans/{id}/exit-guidance (success only)
+window.SGS_HEDGE_PROTECTION = {};   // planId → POST /api/short/hedge/plans/{id}/protection (success only)
+window.SGS_SHORT_CAPABILITIES = null; // GET /api/short/capabilities body (success only)
 
 const HEDGE_FUNDING_QUERY_MAP = {
   minFcs: "min_fcs", min_fcs: "min_fcs",
@@ -775,17 +780,54 @@ const DIVE = {
     _notify();
     return res;
   },
-  async activateHedgePlan(planId, opts = {}) {
+  /* R12: (planId, body, opts) — body carries {expectedVersion} verbatim and
+     is never dropped. Legacy (planId, optsWithSignal) still sends {} so the
+     H09 regression (activate without body) keeps working; any object with an
+     expectedVersion/expected_version key is treated as body. */
+  _normalizePlanWriteArgs(body, opts) {
+    let payload = {};
+    let fetchOpts = {};
+    if (opts !== undefined) {
+      payload = body || {};
+      fetchOpts = opts || {};
+    } else if (body !== undefined && body !== null) {
+      if (typeof body === "object" && !Array.isArray(body) && ("signal" in body)
+        && !("expectedVersion" in body) && !("expected_version" in body)
+        && !("expectedPlanVersion" in body) && !("expected_plan_version" in body)) {
+        payload = {};
+        fetchOpts = body;
+      } else {
+        payload = body || {};
+        fetchOpts = {};
+      }
+    }
+    if (payload != null && typeof payload === "object" && !Array.isArray(payload)
+      && Object.keys(payload).length === 0 && fetchOpts && typeof fetchOpts === "object"
+      && (("expectedVersion" in fetchOpts) || ("expected_version" in fetchOpts)
+        || ("expectedPlanVersion" in fetchOpts) || ("expected_plan_version" in fetchOpts))) {
+      const tmp = { ...fetchOpts };
+      const sig = tmp.signal;
+      delete tmp.signal;
+      payload = tmp;
+      fetchOpts = sig ? { signal: sig } : {};
+    }
+    if (payload == null) payload = {};
+    if (fetchOpts == null) fetchOpts = {};
+    return { payload, fetchOpts };
+  },
+  async activateHedgePlan(planId, body, opts = {}) {
     const id = String(planId || "").trim();
     if (!id) throw new Error("activateHedgePlan: empty planId");
-    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/activate`, {}, opts);
+    const norm = DIVE._normalizePlanWriteArgs(body, opts);
+    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/activate`, norm.payload, norm.fetchOpts);
     _notify();
     return res;
   },
-  async closeHedgePlan(planId, opts = {}) {
+  async closeHedgePlan(planId, body, opts = {}) {
     const id = String(planId || "").trim();
     if (!id) throw new Error("closeHedgePlan: empty planId");
-    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/close`, {}, opts);
+    const norm = DIVE._normalizePlanWriteArgs(body, opts);
+    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/close`, norm.payload, norm.fetchOpts);
     _notify();
     return res;
   },
@@ -815,6 +857,58 @@ const DIVE = {
     const qs = _hedgeQuery(HEDGE_EVIDENCE_QUERY_MAP, filters);
     const res = await _shortGet(`/api/short/hedge/evidence/summary${qs ? "?" + qs : ""}`, opts);
     window.SGS_HEDGE_EVIDENCE = res;
+    _notify();
+    return res;
+  },
+  /* ── R12 repair adapters (D12/D18.3/R10a HTTP contract, offline-first) ──
+     Signatures are explicit: (body, opts) or (id, body, opts). Bodies pass
+     through verbatim (quantity decimal strings never Number-converted);
+     expectedVersion is never dropped. Globals populate ONLY on success. */
+  async hedgeDecisionCreate(body, opts = {}) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new Error("hedgeDecisionCreate: body must be an object");
+    }
+    const res = await _shortPost(`/api/short/hedge/decisions`, body, opts || {});
+    window.SGS_HEDGE_DECISION_LAST = res;
+    const did = res && (res.decisionId || res.decision_id || (res.decision && (res.decision.decisionId || res.decision.decision_id)));
+    if (did) window.SGS_HEDGE_DECISIONS[did] = res.decision || res;
+    _notify();
+    return res;
+  },
+  async hedgeDecisionGet(decisionId, opts = {}) {
+    const id = String(decisionId || "").trim();
+    if (!id) throw new Error("hedgeDecisionGet: empty decisionId");
+    const res = await _shortGet(`/api/short/hedge/decisions/${encodeURIComponent(id)}`, opts || {});
+    window.SGS_HEDGE_DECISIONS[id] = res;
+    _notify();
+    return res;
+  },
+  async hedgeExitGuidance(planId, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("hedgeExitGuidance: empty planId");
+    const res = await _shortGet(`/api/short/hedge/plans/${encodeURIComponent(id)}/exit-guidance`, opts || {});
+    window.SGS_HEDGE_EXIT_GUIDANCE[id] = res;
+    _notify();
+    return res;
+  },
+  async hedgeProtectionSave(planId, body, opts = {}) {
+    const id = String(planId || "").trim();
+    if (!id) throw new Error("hedgeProtectionSave: empty planId");
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new Error("hedgeProtectionSave: body must be an object");
+    }
+    const v = body.expectedVersion != null ? body.expectedVersion : body.expected_version;
+    if (!Number.isInteger(Number(v)) || Number(v) < 1) {
+      throw new Error("hedgeProtectionSave: missing expectedVersion (integer>=1)");
+    }
+    const res = await _shortPost(`/api/short/hedge/plans/${encodeURIComponent(id)}/protection`, body, opts || {});
+    window.SGS_HEDGE_PROTECTION[id] = res;
+    _notify();
+    return res;
+  },
+  async shortCapabilities(opts = {}) {
+    const res = await _shortGet(`/api/short/capabilities`, opts || {});
+    window.SGS_SHORT_CAPABILITIES = res;
     _notify();
     return res;
   },
