@@ -157,7 +157,7 @@ def test_packaged_call_sites_use_read_resource_text() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_spec_collects_all_migrations_including_real_005() -> None:
+def test_spec_collects_all_migrations_including_real_006() -> None:
     spec_path = BACKEND_DIR / "short-lab.spec"
     assert spec_path.is_file()
     spec = spec_path.read_text(encoding="utf-8")
@@ -181,6 +181,7 @@ def test_spec_collects_all_migrations_including_real_005() -> None:
         "003_catalyst.sql",
         "004_core_completion.sql",
         "005_hedge_advisor.sql",
+        "006_optimization_repair.sql",
     }, sql_literals
     for needle in (
         "engine/config",
@@ -191,6 +192,7 @@ def test_spec_collects_all_migrations_including_real_005() -> None:
         "003_catalyst.sql",
         "004_core_completion.sql",
         "005_hedge_advisor.sql",
+        "006_optimization_repair.sql",
         "shortlab/default.yaml",
         "ui/dist",
         "duckdb",
@@ -610,11 +612,13 @@ async def test_bootstrap_base_product_needs_no_hedge(tmp_path) -> None:
     )
 
     config = load_shortlab_config()
-    assert schema_target_for_config(config) == 4
+    # R01: unified target 6 (was base-4 split).
+    assert schema_target_for_config(config) == 6
     handle = await ShortLabRepository.open(tmp_path / "base.duckdb")
     try:
         assert await handle.migrate() == 4
-        # H01: the real 005 applies cleanly; base product works with hedge disabled.
+        # R01: 005 and the real 006 apply cleanly; base works hedge-disabled.
         assert await handle.migrate(target_version=5) == 5
+        assert await handle.migrate(target_version=6) == 6
     finally:
         await handle.close()

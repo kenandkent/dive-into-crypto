@@ -1,22 +1,27 @@
-"""Base retention sweep (F09, design A9.4).
+"""Base retention sweep (F09, design A9.4) + R01 pin extension (D13.2).
 
 ``async maintain(context) -> JobStatus`` is the F09 retention callback handed
 to F06b via ``service.register_retention_callback`` /
 ``service.register_maintain``. It only calls the F01-delivered
-``repository.maintain_retention(policy, now_ms, limit)`` — no new SQL, no
-new queries, no second DB connection. H01 later extends the same repository
-method with 005 pin protection; this callback stays unchanged.
+``repository.maintain_retention(policy, now_ms, limit)`` — no new queries,
+no second DB connection. H01 extends the same repository
+method with 005 pin protection; R01 extends it with 006 pin protection
+(market/FX/decision/entry/task + budget month GC, reference re-check in the
+same worker transaction). This callback signature stays unchanged.
 
-Semantics (base gate, schema 4):
+Semantics (base gate, schema 4; R01 adds 006 TTLs in the repository):
 
 - base snapshots keep at least ``snapshot_min_days`` (default 180d);
   the repository always retains the latest SUCCEEDED generation, any score
   referenced by a forward outcome and ``CONFLICT`` observations regardless
   of TTL;
+- R01: active plans and Evidence-referenced snapshots stay pinned; the
+  repository enforces BOOK 3d, MARK/TICKER 14d, OI/RULES 180d,
+  MARK_BAR_1H 365d, unreferenced Decision 30d, Entry/Task 365d, budget
+  month GC 180d; ledger/plans never auto-removed;
 - each call deletes at most ``batch_delete_limit`` rows clamped to 1..1000;
 - the sweep runs on the repository single-writer queue
-  (``PRIORITY_RETENTION`` with 30s aging), never ``VACUUM``-blocking the
-  service.
+  (``PRIORITY_RETENTION`` with 30s aging).
 """
 
 from __future__ import annotations
@@ -26,6 +31,16 @@ from typing import Any
 
 DAY_MS = 86_400_000
 MAX_BATCH_LIMIT = 1000
+
+# R01 pin/TTL reference (D13.2/D19.4, enforced inside the repository; the
+# callback below keeps its F09 signature and only forwards policy/limit).
+R01_BOOK_TTL_MS = 3 * DAY_MS
+R01_MARK_TTL_MS = 14 * DAY_MS
+R01_OI_TTL_MS = 180 * DAY_MS
+R01_MARK_BAR_TTL_MS = 365 * DAY_MS
+R01_DECISION_TTL_MS = 30 * DAY_MS
+R01_ENTRY_TTL_MS = 365 * DAY_MS
+R01_BUDGET_GC_DAYS = 180
 
 
 def retention_ttl_ms(config: Any) -> int:

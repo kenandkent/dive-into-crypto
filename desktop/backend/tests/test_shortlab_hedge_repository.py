@@ -368,7 +368,7 @@ def test_005_resource_manifest_contains_migration_via_resources_and_spec():
     sql = read_resource_text("shortlab/migrations/005_hedge_advisor.sql")
     for table in ELEVEN_TABLES:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql, table
-    # Spec collects exactly 001-005 (H01 change, F09 review; no placeholder).
+    # Spec collects exactly 001-006 (R01 change; no placeholder).
     import ast
     from pathlib import Path
     spec_path = Path(__file__).resolve().parent.parent / "short-lab.spec"
@@ -382,16 +382,17 @@ def test_005_resource_manifest_contains_migration_via_resources_and_spec():
     assert sql_literals == {
         "001_init.sql", "002_unlock_social.sql", "003_catalyst.sql",
         "004_core_completion.sql", "005_hedge_advisor.sql",
+        "006_optimization_repair.sql",
     }
 
 
-def test_hedge_enabled_schema_target_is_5_while_base_stays_4():
+def test_unified_schema_target_is_6():
     from diveintocrypto_desktop.shortlab.config import load_shortlab_config
     from diveintocrypto_desktop.shortlab.repository import schema_target_for_config
     base = load_shortlab_config()
-    assert schema_target_for_config(base) == 4
-    # Hedge-enabled config targets 5 (same helper, no second repository).
+    # R01: unified target 6 regardless of hedge switch (was 4/5 split).
+    assert schema_target_for_config(base) == 6
     import dataclasses
     hedge_on = dataclasses.replace(
         base, hedge=dataclasses.replace(base.hedge, enabled=True))
-    assert schema_target_for_config(hedge_on) == 5
+    assert schema_target_for_config(hedge_on) == 6

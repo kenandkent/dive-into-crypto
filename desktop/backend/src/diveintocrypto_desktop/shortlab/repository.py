@@ -38,8 +38,11 @@ the host process.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import concurrent.futures
 import dataclasses
+import datetime as _datetime
+import hashlib
 import json
 import time
 import uuid
@@ -57,7 +60,7 @@ try:  # DuckDB is a hard dependency (pyproject); keep module importable without 
 except Exception as _duckdb_import_error:  # pragma: no cover - import-time guard
     _duckdb = None  # type: ignore[assignment]
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA_MIGRATION = "001_init.sql"
 
 # Ordered forward-only migrations. The F01 base target is 4: a fresh database
@@ -65,13 +68,16 @@ SCHEMA_MIGRATION = "001_init.sql"
 # mean FULL is enabled). The Hedge target 5 lands with H01 (005_*): a
 # Hedge-enabled config migrates to 5 in one per-file transaction; a 005
 # failure rolls back to 4 and Hedge stays unavailable while 001-004 keep
-# serving (B28/B29).
+# serving (B28/B29). R01 adds 006 (D13 seven tables + eight indexes incl.
+# idx_sl_fcs_current); ShortLab-enabled configs target 6 in one per-file
+# transaction; a 006 failure rolls back to 5 and 001-005 keep serving.
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, "001_init.sql"),
     (2, "002_unlock_social.sql"),
     (3, "003_catalyst.sql"),
     (4, "004_core_completion.sql"),
     (5, "005_hedge_advisor.sql"),
+    (6, "006_optimization_repair.sql"),
 )
 
 # Single-writer priority worker (design A6.2/B28.8, plan F01.2/F01.3): one
@@ -98,26 +104,49 @@ def schema_target_for_config(config: Any) -> int:
     stay empty until their providers are enabled -- schema and provider
     capability are separate). A Hedge-enabled config targets 5, whose
     migration file lands with H01; requesting 5 on a pre-H01 build raises
-    `MigrationError` and Hedge reads/writes stay disabled.
+    `MigrationError` and Hedge reads/writes stay disabled. R01 (D13):
+    ShortLab-enabled configs target 6 (001-006 in order; 005 tables exist
+    empty even when Hedge is disabled -- schema and feature enablement stay
+    separate). Funding/Hedge switches still gate functionality, not schema.
     """
+    # R01 unified target: any ShortLab-enabled config migrates to 6.
+    try:
+        enabled = getattr(config, "enabled", None)
+        if enabled is not None:
+            if bool(enabled):
+                return 6
+    except Exception:
+        pass
     hedge = getattr(config, "hedge", None)
     try:
         if hedge is not None and bool(getattr(hedge, "enabled", False)):
-            return 5
+            return 6
     except Exception:
         pass
     providers = getattr(config, "providers", None) or {}
     try:
         items = dict(providers) if not isinstance(providers, dict) else providers
     except Exception:
-        return 4
+        # Providers unreadable but ShortLab may still be enabled via mapping;
+        # default to unified 6 when config looks ShortLab-shaped, else 4.
+        return 6
     try:
         entry = items.get("hedge")
         if entry is not None and bool(getattr(entry, "enabled", False)):
-            return 5
+            return 6
     except Exception:
         pass
-    return 4
+    # Default checkout (shortlab.enabled=true) targets 6; only an explicitly
+    # disabled ShortLab stays at base 4.
+    try:
+        if isinstance(config, Mapping):
+            shortlab_section = config.get("shortlab", config)
+            if isinstance(shortlab_section, Mapping):
+                if shortlab_section.get("enabled", True) is False:
+                    return 4
+    except Exception:
+        pass
+    return 6
 
 _JOB_TYPE_SCORE_REFRESH = "score_refresh"
 
@@ -164,6 +193,59 @@ _ALLOWED_DISPLAY_STATUS = frozenset({"EXCLUDED", "WATCH", "CANDIDATE", "READY", 
 _ALLOWED_CANDIDATE_SORTS = frozenset({"ltss", "entry_score", "data_quality"})
 
 _STATUS_RANK = {"READY": 0, "CANDIDATE": 1, "WATCH": 2, "PAUSED": 3, "BLOCKED": 4, "EXCLUDED": 5}
+
+# ---------------------------------------------------------------------------
+# R01 repair constants (D13/D18.2/D19.4): market kinds, cohorts, strategies,
+# quote-task states, per-kind retention TTLs. Amounts stay Decimal strings;
+# time is UTC ms. BUDGET_COUNTER lives in sl_market_observation (kind).
+# ---------------------------------------------------------------------------
+
+_R01_MARKET_KINDS = frozenset({
+    "TICKER", "MARK", "MARK_BAR_1H", "OI", "BOOK", "RULES",
+    "FUNDING_INFO", "ACTIVATION_CHECK", "EVENT_FX", "BUDGET_COUNTER",
+})
+
+_R01_COHORTS = frozenset({
+    "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY", "USER_DECISION",
+})
+
+_R01_STRATEGIES = frozenset({
+    "UNHEDGED_0", "ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50",
+    "RELATIVE_25", "SYSTEM_POLICY",
+})
+
+_R01_ENTRY_STATUS = frozenset({"ENTRY_COMPLETE", "UNEXECUTABLE", "UNAVAILABLE"})
+
+_R01_QUOTE_STATUS = frozenset({"PENDING", "RUNNING", "DEFERRED", "COMPLETE", "UNAVAILABLE"})
+
+_R01_QUOTE_TERMINAL = frozenset({"COMPLETE", "UNAVAILABLE"})
+
+_R01_OPPORTUNITY_SORTS = frozenset({"fcs", "funding30d", "breakEvenDays", "positiveRatio30d"})
+
+_R01_READINESS = frozenset({"READY", "NOT_READY", "BLOCKED"})
+
+_DAY_MS = 86_400_000
+
+# Per-kind market retention TTLs (D13.2): BOOK 3d, MARK/TICKER 14d,
+# OI/RULES/FUNDING_INFO/ACTIVATION_CHECK/EVENT_FX 180d, MARK_BAR_1H 365d.
+# BUDGET_COUNTER uses D19.4 month GC, not a flat TTL. FX observations 180d.
+_R01_MARKET_TTL_MS: dict[str, int] = {
+    "BOOK": 3 * _DAY_MS,
+    "MARK": 14 * _DAY_MS,
+    "TICKER": 14 * _DAY_MS,
+    "OI": 180 * _DAY_MS,
+    "RULES": 180 * _DAY_MS,
+    "FUNDING_INFO": 180 * _DAY_MS,
+    "ACTIVATION_CHECK": 180 * _DAY_MS,
+    "EVENT_FX": 180 * _DAY_MS,
+    "MARK_BAR_1H": 365 * _DAY_MS,
+}
+
+_R01_FX_TTL_MS = 180 * _DAY_MS
+_R01_DECISION_TTL_MS = 30 * _DAY_MS
+_R01_ENTRY_TTL_MS = 365 * _DAY_MS
+_R01_TASK_TTL_MS = 365 * _DAY_MS
+_R01_BUDGET_GC_DAYS = 180
 
 
 class RepositoryError(Exception):
@@ -883,10 +965,13 @@ class ShortLabRepository:
         """Apply pending migrations up to ``target_version`` (inclusive).
 
         The F01 default (``4``) brings a fresh database to the base schema
-        (004 core completion). Explicit lower targets still work for
-        staged upgrades (``migrate(1)``/``migrate(2)``/``migrate(3)``);
+        (004 core completion) for backward compatibility; R01 adds target 6
+        (006 optimization repair, D13). Explicit targets still work for
+        staged upgrades (``migrate(1)``/``migrate(5)``/``migrate(6)``);
         repeat calls are a no-op returning the current version; failures
-        raise :class:`MigrationError` and never exit the process.
+        raise :class:`MigrationError` and never exit the process. Each file
+        commits in a single transaction with its version row; a 006 failure
+        keeps version 5 with 001-005 serving.
         """
         return await self._run(self._migrate_sync, int(target_version))
 
@@ -2684,6 +2769,17 @@ class ShortLabRepository:
             # plans/FCS/outcomes/alerts never auto-deleted here.
             if hedge_tables_exist and hedge_valid and deleted < limit:
                 deleted = self._hedge_sweep_sync(con, now_ms, limit, deleted, pinned)
+            # R01 repair sweep: pin-first, same-txn reference re-check; BOOK 3d,
+            # MARK/TICKER 14d, OI/RULES/FUNDING_INFO/ACTIVATION/EVENT_FX 180d,
+            # MARK_BAR_1H 365d, FX 180d, unreferenced Decision 30d, Entry/Task
+            # 365d; ledger/plans/protections/schedules never auto-deleted.
+            # Invalid reference graphs already flagged above; R01 sweep runs
+            # only when the graph is valid to avoid deleting pinned rows.
+            if hedge_valid and deleted < limit:
+                try:
+                    deleted = self._r01_retention_sweep_sync(con, now_ms, limit, deleted, pinned)
+                except (HedgeReferenceInvalidError, ReferenceNotFoundError):
+                    errors = 1
             retained = 0
             for table in ("sl_funding_observation", "sl_data_cursor", "sl_score_snapshot"):
                 retained += con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
@@ -2697,6 +2793,15 @@ class ShortLabRepository:
                         retained += con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                     except Exception:
                         pass
+            # R01 tables contribute to retained (best-effort when 006 applied).
+            for table in ("sl_market_observation", "sl_funding_schedule",
+                          "sl_fx_observation", "sl_hedge_decision_snapshot",
+                          "sl_hedge_protection_confirmation",
+                          "sl_strategy_entry_snapshot", "sl_strategy_quote_task"):
+                try:
+                    retained += con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    pass
             con.execute("COMMIT")
         except Exception:
             try:
@@ -2709,13 +2814,20 @@ class ShortLabRepository:
         )
 
     def _hedge_pinned_sync(self, con: Any) -> set[tuple[str, str]]:
-        """Transitive pin set from plans/FCS/outcomes/unresolved-alert plans."""
+        """Transitive pin set from plans/FCS/outcomes/entries/unresolved-alerts.
+
+        R01 extends roots with STRATEGY_ENTRY evidence rows (D13.2): any
+        Evidence-referenced snapshot/FX/observation stays pinned long-term.
+        Reference integrity is checked before every retention delete in the
+        same worker transaction; rings/broken/unknown stop the sweep.
+        """
         # Collect roots.
         roots: list[tuple[str, str]] = []
         for table, col, rtype in (
             ("sl_hedge_plan", "plan_id", "PLAN"),
             ("sl_funding_capture_snapshot", "snapshot_id", "FCS"),
             ("sl_hedge_outcome", "outcome_id", "OUTCOME"),
+            ("sl_strategy_entry_snapshot", "entry_id", "STRATEGY_ENTRY"),
         ):
             try:
                 cur = con.execute(f"SELECT {col} FROM {table}")
@@ -2922,6 +3034,290 @@ class ShortLabRepository:
                 pass
         return deleted
 
+    def _r01_retention_sweep_sync(
+        self, con: Any, now_ms: int, limit: int, deleted: int,
+        pinned: set[tuple[str, str]],
+    ) -> int:
+        """R01 sweep: market/FX/decision/entry/task + budget GC (D13.2/D19.4).
+
+        Pin-first, same-transaction inbound re-check before every delete.
+        TTLs: BOOK 3d, MARK/TICKER 14d, OI/RULES/FUNDING_INFO/ACTIVATION/
+        EVENT_FX 180d, MARK_BAR_1H 365d, FX 180d, unreferenced Decision 30d,
+        Entry/Task 365d. Schedules/ledger/plans/protections never auto-deleted.
+        ledgers/plans are never touched here.
+        """
+        if not self._r01_table_exists(con, "sl_market_observation"):
+            return deleted
+        pinned_market = {rid for (rtype, rid) in pinned if rtype == "MARKET_OBSERVATION"}
+        pinned_fx = {rid for (rtype, rid) in pinned if rtype == "FX"}
+        pinned_dec = {rid for (rtype, rid) in pinned if rtype == "DECISION"}
+        # 1. Market observations per-kind TTL.
+        if deleted < limit:
+            try:
+                cur = con.execute(
+                    "SELECT observation_id, kind, known_at_ms FROM sl_market_observation "
+                    "WHERE kind != 'BUDGET_COUNTER' ORDER BY known_at_ms ASC LIMIT ?",
+                    [limit - deleted + 200],
+                )
+                for oid, kind, known_ms in cur.fetchall():
+                    if deleted >= limit:
+                        break
+                    oid_s = str(oid)
+                    if oid_s in pinned_market:
+                        continue
+                    ttl = _R01_MARKET_TTL_MS.get(str(kind))
+                    if ttl is None:
+                        continue
+                    try:
+                        if int(known_ms) >= int(now_ms) - int(ttl):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    # Same-txn inbound re-check.
+                    try:
+                        cur2 = con.execute(
+                            "SELECT count(*) FROM sl_hedge_snapshot_reference "
+                            "WHERE referenced_type = 'MARKET_OBSERVATION' AND referenced_id = ?",
+                            [oid_s],
+                        )
+                        if cur2.fetchone()[0] > 0:
+                            continue
+                    except Exception:
+                        pass
+                    con.execute(
+                        "DELETE FROM sl_market_observation WHERE observation_id = ?",
+                        [oid_s],
+                    )
+                    deleted += 1
+            except Exception:
+                pass
+        # 2. FX observations 180d.
+        if deleted < limit and self._r01_table_exists(con, "sl_fx_observation"):
+            try:
+                cur = con.execute(
+                    "SELECT fx_id, known_at_ms FROM sl_fx_observation "
+                    "ORDER BY known_at_ms ASC LIMIT ?",
+                    [limit - deleted + 100],
+                )
+                for fxid, known_ms in cur.fetchall():
+                    if deleted >= limit:
+                        break
+                    fxid_s = str(fxid)
+                    if fxid_s in pinned_fx:
+                        continue
+                    try:
+                        if int(known_ms) >= int(now_ms) - int(_R01_FX_TTL_MS):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        cur2 = con.execute(
+                            "SELECT count(*) FROM sl_hedge_snapshot_reference "
+                            "WHERE referenced_type = 'FX' AND referenced_id = ?",
+                            [fxid_s],
+                        )
+                        if cur2.fetchone()[0] > 0:
+                            continue
+                    except Exception:
+                        pass
+                    con.execute("DELETE FROM sl_fx_observation WHERE fx_id = ?", [fxid_s])
+                    deleted += 1
+            except Exception:
+                pass
+        # 3. Unreferenced decisions 30d (referenced decisions pinned long-term).
+        if deleted < limit and self._r01_table_exists(con, "sl_hedge_decision_snapshot"):
+            try:
+                cur = con.execute(
+                    "SELECT decision_id, generated_at_ms FROM sl_hedge_decision_snapshot "
+                    "ORDER BY generated_at_ms ASC LIMIT ?",
+                    [limit - deleted + 100],
+                )
+                for did, gen_ms in cur.fetchall():
+                    if deleted >= limit:
+                        break
+                    did_s = str(did)
+                    if did_s in pinned_dec:
+                        continue
+                    try:
+                        if int(gen_ms) >= int(now_ms) - int(_R01_DECISION_TTL_MS):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        cur2 = con.execute(
+                            "SELECT count(*) FROM sl_hedge_snapshot_reference "
+                            "WHERE referenced_type = 'DECISION' AND referenced_id = ?",
+                            [did_s],
+                        )
+                        if cur2.fetchone()[0] > 0:
+                            continue
+                        # Also pinned via direct strategy-entry outbound? Covered.
+                    except Exception:
+                        pass
+                    # Clean outbound edges (decision -> observations) then row.
+                    try:
+                        con.execute(
+                            "DELETE FROM sl_hedge_snapshot_reference WHERE "
+                            "referrer_type = 'DECISION' AND referrer_id = ?",
+                            [did_s],
+                        )
+                    except Exception:
+                        pass
+                    con.execute(
+                        "DELETE FROM sl_hedge_decision_snapshot WHERE decision_id = ?",
+                        [did_s],
+                    )
+                    deleted += 1
+            except Exception:
+                pass
+        # 4. Strategy entries 365d (referenced or young retained).
+        if deleted < limit and self._r01_table_exists(con, "sl_strategy_entry_snapshot"):
+            try:
+                cur = con.execute(
+                    "SELECT entry_id, decision_as_of_ms FROM sl_strategy_entry_snapshot "
+                    "ORDER BY decision_as_of_ms ASC LIMIT ?",
+                    [limit - deleted + 100],
+                )
+                for eid, asof in cur.fetchall():
+                    if deleted >= limit:
+                        break
+                    eid_s = str(eid)
+                    try:
+                        young = int(asof) >= int(now_ms) - int(_R01_ENTRY_TTL_MS)
+                    except (TypeError, ValueError):
+                        young = True
+                    if young:
+                        continue
+                    # Referenced entries (inbound from plans/decisions) retained.
+                    try:
+                        cur2 = con.execute(
+                            "SELECT count(*) FROM sl_hedge_snapshot_reference "
+                            "WHERE referenced_type = 'STRATEGY_ENTRY' AND referenced_id = ?",
+                            [eid_s],
+                        )
+                        if cur2.fetchone()[0] > 0:
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        con.execute(
+                            "DELETE FROM sl_hedge_snapshot_reference WHERE "
+                            "((referrer_type = 'STRATEGY_ENTRY' AND referrer_id = ?) OR "
+                            "(referenced_type = 'STRATEGY_ENTRY' AND referenced_id = ?))",
+                            [eid_s, eid_s],
+                        )
+                    except Exception:
+                        pass
+                    con.execute(
+                        "DELETE FROM sl_strategy_entry_snapshot WHERE entry_id = ?",
+                        [eid_s],
+                    )
+                    deleted += 1
+            except Exception:
+                pass
+        # 5. Quote tasks 365d terminal GC (PENDING/RUNNING/DEFERRED never auto-deleted
+        # here; RUNNING is recovered on startup, DEFERRED retried before deadline).
+        if deleted < limit and self._r01_table_exists(con, "sl_strategy_quote_task"):
+            try:
+                cur = con.execute(
+                    "SELECT task_id, updated_at_ms, status FROM sl_strategy_quote_task "
+                    "WHERE status IN ('COMPLETE', 'UNAVAILABLE') ORDER BY updated_at_ms ASC LIMIT ?",
+                    [limit - deleted + 100],
+                )
+                for tid, upd, _st in cur.fetchall():
+                    if deleted >= limit:
+                        break
+                    try:
+                        if int(upd) >= int(now_ms) - int(_R01_TASK_TTL_MS):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    con.execute(
+                        "DELETE FROM sl_strategy_quote_task WHERE task_id = ?",
+                        [str(tid)],
+                    )
+                    deleted += 1
+            except Exception:
+                pass
+        # 6. Budget month GC (D19.4): current month never; unrecovered RESERVED
+        # never; threshold max(month_end+180d, latest_recorded+180d); whole-month
+        # delete only when every request in the month is terminal.
+        if deleted < limit:
+            try:
+                deleted = self._r01_budget_gc_sync(con, now_ms, limit, deleted)
+            except Exception:
+                pass
+        return deleted
+
+    def _r01_budget_gc_sync(
+        self, con: Any, now_ms: int, limit: int, deleted: int
+    ) -> int:
+        cur_month = self._r01_utc_month_key(int(now_ms))
+        cur = con.execute(
+            "SELECT observation_id, value_json FROM sl_market_observation "
+            "WHERE kind = 'BUDGET_COUNTER'"
+        )
+        rows = cur.fetchall()
+        by_month: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for oid, vj in rows:
+            try:
+                v = json.loads(vj) if isinstance(vj, str) else vj
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(v, dict):
+                continue
+            prov = str(v.get("provider") or "")
+            mk = str(v.get("month_key") or "")
+            if not prov or not mk:
+                continue
+            by_month.setdefault((prov, mk), []).append({"oid": str(oid), "v": v})
+        for (prov, mk), items in sorted(by_month.items()):
+            if deleted >= limit:
+                break
+            if mk == cur_month:
+                continue
+            # Group per request -> latest.
+            by_req: dict[str, list[dict[str, Any]]] = {}
+            for it in items:
+                by_req.setdefault(str(it["v"].get("request_id")), []).append(it)
+            has_pending_reserved = False
+            latest_times: list[int] = []
+            for _rid, lst in by_req.items():
+                # Latest by (seq, recorded_at).
+                def _k(e: dict[str, Any]) -> tuple[int, int]:
+                    vv = e["v"]
+                    return (int(vv.get("transition_seq", 0)), int(vv.get("recorded_at_ms", 0)))
+                best = max(lst, key=_k)
+                st = str(best["v"].get("state"))
+                try:
+                    latest_times.append(int(best["v"].get("recorded_at_ms", 0)))
+                except (TypeError, ValueError):
+                    pass
+                if st == "RESERVED":
+                    has_pending_reserved = True
+                    break
+            if has_pending_reserved:
+                continue
+            try:
+                month_end = self._r01_month_end_ms(mk)
+            except ValidationError:
+                continue
+            latest_rec = max(latest_times) if latest_times else month_end
+            threshold = max(int(month_end) + int(_R01_BUDGET_GC_DAYS) * _DAY_MS,
+                            int(latest_rec) + int(_R01_BUDGET_GC_DAYS) * _DAY_MS)
+            if int(now_ms) < int(threshold):
+                continue
+            # Whole-month delete (re-check pending inside txn already done).
+            for it in items:
+                if deleted >= limit:
+                    break
+                con.execute(
+                    "DELETE FROM sl_market_observation WHERE observation_id = ?",
+                    [it["oid"]],
+                )
+                deleted += 1
+        return deleted
+
     # -- hedge (H01, design B28/B29) ---------------------------------------
     # All Hedge writes run on the same single-worker queue; ledger mutation
     # (`apply_hedge_event`) is one indivisible worker op (BEGIN→checks→
@@ -2932,7 +3328,8 @@ class ShortLabRepository:
 
     _HEDGE_REF_TYPES = frozenset(
         {"FCS", "SIMULATION", "PLAN", "OUTCOME", "VENUE_QUOTE", "IDENTITY",
-         "CONFIG", "VENUE_MAPPING", "CONTRACT_RULES", "FUNDING_OBSERVATION"}
+         "CONFIG", "VENUE_MAPPING", "CONTRACT_RULES", "FUNDING_OBSERVATION",
+         "DECISION", "STRATEGY_ENTRY", "MARKET_OBSERVATION", "FX", "PROTECTION"}
     )
     _HEDGE_PLAN_STATUS = frozenset(
         {"DRAFT", "READY", "PARTIALLY_FILLED", "ACTIVE", "CLOSING", "CLOSED", "INVALID"}
@@ -3023,8 +3420,15 @@ class ShortLabRepository:
                 [table],
             )
             if cur.fetchone()[0] == 0:
+                # R01: new tables need schema 6; old tables need schema 5.
+                need = 6 if table in (
+                    "sl_market_observation", "sl_funding_schedule",
+                    "sl_fx_observation", "sl_hedge_decision_snapshot",
+                    "sl_hedge_protection_confirmation",
+                    "sl_strategy_entry_snapshot", "sl_strategy_quote_task",
+                ) else 5
                 raise ReferenceNotFoundError(
-                    f"hedge table {table} is unavailable (migrate to schema 5)"
+                    f"hedge table {table} is unavailable (migrate to schema {need})"
                 )
 
     def _hedge_ref_exists_sync(self, con: Any, ref_type: str, ref_id: str) -> bool:
@@ -3057,6 +3461,36 @@ class ShortLabRepository:
         if ref_type == "FUNDING_OBSERVATION":
             return self._fetch_raw(con, "sl_funding_observation",
                                    "observation_id = ?", [ref_id]) is not None
+        if ref_type == "DECISION":
+            try:
+                return self._fetch_raw(con, "sl_hedge_decision_snapshot",
+                                       "decision_id = ?", [ref_id]) is not None
+            except Exception:
+                return False
+        if ref_type == "STRATEGY_ENTRY":
+            try:
+                return self._fetch_raw(con, "sl_strategy_entry_snapshot",
+                                       "entry_id = ?", [ref_id]) is not None
+            except Exception:
+                return False
+        if ref_type == "MARKET_OBSERVATION":
+            try:
+                return self._fetch_raw(con, "sl_market_observation",
+                                       "observation_id = ?", [ref_id]) is not None
+            except Exception:
+                return False
+        if ref_type == "FX":
+            try:
+                return self._fetch_raw(con, "sl_fx_observation",
+                                       "fx_id = ?", [ref_id]) is not None
+            except Exception:
+                return False
+        if ref_type == "PROTECTION":
+            try:
+                return self._fetch_raw(con, "sl_hedge_protection_confirmation",
+                                       "confirmation_id = ?", [ref_id]) is not None
+            except Exception:
+                return False
         raise HedgeReferenceInvalidError(
             f"RETENTION_REFERENCE_INVALID: unknown reference type {ref_type!r}"
         )
@@ -4422,6 +4856,1519 @@ class ShortLabRepository:
         )
         return tuple(self._rows_to_dicts(cur))
 
+    # -- R01 market observations (D13/D18.2) ----------------------------------
+    # Records are D03 JSON mappings; saves return str IDs. Failures raise
+    # ValidationError / LocalWriteBusyError. All queries enforce known-time
+    # cutoffs in the repository (no consumer-side full scans).
+
+    @staticmethod
+    def _r01_table_exists(con: Any, table: str) -> bool:
+        try:
+            cur = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table],
+            )
+            return cur.fetchone()[0] == 1
+        except Exception:
+            return False
+
+    @staticmethod
+    def _r01_require_r01_tables(con: Any, tables: Sequence[str]) -> None:
+        for table in tables:
+            cur = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table],
+            )
+            if cur.fetchone()[0] == 0:
+                raise ReferenceNotFoundError(
+                    f"R01 table {table} is unavailable (migrate to schema 6)"
+                )
+
+    @staticmethod
+    def _r01_utc_month_key(ms: int) -> str:
+        dt = _datetime.datetime.fromtimestamp(ms / 1000.0, tz=_datetime.timezone.utc)
+        return f"{dt.year:04d}-{dt.month:02d}"
+
+    @staticmethod
+    def _r01_month_end_ms(month_key: str) -> int:
+        try:
+            year_s, mon_s = month_key.split("-")
+            year, mon = int(year_s), int(mon_s)
+        except Exception as exc:
+            raise ValidationError(f"month_key={month_key!r} must be YYYY-MM") from exc
+        if not 1 <= mon <= 12:
+            raise ValidationError(f"month_key={month_key!r} must be YYYY-MM")
+        last_day = calendar.monthrange(year, mon)[1]
+        dt = _datetime.datetime(
+            year, mon, last_day, 23, 59, 59, 999000, tzinfo=_datetime.timezone.utc
+        )
+        return int(dt.timestamp() * 1000)
+
+    @staticmethod
+    def _r01_validate_month_key(month_key: str) -> str:
+        if not isinstance(month_key, str):
+            raise ValidationError("month_key must be YYYY-MM")
+        parts = month_key.split("-")
+        if len(parts) != 2 or len(parts[0]) != 4 or len(parts[1]) != 2:
+            raise ValidationError(f"month_key={month_key!r} must be YYYY-MM")
+        try:
+            y, m = int(parts[0]), int(parts[1])
+        except ValueError as exc:
+            raise ValidationError(f"month_key={month_key!r} must be YYYY-MM") from exc
+        if not 1 <= m <= 12:
+            raise ValidationError(f"month_key={month_key!r} must be YYYY-MM")
+        _ = y
+        return month_key
+
+    async def save_market_observation(self, record: Mapping[str, Any]) -> str:
+        return await self._run(self._save_market_observation_sync, dict(record))
+
+    def _save_market_observation_sync(self, record: dict[str, Any]) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("market observation record must be a mapping")
+        data = dict(record)
+        for key in ("observation_id", "symbol", "kind", "known_at_ms",
+                    "value_json", "meta_json"):
+            if key not in data:
+                raise ValidationError(f"market observation misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "observation_id", "symbol", "kind", "source_as_of_ms",
+            "known_at_ms", "value_json", "meta_json", "raw_sha256",
+        })
+        if unknown:
+            raise ValidationError(f"market observation has unknown fields: {unknown}")
+        oid = data["observation_id"]
+        sym = data["symbol"]
+        kind = data["kind"]
+        if not isinstance(oid, str) or not oid:
+            raise ValidationError("observation_id must be a non-empty str")
+        if not isinstance(sym, str) or not sym:
+            raise ValidationError("symbol must be a non-empty str")
+        if kind not in _R01_MARKET_KINDS:
+            raise ValidationError(f"kind={kind!r} must be one of {sorted(_R01_MARKET_KINDS)}")
+        known = _require_int(data["known_at_ms"], name="known_at_ms")
+        src = data.get("source_as_of_ms")
+        if src is not None:
+            src = _require_int(src, name="source_as_of_ms")
+        value_text = self._hedge_json_text(data["value_json"], name="value_json")
+        meta_text = self._hedge_json_text(data["meta_json"], name="meta_json")
+        # EVENT_FX values must carry event_id + FX mapping (D18.1).
+        if kind == "EVENT_FX":
+            try:
+                parsed_v = json.loads(value_text)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(f"value_json is not valid JSON: {exc}") from exc
+            if not isinstance(parsed_v, Mapping) or not parsed_v.get("event_id"):
+                raise ValidationError("EVENT_FX value_json must hold event_id + FX mapping")
+        raw_sha = data.get("raw_sha256")
+        if raw_sha is None:
+            raw_sha = hashlib.sha256(value_text.encode("utf-8")).hexdigest()
+        if not isinstance(raw_sha, str) or not raw_sha:
+            raise ValidationError("raw_sha256 must be a non-empty str")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_market_observation",))
+        raw = {
+            "observation_id": oid,
+            "symbol": sym,
+            "kind": kind,
+            "source_as_of_ms": src,
+            "known_at_ms": known,
+            "value_json": value_text,
+            "meta_json": meta_text,
+            "raw_sha256": raw_sha,
+        }
+        self._insert_immutable(
+            con, "sl_market_observation", "observation_id = ?", [oid], raw
+        )
+        return oid
+
+    async def get_market_observation(self, id: str) -> Mapping[str, Any] | None:
+        return await self._run(self._get_market_observation_sync, id)
+
+    def _get_market_observation_sync(self, oid: str) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_market_observation"):
+            return None
+        raw = self._fetch_raw(con, "sl_market_observation", "observation_id = ?", [oid])
+        if raw is None:
+            return None
+        out = dict(raw)
+        for key in ("value_json", "meta_json"):
+            try:
+                out[key] = json.loads(out[key]) if isinstance(out[key], str) else out[key]
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    async def list_market_observations(
+        self, symbol: str, kind: str, start_ms: int,
+        end_ms: int, known_by_ms: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        return await self._run(
+            self._list_market_observations_sync, symbol, kind,
+            _require_int(start_ms, name="start_ms"),
+            _require_int(end_ms, name="end_ms"),
+            _require_int(known_by_ms, name="known_by_ms"),
+        )
+
+    def _list_market_observations_sync(
+        self, symbol: str, kind: str, start_ms: int, end_ms: int, known_by_ms: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(symbol, str) or not symbol:
+            raise ValidationError("symbol must be a non-empty str")
+        if kind not in _R01_MARKET_KINDS:
+            raise ValidationError(f"kind={kind!r} must be one of {sorted(_R01_MARKET_KINDS)}")
+        if start_ms > end_ms:
+            raise ValidationError("start_ms must be <= end_ms")
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_market_observation"):
+            return ()
+        cur = con.execute(
+            "SELECT * FROM sl_market_observation WHERE symbol = ? AND kind = ? "
+            "AND known_at_ms <= ? AND source_as_of_ms IS NOT NULL "
+            "AND source_as_of_ms >= ? AND source_as_of_ms <= ? "
+            "ORDER BY source_as_of_ms ASC, known_at_ms ASC, observation_id ASC",
+            [symbol, kind, known_by_ms, start_ms, end_ms],
+        )
+        rows = self._rows_to_dicts(cur)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            for key in ("value_json", "meta_json"):
+                try:
+                    d[key] = json.loads(d[key]) if isinstance(d[key], str) else d[key]
+                except (TypeError, ValueError):
+                    pass
+            out.append(d)
+        return tuple(out)
+
+    async def list_funding_observations(
+        self, symbol: str, start_ms: int, end_ms: int, known_by_ms: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        return await self._run(
+            self._list_funding_observations_sync, symbol,
+            _require_int(start_ms, name="start_ms"),
+            _require_int(end_ms, name="end_ms"),
+            _require_int(known_by_ms, name="known_by_ms"),
+        )
+
+    def _list_funding_observations_sync(
+        self, symbol: str, start_ms: int, end_ms: int, known_by_ms: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        # D05.1: old sl_funding_observation archive; per event time select the
+        # latest receipt known no later than known_by (point-in-time, no future).
+        if not isinstance(symbol, str) or not symbol:
+            raise ValidationError("symbol must be a non-empty str")
+        if start_ms > end_ms:
+            raise ValidationError("start_ms must be <= end_ms")
+        con = self._require_con()
+        cur = con.execute(
+            "SELECT * FROM sl_funding_observation WHERE symbol = ? "
+            "AND funding_time_ms >= ? AND funding_time_ms <= ? "
+            "AND known_at_ms <= ? "
+            "ORDER BY funding_time_ms ASC, known_at_ms ASC",
+            [symbol, start_ms, end_ms, known_by_ms],
+        )
+        best: dict[int, dict[str, Any]] = {}
+        for row in self._rows_to_dicts(cur):
+            best[int(row["funding_time_ms"])] = row
+        ordered = [best[k] for k in sorted(best)]
+        out: list[dict[str, Any]] = []
+        for row in ordered:
+            d = dict(row)
+            try:
+                raw = d.get("raw_json")
+                d["raw_json"] = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                pass
+            out.append(d)
+        return tuple(out)
+
+    # -- R01 funding schedules + FX observations (D05.1/D18.2) -----------------
+    async def save_funding_schedule(self, record: Mapping[str, Any]) -> str:
+        return await self._run(self._save_funding_schedule_sync, dict(record))
+
+    def _save_funding_schedule_sync(self, record: dict[str, Any]) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("funding schedule record must be a mapping")
+        data = dict(record)
+        for key in ("schedule_id", "symbol", "effective_from_ms",
+                    "known_at_ms", "schedule_json"):
+            if key not in data:
+                raise ValidationError(f"funding schedule misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "schedule_id", "symbol", "effective_from_ms", "effective_to_ms",
+            "known_at_ms", "schedule_json",
+        })
+        if unknown:
+            raise ValidationError(f"funding schedule has unknown fields: {unknown}")
+        sid = data["schedule_id"]
+        sym = data["symbol"]
+        if not isinstance(sid, str) or not sid:
+            raise ValidationError("schedule_id must be a non-empty str")
+        if not isinstance(sym, str) or not sym:
+            raise ValidationError("symbol must be a non-empty str")
+        eff_from = _require_int(data["effective_from_ms"], name="effective_from_ms")
+        eff_to = data.get("effective_to_ms")
+        if eff_to is not None:
+            eff_to = _require_int(eff_to, name="effective_to_ms")
+            if eff_to <= eff_from:
+                raise ValidationError("effective_to_ms must be > effective_from_ms")
+        known = _require_int(data["known_at_ms"], name="known_at_ms")
+        sched_text = self._hedge_json_text(data["schedule_json"], name="schedule_json")
+        try:
+            parsed_sched = json.loads(sched_text)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"schedule_json is not valid JSON: {exc}") from exc
+        if isinstance(parsed_sched, Mapping):
+            iv = parsed_sched.get("interval_hours")
+            if iv is not None:
+                if isinstance(iv, bool) or not isinstance(iv, int) or iv <= 0:
+                    raise ValidationError("schedule interval_hours must be int > 0")
+            ver = parsed_sched.get("verification")
+            if ver is not None and ver not in ("CONFIRMED", "INFERRED", "UNKNOWN"):
+                raise ValidationError(f"verification={ver!r} unknown")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_funding_schedule",))
+        raw = {
+            "schedule_id": sid,
+            "symbol": sym,
+            "effective_from_ms": eff_from,
+            "effective_to_ms": eff_to,
+            "known_at_ms": known,
+            "schedule_json": sched_text,
+        }
+        self._insert_immutable(
+            con, "sl_funding_schedule", "schedule_id = ?", [sid], raw
+        )
+        return sid
+
+    async def list_funding_schedules(
+        self, symbol: str, known_by_ms: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        return await self._run(
+            self._list_funding_schedules_sync, symbol,
+            _require_int(known_by_ms, name="known_by_ms"),
+        )
+
+    def _list_funding_schedules_sync(
+        self, symbol: str, known_by_ms: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(symbol, str) or not symbol:
+            raise ValidationError("symbol must be a non-empty str")
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_funding_schedule"):
+            return ()
+        cur = con.execute(
+            "SELECT * FROM sl_funding_schedule WHERE symbol = ? "
+            "AND known_at_ms <= ? "
+            "ORDER BY effective_from_ms ASC, known_at_ms ASC, schedule_id ASC",
+            [symbol, known_by_ms],
+        )
+        out: list[dict[str, Any]] = []
+        for row in self._rows_to_dicts(cur):
+            d = dict(row)
+            try:
+                d["schedule_json"] = json.loads(d["schedule_json"]) if isinstance(d["schedule_json"], str) else d["schedule_json"]
+            except (TypeError, ValueError):
+                pass
+            out.append(d)
+        return tuple(out)
+
+    async def save_fx_observation(self, record: Mapping[str, Any]) -> str:
+        return await self._run(self._save_fx_observation_sync, dict(record))
+
+    def _save_fx_observation_sync(self, record: dict[str, Any]) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("fx observation record must be a mapping")
+        data = dict(record)
+        for key in ("fx_id", "currency", "source_as_of_ms", "known_at_ms", "rate_str"):
+            if key not in data:
+                raise ValidationError(f"fx observation misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "fx_id", "currency", "source_as_of_ms", "known_at_ms",
+            "rate_str", "source_json",
+        })
+        if unknown:
+            raise ValidationError(f"fx observation has unknown fields: {unknown}")
+        fxid = data["fx_id"]
+        cur_ = data["currency"]
+        if not isinstance(fxid, str) or not fxid:
+            raise ValidationError("fx_id must be a non-empty str")
+        if not isinstance(cur_, str) or not cur_:
+            raise ValidationError("currency must be a non-empty str")
+        src = _require_int(data["source_as_of_ms"], name="source_as_of_ms")
+        known = _require_int(data["known_at_ms"], name="known_at_ms")
+        rate = data["rate_str"]
+        parsed_rate = self._hedge_parse_decimal("rate_str", rate)
+        if parsed_rate <= 0:
+            raise ValidationError("rate_str must be > 0")
+        src_json = data.get("source_json", {})
+        src_text = self._hedge_json_text(src_json, name="source_json")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_fx_observation",))
+        raw = {
+            "fx_id": fxid,
+            "currency": cur_,
+            "source_as_of_ms": src,
+            "known_at_ms": known,
+            "rate_str": str(parsed_rate),
+            "source_json": src_text,
+        }
+        self._insert_immutable(con, "sl_fx_observation", "fx_id = ?", [fxid], raw)
+        return fxid
+
+    async def get_fx_at(
+        self, currency: str, event_ms: int, known_by_ms: int,
+        max_age_ms: int = 60000,
+    ) -> Mapping[str, Any] | None:
+        return await self._run(
+            self._get_fx_at_sync, currency,
+            _require_int(event_ms, name="event_ms"),
+            _require_int(known_by_ms, name="known_by_ms"),
+            int(max_age_ms),
+        )
+
+    def _get_fx_at_sync(
+        self, currency: str, event_ms: int, known_by_ms: int, max_age_ms: int
+    ) -> Mapping[str, Any] | None:
+        if not isinstance(currency, str) or not currency:
+            raise ValidationError("currency must be a non-empty str")
+        if isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int) or max_age_ms < 0:
+            raise ValidationError("max_age_ms must be a non-negative int")
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_fx_observation"):
+            return None
+        low = event_ms - max_age_ms
+        cur = con.execute(
+            "SELECT * FROM sl_fx_observation WHERE currency = ? "
+            "AND source_as_of_ms <= ? AND source_as_of_ms >= ? "
+            "AND known_at_ms <= ? "
+            "ORDER BY source_as_of_ms DESC, known_at_ms DESC, fx_id ASC LIMIT 1",
+            [currency, event_ms, low, known_by_ms],
+        )
+        rows = self._rows_to_dicts(cur)
+        if not rows:
+            return None
+        d = dict(rows[0])
+        try:
+            d["source_json"] = json.loads(d["source_json"]) if isinstance(d["source_json"], str) else d["source_json"]
+        except (TypeError, ValueError):
+            pass
+        return d
+
+    # -- R01 hedge decisions + protection confirmations (D12/D18.2) ------------
+    async def save_hedge_decision(
+        self, record: Mapping[str, Any], references: tuple[Mapping[str, Any], ...]
+    ) -> str:
+        return await self._run(
+            self._save_hedge_decision_sync, dict(record), list(references or ())
+        )
+
+    def _save_hedge_decision_sync(
+        self, record: dict[str, Any], references: list[Any]
+    ) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("hedge decision record must be a mapping")
+        data = dict(record)
+        for key in ("decision_id", "symbol", "generated_at_ms", "expires_at_ms",
+                    "decision_policy_hash", "decision_json"):
+            if key not in data:
+                raise ValidationError(f"hedge decision misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "decision_id", "symbol", "generated_at_ms", "expires_at_ms",
+            "decision_policy_hash", "decision_json",
+        })
+        if unknown:
+            raise ValidationError(f"hedge decision has unknown fields: {unknown}")
+        did = data["decision_id"]
+        sym = data["symbol"]
+        if not isinstance(did, str) or not did:
+            raise ValidationError("decision_id must be a non-empty str")
+        if not isinstance(sym, str) or not sym:
+            raise ValidationError("symbol must be a non-empty str")
+        gen = _require_int(data["generated_at_ms"], name="generated_at_ms")
+        exp = _require_int(data["expires_at_ms"], name="expires_at_ms")
+        if exp <= gen:
+            raise ValidationError("expires_at_ms must be > generated_at_ms")
+        pol = data["decision_policy_hash"]
+        if not isinstance(pol, str) or not pol:
+            raise ValidationError("decision_policy_hash must be a non-empty str")
+        dec_text = self._hedge_json_text(data["decision_json"], name="decision_json")
+        try:
+            parsed_dec = json.loads(dec_text)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"decision_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed_dec, Mapping):
+            raise ValidationError("decision_json must hold a JSON object")
+        if parsed_dec.get("request") is None:
+            raise ValidationError("decision_json.request must not be omitted")
+        has_refs = any(
+            parsed_dec.get(k) is not None
+            for k in ("source_refs", "context_refs", "contextRefs", "sourceRefs")
+        )
+        if not has_refs:
+            # Accept nested DecisionResult with context_refs inside `request`?
+            # Strict: top-level source/context refs required (D18.2).
+            raise ValidationError("decision_json source/context refs must not be omitted")
+        # Symbol coherence: request.symbol should match record symbol when present.
+        try:
+            req = parsed_dec.get("request")
+            if isinstance(req, Mapping) and isinstance(req.get("symbol"), str):
+                if req["symbol"] != sym:
+                    raise ValidationError("decision symbol must match request.symbol")
+        except ValidationError:
+            raise
+        except Exception:
+            pass
+        con = self._require_con()
+        self._r01_require_r01_tables(
+            con, ("sl_hedge_decision_snapshot", "sl_hedge_snapshot_reference")
+        )
+        raw = {
+            "decision_id": did,
+            "symbol": sym,
+            "generated_at_ms": gen,
+            "expires_at_ms": exp,
+            "decision_policy_hash": pol,
+            "decision_json": dec_text,
+        }
+        con.execute("BEGIN TRANSACTION")
+        try:
+            self._insert_immutable(
+                con, "sl_hedge_decision_snapshot", "decision_id = ?", [did], raw
+            )
+            if references:
+                self._hedge_insert_refs_sync(con, "DECISION", did, references, gen)
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return did
+
+    async def get_hedge_decision(self, id: str) -> Mapping[str, Any] | None:
+        return await self._run(self._get_hedge_decision_sync, id)
+
+    def _get_hedge_decision_sync(self, did: str) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_hedge_decision_snapshot"):
+            return None
+        raw = self._fetch_raw(con, "sl_hedge_decision_snapshot", "decision_id = ?", [did])
+        if raw is None:
+            return None
+        out = dict(raw)
+        try:
+            out["decision_json"] = json.loads(out["decision_json"]) if isinstance(out["decision_json"], str) else out["decision_json"]
+        except (TypeError, ValueError):
+            pass
+        return out
+
+    async def save_protection_confirmation(
+        self, plan_id: str, expected_version: int, record: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        return await self._run(
+            self._save_protection_confirmation_sync, plan_id, expected_version,
+            dict(record), priority=PRIORITY_CRITICAL,
+        )
+
+    def _save_protection_confirmation_sync(
+        self, plan_id: str, expected_version: int, record: dict[str, Any]
+    ) -> Mapping[str, Any]:
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValidationError("plan_id must be a non-empty str")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("expected_version must be an int >= 1")
+        if not isinstance(record, Mapping):
+            raise ValidationError("protection record must be a mapping")
+        data = dict(record)
+        for key in ("client_request_id", "confirmed_at_ms", "expires_at_ms",
+                    "confirmation_json"):
+            if key not in data:
+                raise ValidationError(f"protection record misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "confirmation_id", "client_request_id", "confirmed_at_ms",
+            "expires_at_ms", "confirmation_json",
+        })
+        if unknown:
+            raise ValidationError(f"protection record has unknown fields: {unknown}")
+        client_id = data["client_request_id"]
+        if not isinstance(client_id, str) or not client_id:
+            raise ValidationError("client_request_id must be a non-empty str")
+        confirmed = _require_int(data["confirmed_at_ms"], name="confirmed_at_ms")
+        expires = _require_int(data["expires_at_ms"], name="expires_at_ms")
+        if expires <= confirmed:
+            raise ValidationError("expires_at_ms must be > confirmed_at_ms")
+        conf_text = self._hedge_json_text(data["confirmation_json"], name="confirmation_json")
+        try:
+            parsed_conf = json.loads(conf_text)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"confirmation_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed_conf, Mapping):
+            raise ValidationError("confirmation_json must hold a JSON object")
+        conf_id = data.get("confirmation_id") or f"{plan_id}#{client_id}"
+        if not isinstance(conf_id, str) or not conf_id:
+            raise ValidationError("confirmation_id must be a non-empty str")
+        # protected_position_hash: CAS validity uses the hash, not the version
+        # (D06.3/D13.2). Preserve caller hash; compute deterministically when absent.
+        if not isinstance(parsed_conf, dict):
+            parsed_conf = dict(parsed_conf)
+        else:
+            parsed_conf = dict(parsed_conf)
+        if not parsed_conf.get("protected_position_hash"):
+            h = hashlib.sha256(_canonical_json(parsed_conf).encode("utf-8")).hexdigest()
+            parsed_conf["protected_position_hash"] = h
+        if not parsed_conf.get("schema_version"):
+            parsed_conf["schema_version"] = "repair-contract-v1"
+        parsed_conf["resulting_plan_version"] = int(expected_version) + 1
+        parsed_conf["confirmation_id"] = conf_id
+        conf_text = _canonical_json(parsed_conf)
+        con = self._require_con()
+        self._hedge_require_tables(con, ("sl_hedge_plan",))
+        self._r01_require_r01_tables(
+            con, ("sl_hedge_protection_confirmation", "sl_hedge_snapshot_reference")
+        )
+        con.execute("BEGIN TRANSACTION")
+        try:
+            # Idempotency first: same (plan_id, client_request_id).
+            dup = self._fetch_raw(
+                con, "sl_hedge_protection_confirmation",
+                "plan_id = ? AND client_request_id = ?", [plan_id, client_id],
+            )
+            if dup is not None:
+                if dup["confirmation_json"] == conf_text:
+                    plan = self._fetch_raw(con, "sl_hedge_plan", "plan_id = ?", [plan_id])
+                    out = dict(dup)
+                    try:
+                        out["confirmation_json"] = json.loads(out["confirmation_json"])
+                    except (TypeError, ValueError):
+                        pass
+                    if plan is not None:
+                        out["resulting_plan_version"] = int(plan["plan_version"])
+                    try:
+                        con.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    return out
+                raise HedgeIdempotencyError(
+                    "HEDGE_IDEMPOTENCY_MISMATCH: client_request_id reuses a "
+                    "different protection payload"
+                )
+            plan = self._fetch_raw(con, "sl_hedge_plan", "plan_id = ?", [plan_id])
+            if plan is None:
+                raise ReferenceNotFoundError(f"plan {plan_id!r} not found")
+            if int(plan["plan_version"]) != int(expected_version):
+                raise HedgeVersionConflictError("HEDGE_VERSION_CONFLICT")
+            cur = con.execute(
+                "UPDATE sl_hedge_plan SET plan_version = plan_version + 1, "
+                "updated_at_ms = ? WHERE plan_id = ? AND plan_version = ?",
+                [confirmed, plan_id, int(expected_version)],
+            )
+            changed = cur.rowcount if getattr(cur, "rowcount", None) not in (None, -1) else None
+            if changed is None:
+                row = self._fetch_raw(con, "sl_hedge_plan", "plan_id = ?", [plan_id])
+                if row is None or int(row["plan_version"]) != int(expected_version) + 1:
+                    raise HedgeVersionConflictError("HEDGE_VERSION_CONFLICT")
+            elif changed != 1:
+                raise HedgeVersionConflictError("HEDGE_VERSION_CONFLICT")
+            con.execute(
+                "INSERT INTO sl_hedge_protection_confirmation (confirmation_id, plan_id, "
+                "plan_version, client_request_id, confirmed_at_ms, expires_at_ms, "
+                "confirmation_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [conf_id, plan_id, int(expected_version) + 1, client_id,
+                 confirmed, expires, conf_text],
+            )
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        out = {
+            "confirmation_id": conf_id,
+            "plan_id": plan_id,
+            "plan_version": int(expected_version) + 1,
+            "client_request_id": client_id,
+            "confirmed_at_ms": confirmed,
+            "expires_at_ms": expires,
+            "confirmation_json": parsed_conf,
+            "resulting_plan_version": int(expected_version) + 1,
+        }
+        return out
+
+    async def get_protection_confirmation(
+        self, plan_id: str
+    ) -> Mapping[str, Any] | None:
+        return await self._run(self._get_protection_confirmation_sync, plan_id)
+
+    def _get_protection_confirmation_sync(
+        self, plan_id: str
+    ) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_hedge_protection_confirmation"):
+            return None
+        cur = con.execute(
+            "SELECT * FROM sl_hedge_protection_confirmation WHERE plan_id = ? "
+            "ORDER BY plan_version DESC, confirmed_at_ms DESC LIMIT 1",
+            [plan_id],
+        )
+        rows = self._rows_to_dicts(cur)
+        if not rows:
+            return None
+        out = dict(rows[0])
+        try:
+            out["confirmation_json"] = json.loads(out["confirmation_json"]) if isinstance(out["confirmation_json"], str) else out["confirmation_json"]
+        except (TypeError, ValueError):
+            pass
+        return out
+
+    # -- R01 monthly budget atomics (D19.4, BUDGET_COUNTER) --------------------
+    # BUDGET_COUNTER rows live in sl_market_observation (kind). value_json:
+    # provider/month_key/request_id/state/limit_snapshot/transition_seq/
+    # recorded_at_ms. RESERVED seq1; SENT/CANCELLED seq2; new Observation per
+    # transition, same-ms winner by seq; terminal states never interconvert.
+    # Counting/comparison/insertion share one single-worker transaction.
+
+    def _budget_all_for_month_sync(
+        self, con: Any, provider: str, month_key: str
+    ) -> list[dict[str, Any]]:
+        cur = con.execute(
+            "SELECT * FROM sl_market_observation WHERE symbol = ? AND kind = 'BUDGET_COUNTER'",
+            [provider],
+        )
+        out: list[dict[str, Any]] = []
+        for row in self._rows_to_dicts(cur):
+            try:
+                val = json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"]
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(val, dict):
+                continue
+            if val.get("month_key") != month_key:
+                continue
+            if val.get("provider") != provider:
+                continue
+            out.append({"row": row, "value": val})
+        return out
+
+    def _budget_find_request_sync(
+        self, con: Any, request_id: str
+    ) -> list[dict[str, Any]]:
+        cur = con.execute(
+            "SELECT * FROM sl_market_observation WHERE kind = 'BUDGET_COUNTER'"
+        )
+        out: list[dict[str, Any]] = []
+        for row in self._rows_to_dicts(cur):
+            try:
+                val = json.loads(row["value_json"]) if isinstance(row["value_json"], str) else row["value_json"]
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(val, dict):
+                continue
+            if val.get("request_id") != request_id:
+                continue
+            out.append({"row": row, "value": val})
+        return out
+
+    @staticmethod
+    def _budget_latest(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not entries:
+            return None
+        def _key(e: dict[str, Any]) -> tuple[int, int]:
+            v = e["value"]
+            return (int(v.get("transition_seq", 0)), int(v.get("recorded_at_ms", 0)))
+        return max(entries, key=_key)
+
+    async def reserve_provider_request(
+        self, provider: str, month_key: str, request_id: str,
+        monthly_limit: int, as_of_ms: int,
+    ) -> Mapping[str, Any]:
+        return await self._run(
+            self._reserve_provider_request_sync, provider, month_key,
+            request_id, monthly_limit, _require_int(as_of_ms, name="as_of_ms"),
+        )
+
+    def _reserve_provider_request_sync(
+        self, provider: str, month_key: str, request_id: str,
+        monthly_limit: int, as_of_ms: int,
+    ) -> Mapping[str, Any]:
+        if not isinstance(provider, str) or not provider:
+            raise ValidationError("provider must be a non-empty str")
+        self._r01_validate_month_key(month_key)
+        if not isinstance(request_id, str) or not request_id:
+            raise ValidationError("request_id must be a non-empty str")
+        if isinstance(monthly_limit, bool) or not isinstance(monthly_limit, int) or monthly_limit <= 0:
+            raise ValidationError("monthly_limit must be a positive int")
+        # Month key must match the UTC month of as_of_ms (D19.4).
+        want_key = self._r01_utc_month_key(as_of_ms)
+        if month_key != want_key:
+            raise ValidationError(
+                f"MONTH_KEY_MISMATCH: month_key={month_key!r} != UTC month {want_key!r} of as_of_ms"
+            )
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_market_observation",))
+        con.execute("BEGIN TRANSACTION")
+        try:
+            # Global ID conflict: same request_id with different provider/month/limit.
+            existing_global = self._budget_find_request_sync(con, request_id)
+            for entry in existing_global:
+                v = entry["value"]
+                if (v.get("provider") != provider or v.get("month_key") != month_key
+                        or int(v.get("limit_snapshot", -1)) != int(monthly_limit)):
+                    raise ValidationError(
+                        f"BUDGET_REQUEST_ID_CONFLICT: request_id {request_id!r} already used "
+                        "with different provider/month/limit"
+                    )
+            month_entries = self._budget_all_for_month_sync(con, provider, month_key)
+            # Group by request_id -> latest.
+            by_id: dict[str, list[dict[str, Any]]] = {}
+            for e in month_entries:
+                by_id.setdefault(str(e["value"].get("request_id")), []).append(e)
+            latest_by_id: dict[str, dict[str, Any]] = {}
+            for rid, lst in by_id.items():
+                latest = self._budget_latest(lst)
+                if latest is not None:
+                    latest_by_id[rid] = latest
+            sent_count = sum(1 for v in latest_by_id.values() if v["value"].get("state") == "SENT")
+            reserved_count = sum(1 for v in latest_by_id.values() if v["value"].get("state") == "RESERVED")
+            occupied = sent_count + reserved_count
+            remaining = int(monthly_limit) - occupied
+            if request_id in latest_by_id:
+                state = latest_by_id[request_id]["value"].get("state")
+                if state == "RESERVED":
+                    con.execute("ROLLBACK")
+                    return {
+                        "admitted": False, "request_id": request_id,
+                        "month_key": month_key, "sent_count": sent_count,
+                        "reserved_count": reserved_count, "remaining": remaining,
+                        "reason_code": "BUDGET_RESERVATION_ALREADY_HELD",
+                    }
+                if state == "SENT":
+                    con.execute("ROLLBACK")
+                    return {
+                        "admitted": False, "request_id": request_id,
+                        "month_key": month_key, "sent_count": sent_count,
+                        "reserved_count": reserved_count, "remaining": remaining,
+                        "reason_code": "BUDGET_REQUEST_ALREADY_SENT",
+                    }
+                if state == "CANCELLED":
+                    con.execute("ROLLBACK")
+                    return {
+                        "admitted": False, "request_id": request_id,
+                        "month_key": month_key, "sent_count": sent_count,
+                        "reserved_count": reserved_count, "remaining": remaining,
+                        "reason_code": "BUDGET_REQUEST_CANCELLED",
+                    }
+                con.execute("ROLLBACK")
+                raise ValidationError(f"BUDGET_STATE_CONFLICT: unknown state {state!r}")
+            # New request: quota check.
+            if occupied >= int(monthly_limit):
+                con.execute("ROLLBACK")
+                return {
+                    "admitted": False, "request_id": request_id,
+                    "month_key": month_key, "sent_count": sent_count,
+                    "reserved_count": reserved_count, "remaining": 0,
+                    "reason_code": "BUDGET_MONTHLY_EXHAUSTED",
+                }
+            value = {
+                "provider": provider, "month_key": month_key,
+                "request_id": request_id, "state": "RESERVED",
+                "limit_snapshot": int(monthly_limit), "transition_seq": 1,
+                "recorded_at_ms": int(as_of_ms),
+            }
+            value_text = _canonical_json(value)
+            meta = {
+                "status": "OK", "source": "budget",
+                "source_as_of_ms": int(as_of_ms), "fetched_at_ms": int(as_of_ms),
+                "known_at_ms": int(as_of_ms),
+                "repair_schema_version": "repair-contract-v1",
+            }
+            meta_text = _canonical_json(meta)
+            raw_sha = hashlib.sha256(value_text.encode("utf-8")).hexdigest()
+            obs_id = f"budget:{provider}:{month_key}:{request_id}:1"
+            # Ensure observation_id uniqueness (retry suffix on collision).
+            suffix = 0
+            cur_id = obs_id
+            while self._fetch_raw(con, "sl_market_observation", "observation_id = ?", [cur_id]) is not None:
+                suffix += 1
+                cur_id = f"{obs_id}#{suffix}"
+            con.execute(
+                "INSERT INTO sl_market_observation (observation_id, symbol, kind, "
+                "source_as_of_ms, known_at_ms, value_json, meta_json, raw_sha256) "
+                "VALUES (?, ?, 'BUDGET_COUNTER', ?, ?, ?, ?, ?)",
+                [cur_id, provider, int(as_of_ms), int(as_of_ms),
+                 value_text, meta_text, raw_sha],
+            )
+            con.execute("COMMIT")
+            reserved_count += 1
+            remaining = int(monthly_limit) - (sent_count + reserved_count)
+            return {
+                "admitted": True, "request_id": request_id,
+                "month_key": month_key, "sent_count": sent_count,
+                "reserved_count": reserved_count, "remaining": remaining,
+                "reason_code": None,
+            }
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    async def finish_provider_request(
+        self, request_id: str, sent: bool, as_of_ms: int
+    ) -> None:
+        return await self._run(
+            self._finish_provider_request_sync, request_id, sent,
+            _require_int(as_of_ms, name="as_of_ms"),
+        )
+
+    def _finish_provider_request_sync(
+        self, request_id: str, sent: Any, as_of_ms: int
+    ) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            raise ValidationError("request_id must be a non-empty str")
+        if not isinstance(sent, bool):
+            raise ValidationError("sent must be a bool")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_market_observation",))
+        con.execute("BEGIN TRANSACTION")
+        try:
+            entries = self._budget_find_request_sync(con, request_id)
+            if not entries:
+                raise ValidationError(
+                    f"BUDGET_REQUEST_NOT_FOUND: request_id {request_id!r} has no reservation"
+                )
+            latest = self._budget_latest(entries)
+            assert latest is not None
+            val = latest["value"]
+            state = val.get("state")
+            reserved_at = int(val.get("recorded_at_ms", 0)) if state == "RESERVED" else None
+            # For terminal states, find reservation time for clock-skew check.
+            if state in ("SENT", "CANCELLED"):
+                # Find earliest RESERVED recorded_at for skew check.
+                res_times = [int(e["value"].get("recorded_at_ms", 0)) for e in entries
+                             if e["value"].get("state") == "RESERVED"]
+                base_time = min(res_times) if res_times else int(val.get("recorded_at_ms", 0))
+                if int(as_of_ms) < int(base_time):
+                    raise ValidationError("CLOCK_SKEW: finish as_of_ms predates reservation")
+                if state == "SENT" and sent is True:
+                    con.execute("ROLLBACK")
+                    return None
+                if state == "CANCELLED" and sent is False:
+                    con.execute("ROLLBACK")
+                    return None
+                raise ValidationError(
+                    f"BUDGET_STATE_CONFLICT: {state} cannot finish(sent={sent})"
+                )
+            if state != "RESERVED":
+                raise ValidationError(f"BUDGET_STATE_CONFLICT: unknown state {state!r}")
+            assert reserved_at is not None
+            if int(as_of_ms) < int(reserved_at):
+                raise ValidationError("CLOCK_SKEW: finish as_of_ms predates reservation")
+            new_state = "SENT" if sent is True else "CANCELLED"
+            provider = str(val.get("provider"))
+            month_key = str(val.get("month_key"))
+            limit_snap = int(val.get("limit_snapshot"))
+            new_value = {
+                "provider": provider, "month_key": month_key,
+                "request_id": request_id, "state": new_state,
+                "limit_snapshot": limit_snap, "transition_seq": 2,
+                "recorded_at_ms": int(as_of_ms),
+            }
+            value_text = _canonical_json(new_value)
+            meta = {
+                "status": "OK", "source": "budget",
+                "source_as_of_ms": int(as_of_ms), "fetched_at_ms": int(as_of_ms),
+                "known_at_ms": int(as_of_ms),
+                "repair_schema_version": "repair-contract-v1",
+            }
+            meta_text = _canonical_json(meta)
+            raw_sha = hashlib.sha256(value_text.encode("utf-8")).hexdigest()
+            obs_id = f"budget:{provider}:{month_key}:{request_id}:2"
+            suffix = 0
+            cur_id = obs_id
+            while self._fetch_raw(con, "sl_market_observation", "observation_id = ?", [cur_id]) is not None:
+                # Idempotent re-finish with same state+time is handled above;
+                # a colliding ID with different time is a new suffix.
+                existing = self._fetch_raw(con, "sl_market_observation", "observation_id = ?", [cur_id])
+                if existing is not None:
+                    try:
+                        ev = json.loads(existing["value_json"]) if isinstance(existing["value_json"], str) else {}
+                    except (TypeError, ValueError):
+                        ev = {}
+                    if isinstance(ev, dict) and ev.get("state") == new_state and int(ev.get("recorded_at_ms", -1)) == int(as_of_ms):
+                        con.execute("ROLLBACK")
+                        return None
+                suffix += 1
+                cur_id = f"{obs_id}#{suffix}"
+                if suffix > 10:
+                    break
+            con.execute(
+                "INSERT INTO sl_market_observation (observation_id, symbol, kind, "
+                "source_as_of_ms, known_at_ms, value_json, meta_json, raw_sha256) "
+                "VALUES (?, ?, 'BUDGET_COUNTER', ?, ?, ?, ?, ?)",
+                [cur_id, provider, int(as_of_ms), int(as_of_ms),
+                 value_text, meta_text, raw_sha],
+            )
+            con.execute("COMMIT")
+            return None
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    # -- R01 current funding opportunities (D08, ROW_NUMBER latest) ------------
+    # Latest per symbol by (as_of DESC, created_at DESC, snapshot_id ASC),
+    # selected in SQL before any READY filter; typed projection_v2 parsed in
+    # Python, stale adjusted by expires_at, then filter/order/page. The
+    # repository never imports the not-yet-implemented R09 projection module.
+    async def list_current_funding_opportunities(
+        self, query: Any, as_of_ms: int
+    ) -> Any:
+        return await self._run(
+            self._list_current_funding_opportunities_sync, query,
+            _require_int(as_of_ms, name="as_of_ms"),
+        )
+
+    def _list_current_funding_opportunities_sync(
+        self, query: Any, as_of_ms: int
+    ) -> Any:
+        from diveintocrypto_desktop.shortlab.repair_contracts import (
+            OpportunityPage as _OppPage,
+            OpportunityQuery as _OppQuery,
+        )
+        # Normalise query (DTO or mapping) with D08 validation.
+        if isinstance(query, _OppQuery):
+            q = query
+        elif isinstance(query, Mapping):
+            try:
+                q = _OppQuery(**dict(query))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(f"invalid OpportunityQuery: {exc}") from exc
+        else:
+            raise ValidationError("query must be OpportunityQuery or mapping")
+        con = self._require_con()
+        try:
+            self._hedge_require_tables(con, ("sl_funding_capture_snapshot",))
+        except ReferenceNotFoundError:
+            return _OppPage(items=(), total=0, as_of_ms=None)
+        # SQL: latest per symbol first (no READY pre-filter, no 200-row cap).
+        try:
+            cur = con.execute(
+                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+                "PARTITION BY symbol ORDER BY as_of_ms DESC, "
+                "created_at_ms DESC, snapshot_id ASC) AS rn "
+                "FROM sl_funding_capture_snapshot) WHERE rn = 1"
+            )
+            latest_rows = self._rows_to_dicts(cur)
+        except Exception as exc:
+            raise RepositoryError(f"opportunity latest query failed: {exc}") from exc
+        # Parse projections.
+        parsed: list[dict[str, Any]] = []
+        for row in latest_rows:
+            try:
+                risk = json.loads(row["risk_json"]) if isinstance(row["risk_json"], str) else (row["risk_json"] or {})
+            except (TypeError, ValueError):
+                risk = {}
+            if not isinstance(risk, dict):
+                risk = {}
+            proj = risk.get("projection_v2")
+            if isinstance(proj, dict):
+                item = dict(proj)
+                # Ensure identity keys present for sorting/filtering.
+                item.setdefault("snapshot_id", row.get("snapshot_id"))
+                item.setdefault("symbol", row.get("symbol"))
+                item.setdefault("canonical_id", row.get("canonical_id"))
+                item.setdefault("as_of_ms", row.get("as_of_ms"))
+            else:
+                # LEGACY: no v2 projection; visible as history but never READY.
+                item = {
+                    "snapshot_id": row.get("snapshot_id"),
+                    "symbol": row.get("symbol"),
+                    "canonical_id": row.get("canonical_id"),
+                    "as_of_ms": row.get("as_of_ms"),
+                    "expires_at_ms": row.get("as_of_ms"),
+                    "stale": True,
+                    "fcs": None,
+                    "fcs_config_hash": row.get("fcs_config_hash"),
+                    "funding_7d": None,
+                    "funding_30d": None,
+                    "positive_ratio_30d": None,
+                    "history_class": "HISTORY_CLASS_UNKNOWN",
+                    "best_venue": None,
+                    "break_even_days": None,
+                    "conservative_apr": None,
+                    "readiness_breakdown": None,
+                    "readiness": "NOT_READY",
+                    "reasons": ["LEGACY"],
+                }
+            # Stale adjustment: query time >= expires => stale, NOT_READY.
+            try:
+                exp = item.get("expires_at_ms")
+                exp_i = int(exp) if exp is not None else None
+            except (TypeError, ValueError):
+                exp_i = None
+            is_stale = True if exp_i is None else (int(as_of_ms) >= int(exp_i))
+            item["stale"] = bool(is_stale)
+            if is_stale:
+                # Preserve reasons, force readiness NOT_READY for current view.
+                item["readiness"] = "NOT_READY"
+                # Ensure stale reason present? Keep original reasons + STALE?
+                rs = list(item.get("reasons") or [])
+                if "STALE" not in rs and item.get("snapshot_id") is not None:
+                    # Only add STALE marker for v2 items; LEGACY keeps its tag.
+                    if "LEGACY" not in rs:
+                        rs.append("STALE")
+                        item["reasons"] = rs
+            else:
+                # Non-stale: derive readiness shorthand from breakdown when present.
+                if item.get("readiness") is None:
+                    bd = item.get("readiness_breakdown")
+                    if isinstance(bd, Mapping) and isinstance(bd.get("readiness"), str):
+                        item["readiness"] = bd["readiness"]
+                    else:
+                        item["readiness"] = "NOT_READY"
+            parsed.append(item)
+        # Filter (after latest selection).
+        def _dec_or_none(v: Any) -> Decimal | None:
+            if v is None:
+                return None
+            try:
+                d = Decimal(str(v))
+            except (InvalidOperation, ValueError, ArithmeticError):
+                return None
+            return d if d.is_finite() else None
+        filtered: list[dict[str, Any]] = []
+        for item in parsed:
+            if q.symbol is not None and item.get("symbol") != q.symbol:
+                continue
+            if q.venue is not None and item.get("best_venue") != q.venue:
+                continue
+            if not bool(q.include_stale) and bool(item.get("stale")):
+                continue
+            if q.readiness is not None and item.get("readiness") != q.readiness:
+                continue
+            if q.min_fcs is not None:
+                try:
+                    fcs_v = item.get("fcs")
+                    if fcs_v is None or float(fcs_v) < float(q.min_fcs):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if q.min_funding_30d is not None:
+                need = _dec_or_none(q.min_funding_30d)
+                have = _dec_or_none(item.get("funding_30d"))
+                if need is None or have is None or have < need:
+                    continue
+            if q.min_positive_ratio_30d is not None:
+                need = _dec_or_none(q.min_positive_ratio_30d)
+                have = _dec_or_none(item.get("positive_ratio_30d"))
+                if need is None or have is None or have < need:
+                    continue
+            filtered.append(item)
+        total = len(filtered)
+        # Sort: requested key (null last), then symbol ASC, snapshot_id ASC.
+        sort_key = q.sort
+        reverse = (q.order == "desc")
+        def _sort_val(item: dict[str, Any]) -> tuple[int, Any]:
+            if sort_key is None:
+                return (0, 0)
+            mapping = {
+                "fcs": item.get("fcs"),
+                "funding30d": item.get("funding_30d"),
+                "breakEvenDays": item.get("break_even_days"),
+                "positiveRatio30d": item.get("positive_ratio_30d"),
+            }
+            raw = mapping.get(sort_key)
+            if raw is None:
+                return (1, 0)
+            try:
+                if sort_key == "fcs":
+                    return (0, float(raw))
+                d = Decimal(str(raw))
+                return (0, d)
+            except (TypeError, ValueError, InvalidOperation, ArithmeticError):
+                return (1, 0)
+        if sort_key is None:
+            # Default: stable symbol/id order? Keep symbol ASC, snapshot ASC.
+            filtered.sort(key=lambda it: (str(it.get("symbol") or ""), str(it.get("snapshot_id") or "")))
+        else:
+            # Null-last + direction, then symbol/id tiebreakers.
+            # Split nulls and non-nulls to enforce null-last in both directions.
+            non_null = [it for it in filtered if _sort_val(it)[0] == 0]
+            nulls = [it for it in filtered if _sort_val(it)[0] == 1]
+            try:
+                non_null.sort(key=lambda it: _sort_val(it)[1], reverse=reverse)
+            except TypeError:
+                non_null.sort(key=lambda it: str(_sort_val(it)[1]), reverse=reverse)
+            nulls.sort(key=lambda it: (str(it.get("symbol") or ""), str(it.get("snapshot_id") or "")))
+            filtered = non_null + nulls
+        # Page.
+        page_items = filtered[int(q.offset): int(q.offset) + int(q.limit)]
+        if total == 0:
+            page_as_of = None
+        else:
+            try:
+                vals = [int(it["as_of_ms"]) for it in filtered if it.get("as_of_ms") is not None]
+                page_as_of = min(vals) if vals else int(as_of_ms)
+            except (TypeError, ValueError):
+                page_as_of = int(as_of_ms)
+        return _OppPage(items=tuple(filtered[int(q.offset): int(q.offset) + int(q.limit)]), total=int(total), as_of_ms=page_as_of)
+
+    # -- R01 strategy entries + quote tasks (D14/D18.2) ------------------------
+    async def save_strategy_entry(
+        self, record: Mapping[str, Any], references: tuple[Mapping[str, Any], ...]
+    ) -> str:
+        return await self._run(
+            self._save_strategy_entry_sync, dict(record), list(references or ())
+        )
+
+    def _save_strategy_entry_sync(
+        self, record: dict[str, Any], references: list[Any]
+    ) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("strategy entry record must be a mapping")
+        data = dict(record)
+        for key in ("entry_id", "cohort", "symbol", "source_snapshot_id",
+                    "strategy", "decision_as_of_ms", "entry_json"):
+            if key not in data:
+                raise ValidationError(f"strategy entry misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "entry_id", "cohort", "symbol", "source_snapshot_id", "strategy",
+            "decision_as_of_ms", "executed_as_of_ms", "entry_json",
+        })
+        if unknown:
+            raise ValidationError(f"strategy entry has unknown fields: {unknown}")
+        eid = data["entry_id"]
+        cohort = data["cohort"]
+        sym = data["symbol"]
+        src = data["source_snapshot_id"]
+        strat = data["strategy"]
+        if not isinstance(eid, str) or not eid:
+            raise ValidationError("entry_id must be a non-empty str")
+        if cohort not in _R01_COHORTS:
+            raise ValidationError(f"cohort={cohort!r} must be one of {sorted(_R01_COHORTS)}")
+        if not isinstance(sym, str) or not sym:
+            raise ValidationError("symbol must be a non-empty str")
+        if not isinstance(src, str) or not src:
+            raise ValidationError("source_snapshot_id must be a non-empty str")
+        if strat not in _R01_STRATEGIES:
+            raise ValidationError(f"strategy={strat!r} must be one of {sorted(_R01_STRATEGIES)}")
+        dec_asof = _require_int(data["decision_as_of_ms"], name="decision_as_of_ms")
+        exec_asof = data.get("executed_as_of_ms")
+        if exec_asof is not None:
+            exec_asof = _require_int(exec_asof, name="executed_as_of_ms")
+        entry_text = self._hedge_json_text(data["entry_json"], name="entry_json")
+        try:
+            parsed_entry = json.loads(entry_text)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"entry_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed_entry, Mapping):
+            raise ValidationError("entry_json must hold a JSON object")
+        status = parsed_entry.get("status")
+        if status not in _R01_ENTRY_STATUS:
+            raise ValidationError(f"entry status={status!r} must be ENTRY_COMPLETE/UNEXECUTABLE/UNAVAILABLE")
+        con = self._require_con()
+        self._r01_require_r01_tables(
+            con, ("sl_strategy_entry_snapshot", "sl_hedge_snapshot_reference")
+        )
+        raw = {
+            "entry_id": eid,
+            "cohort": cohort,
+            "symbol": sym,
+            "source_snapshot_id": src,
+            "strategy": strat,
+            "decision_as_of_ms": dec_asof,
+            "executed_as_of_ms": exec_asof,
+            "entry_json": entry_text,
+        }
+        con.execute("BEGIN TRANSACTION")
+        try:
+            # UNIQUE(cohort,source_snapshot_id,strategy): same triple with
+            # different entry_id is a caller error (no silent overwrite).
+            dup_triple = con.execute(
+                "SELECT entry_id FROM sl_strategy_entry_snapshot WHERE cohort = ? "
+                "AND source_snapshot_id = ? AND strategy = ? LIMIT 1",
+                [cohort, src, strat],
+            ).fetchone()
+            if dup_triple is not None and str(dup_triple[0]) != str(eid):
+                raise ValidationError(
+                    "strategy entry UNIQUE(cohort,source_snapshot_id,strategy) conflict"
+                )
+            self._insert_immutable(
+                con, "sl_strategy_entry_snapshot", "entry_id = ?", [eid], raw
+            )
+            if references:
+                self._hedge_insert_refs_sync(con, "STRATEGY_ENTRY", eid, references, dec_asof)
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return eid
+
+    async def list_strategy_entries(
+        self, cohort: str, start_ms: int, end_ms: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        return await self._run(
+            self._list_strategy_entries_sync, cohort,
+            _require_int(start_ms, name="start_ms"),
+            _require_int(end_ms, name="end_ms"),
+        )
+
+    def _list_strategy_entries_sync(
+        self, cohort: str, start_ms: int, end_ms: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        if cohort not in _R01_COHORTS:
+            raise ValidationError(f"cohort={cohort!r} must be one of {sorted(_R01_COHORTS)}")
+        if start_ms > end_ms:
+            raise ValidationError("start_ms must be <= end_ms")
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_strategy_entry_snapshot"):
+            return ()
+        cur = con.execute(
+            "SELECT * FROM sl_strategy_entry_snapshot WHERE cohort = ? "
+            "AND decision_as_of_ms >= ? AND decision_as_of_ms <= ? "
+            "ORDER BY decision_as_of_ms ASC, entry_id ASC",
+            [cohort, start_ms, end_ms],
+        )
+        out: list[dict[str, Any]] = []
+        for row in self._rows_to_dicts(cur):
+            d = dict(row)
+            try:
+                d["entry_json"] = json.loads(d["entry_json"]) if isinstance(d["entry_json"], str) else d["entry_json"]
+            except (TypeError, ValueError):
+                pass
+            out.append(d)
+        return tuple(out)
+
+    async def save_strategy_quote_task(self, record: Mapping[str, Any]) -> str:
+        return await self._run(self._save_strategy_quote_task_sync, dict(record))
+
+    def _save_strategy_quote_task_sync(self, record: dict[str, Any]) -> str:
+        if not isinstance(record, Mapping):
+            raise ValidationError("quote task record must be a mapping")
+        data = dict(record)
+        for key in ("task_id", "entry_id", "horizon_days", "purpose",
+                    "due_ms", "status", "task_json"):
+            if key not in data:
+                raise ValidationError(f"quote task misses required field: {key}")
+        unknown = sorted(set(data) - {
+            "task_id", "entry_id", "horizon_days", "purpose", "due_ms",
+            "status", "task_json", "updated_at_ms",
+        })
+        if unknown:
+            raise ValidationError(f"quote task has unknown fields: {unknown}")
+        tid = data["task_id"]
+        entry_id = data["entry_id"]
+        horizon = data["horizon_days"]
+        purpose = data["purpose"]
+        if not isinstance(tid, str) or not tid:
+            raise ValidationError("task_id must be a non-empty str")
+        if not isinstance(entry_id, str) or not entry_id:
+            raise ValidationError("entry_id must be a non-empty str")
+        if horizon not in (7, 30, 90):
+            raise ValidationError("horizon_days must be 7, 30 or 90")
+        if not isinstance(purpose, str) or not purpose:
+            raise ValidationError("purpose must be a non-empty str")
+        if purpose != "EXIT":
+            raise ValidationError("purpose must be EXIT")
+        due = _require_int(data["due_ms"], name="due_ms")
+        status = data["status"]
+        if status not in _R01_QUOTE_STATUS:
+            raise ValidationError(f"status={status!r} must be one of {sorted(_R01_QUOTE_STATUS)}")
+        task_text = self._hedge_json_text(data["task_json"], name="task_json")
+        try:
+            parsed_task = json.loads(task_text)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"task_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed_task, Mapping):
+            raise ValidationError("task_json must hold a JSON object")
+        # Deadline coherence: deadline_ms >= due_ms when present.
+        dl = parsed_task.get("deadline_ms")
+        if dl is not None:
+            try:
+                dl_i = int(dl)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("task deadline_ms must be an int") from exc
+            if dl_i < due:
+                raise ValidationError("task deadline_ms must be >= due_ms")
+        updated = data.get("updated_at_ms", due)
+        updated = _require_int(updated, name="updated_at_ms")
+        con = self._require_con()
+        self._r01_require_r01_tables(
+            con, ("sl_strategy_quote_task", "sl_strategy_entry_snapshot")
+        )
+        # Referenced entry must exist (no orphan tasks).
+        if self._fetch_raw(con, "sl_strategy_entry_snapshot", "entry_id = ?", [entry_id]) is None:
+            raise ReferenceNotFoundError(f"referenced entry {entry_id!r} not found")
+        raw = {
+            "task_id": tid,
+            "entry_id": entry_id,
+            "horizon_days": int(horizon),
+            "purpose": purpose,
+            "due_ms": due,
+            "status": status,
+            "task_json": task_text,
+            "updated_at_ms": updated,
+        }
+        try:
+            self._insert_immutable(
+                con, "sl_strategy_quote_task", "task_id = ?", [tid], raw
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "UNIQUE" in msg.upper() or "unique" in msg or "duplicate" in msg.lower():
+                raise ValidationError(
+                    "quote task UNIQUE(entry_id,horizon_days,purpose) conflict"
+                ) from exc
+            raise
+        # Enforce the UNIQUE triple explicitly for clearer errors.
+        cur = con.execute(
+            "SELECT task_id FROM sl_strategy_quote_task WHERE entry_id = ? "
+            "AND horizon_days = ? AND purpose = ?",
+            [entry_id, int(horizon), purpose],
+        )
+        rows = cur.fetchall()
+        if len(rows) > 1:
+            # Roll back the just-inserted row to keep the triple unique.
+            con.execute("DELETE FROM sl_strategy_quote_task WHERE task_id = ?", [tid])
+            raise ValidationError(
+                "quote task UNIQUE(entry_id,horizon_days,purpose) conflict"
+            )
+        return tid
+
+    async def claim_due_quote_tasks(
+        self, as_of_ms: int, limit: int = 20
+    ) -> tuple[Mapping[str, Any], ...]:
+        return await self._run(
+            self._claim_due_quote_tasks_sync,
+            _require_int(as_of_ms, name="as_of_ms"), int(limit),
+        )
+
+    def _claim_due_quote_tasks_sync(
+        self, as_of_ms: int, limit: int
+    ) -> tuple[Mapping[str, Any], ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValidationError("limit must be an int in 1..100")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_strategy_quote_task",))
+        con.execute("BEGIN TRANSACTION")
+        try:
+            cur = con.execute(
+                "SELECT * FROM sl_strategy_quote_task WHERE status IN ('PENDING', 'DEFERRED') "
+                "AND due_ms <= ? ORDER BY due_ms ASC, task_id ASC LIMIT ?",
+                [as_of_ms, limit + 50],
+            )
+            candidates = self._rows_to_dicts(cur)
+            claimed: list[dict[str, Any]] = []
+            for row in candidates:
+                if len(claimed) >= limit:
+                    break
+                try:
+                    tj = json.loads(row["task_json"]) if isinstance(row["task_json"], str) else (row["task_json"] or {})
+                except (TypeError, ValueError):
+                    tj = {}
+                if not isinstance(tj, dict):
+                    tj = {}
+                dl = tj.get("deadline_ms")
+                if dl is not None:
+                    try:
+                        if int(as_of_ms) > int(dl):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                # Atomic claim: only if still PENDING/DEFERRED (same txn).
+                cur2 = con.execute(
+                    "UPDATE sl_strategy_quote_task SET status = 'RUNNING', "
+                    "updated_at_ms = ? WHERE task_id = ? "
+                    "AND status IN ('PENDING', 'DEFERRED')",
+                    [as_of_ms, row["task_id"]],
+                )
+                changed = cur2.rowcount if getattr(cur2, "rowcount", None) not in (None, -1) else 1
+                if changed != 1:
+                    continue
+                # Bump attempt_count in task_json (same txn).
+                try:
+                    attempt = int(tj.get("attempt_count", 0)) + 1
+                except (TypeError, ValueError):
+                    attempt = 1
+                tj["attempt_count"] = attempt
+                tj["last_claim_ms"] = int(as_of_ms)
+                new_text = _canonical_json(tj)
+                con.execute(
+                    "UPDATE sl_strategy_quote_task SET task_json = ? WHERE task_id = ?",
+                    [new_text, row["task_id"]],
+                )
+                fresh = self._fetch_raw(con, "sl_strategy_quote_task", "task_id = ?", [row["task_id"]])
+                assert fresh is not None
+                d = dict(fresh)
+                try:
+                    d["task_json"] = json.loads(d["task_json"]) if isinstance(d["task_json"], str) else d["task_json"]
+                except (TypeError, ValueError):
+                    pass
+                claimed.append(d)
+            con.execute("COMMIT")
+            return tuple(claimed)
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    async def finish_quote_task(
+        self, task_id: str, status: str, result: Mapping[str, Any]
+    ) -> None:
+        return await self._run(
+            self._finish_quote_task_sync, task_id, status, dict(result or {}),
+        )
+
+    def _finish_quote_task_sync(
+        self, task_id: str, status: str, result: dict[str, Any]
+    ) -> None:
+        if not isinstance(task_id, str) or not task_id:
+            raise ValidationError("task_id must be a non-empty str")
+        if status not in ("COMPLETE", "UNAVAILABLE", "DEFERRED"):
+            raise ValidationError("finish status must be COMPLETE/UNAVAILABLE/DEFERRED")
+        if not isinstance(result, Mapping):
+            raise ValidationError("result must be a mapping")
+        con = self._require_con()
+        self._r01_require_r01_tables(con, ("sl_strategy_quote_task",))
+        row = self._fetch_raw(con, "sl_strategy_quote_task", "task_id = ?", [task_id])
+        if row is None:
+            raise ReferenceNotFoundError(f"quote task {task_id!r} not found")
+        if row["status"] != "RUNNING":
+            raise ValidationError(
+                f"quote task {task_id!r} must be RUNNING to finish (got {row['status']!r})"
+            )
+        try:
+            tj = json.loads(row["task_json"]) if isinstance(row["task_json"], str) else (row["task_json"] or {})
+        except (TypeError, ValueError):
+            tj = {}
+        if not isinstance(tj, dict):
+            tj = {}
+        merged = dict(tj)
+        for k, v in dict(result).items():
+            merged[k] = v
+        merged["finish_status"] = status
+        now_ms = time.time_ns() // 1_000_000
+        new_text = _canonical_json(merged)
+        con.execute(
+            "UPDATE sl_strategy_quote_task SET status = ?, task_json = ?, "
+            "updated_at_ms = ? WHERE task_id = ?",
+            [status, new_text, now_ms, task_id],
+        )
+        return None
+
     # -- crash recovery ------------------------------------------------------------
     async def recover_running_jobs(
         self, now_ms: int, *, priority: int | None = PRIORITY_CRITICAL,
@@ -4448,6 +6395,96 @@ class ShortLabRepository:
                 "error_code = ? WHERE status = 'RUNNING'",
                 [now_ms, PROCESS_INTERRUPTED],
             )
+        # R01: restart recovery for quote tasks + budget (same startup txn).
+        # Quote RUNNING -> PENDING with PROCESS_INTERRUPTED (deadline still enforced
+        # on next claim). Budget遗留RESERVED保守追加SENT (reason
+        # PROCESS_INTERRUPTED_SEND_UNKNOWN); only the startup holder runs this.
+        try:
+            if self._r01_table_exists(con, "sl_strategy_quote_task"):
+                cur = con.execute(
+                    "SELECT task_id, task_json FROM sl_strategy_quote_task WHERE status = 'RUNNING'"
+                )
+                for task_id, task_json_raw in cur.fetchall():
+                    try:
+                        tj = json.loads(task_json_raw) if isinstance(task_json_raw, str) else (task_json_raw or {})
+                    except (TypeError, ValueError):
+                        tj = {}
+                    if not isinstance(tj, dict):
+                        tj = {}
+                    tj["reason_code"] = PROCESS_INTERRUPTED
+                    tj["recovered_at_ms"] = int(now_ms)
+                    con.execute(
+                        "UPDATE sl_strategy_quote_task SET status = 'PENDING', "
+                        "task_json = ?, updated_at_ms = ? WHERE task_id = ?",
+                        [_canonical_json(tj), int(now_ms), str(task_id)],
+                    )
+        except Exception:
+            pass
+        try:
+            if self._r01_table_exists(con, "sl_market_observation"):
+                # Find RESERVED without a terminal SENT/CANCELLED for the same request.
+                cur = con.execute(
+                    "SELECT observation_id, value_json FROM sl_market_observation "
+                    "WHERE kind = 'BUDGET_COUNTER'"
+                )
+                rows = cur.fetchall()
+                by_req: dict[str, list[dict[str, Any]]] = {}
+                for _oid, _vj in rows:
+                    try:
+                        _v = json.loads(_vj) if isinstance(_vj, str) else _vj
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(_v, dict) or not _v.get("request_id"):
+                        continue
+                    by_req.setdefault(str(_v["request_id"]), []).append(_v)
+                for req_id, vals in by_req.items():
+                    states = {str(v.get("state")) for v in vals}
+                    if "RESERVED" in states and "SENT" not in states and "CANCELLED" not in states:
+                        # Conservative: append SENT seq2 (cannot prove unsent).
+                        base = next(v for v in vals if v.get("state") == "RESERVED")
+                        provider = str(base.get("provider"))
+                        month_key = str(base.get("month_key"))
+                        limit_snap = int(base.get("limit_snapshot", 0) or 0)
+                        new_value = {
+                            "provider": provider, "month_key": month_key,
+                            "request_id": req_id, "state": "SENT",
+                            "limit_snapshot": limit_snap, "transition_seq": 2,
+                            "recorded_at_ms": int(now_ms),
+                            "reason_code": "PROCESS_INTERRUPTED_SEND_UNKNOWN",
+                        }
+                        value_text = _canonical_json(new_value)
+                        meta = {
+                            "status": "OK", "source": "budget",
+                            "source_as_of_ms": int(now_ms), "fetched_at_ms": int(now_ms),
+                            "known_at_ms": int(now_ms),
+                            "repair_schema_version": "repair-contract-v1",
+                        }
+                        meta_text = _canonical_json(meta)
+                        raw_sha = hashlib.sha256(value_text.encode("utf-8")).hexdigest()
+                        obs_id = f"budget:{provider}:{month_key}:{req_id}:2"
+                        suffix = 0
+                        cur_id = obs_id
+                        while True:
+                            cur2 = con.execute(
+                                "SELECT count(*) FROM sl_market_observation WHERE observation_id = ?",
+                                [cur_id],
+                            )
+                            if cur2.fetchone()[0] == 0:
+                                break
+                            suffix += 1
+                            cur_id = f"{obs_id}#{suffix}"
+                            if suffix > 10:
+                                cur_id = f"{obs_id}#rec-{uuid.uuid4().hex[:8]}"
+                                break
+                        con.execute(
+                            "INSERT INTO sl_market_observation (observation_id, symbol, kind, "
+                            "source_as_of_ms, known_at_ms, value_json, meta_json, raw_sha256) "
+                            "VALUES (?, ?, 'BUDGET_COUNTER', ?, ?, ?, ?, ?)",
+                            [cur_id, provider, int(now_ms), int(now_ms),
+                             value_text, meta_text, raw_sha],
+                        )
+        except Exception:
+            pass
         return count
 
     # -- introspection ------------------------------------------------------------------

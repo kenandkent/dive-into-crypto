@@ -52,11 +52,12 @@ Bundled resources beyond the UI
   when SHORTLAB_CONFIG_PATH is unset (same resources entry point).
 - shortlab/identity/asset_overrides.yaml + verified_assets.yaml: the two
   human-verified identity tables (same resources entry point).
-- shortlab/migrations/001_init.sql … 005_hedge_advisor.sql: the F01 base
-  migrations plus the H01 Hedge advisor migration applied by
-  ShortLabRepository.migrate (same resources entry point). H01 adds
-  005_hedge_advisor.sql and H11 verifies the full 005 manifest. Never
-  create a placeholder 005 file to satisfy the bundle.
+- shortlab/migrations/001_init.sql … 006_optimization_repair.sql: the F01 base
+  migrations plus the H01 Hedge advisor migration plus the R01 repair
+  migration applied by ShortLabRepository.migrate (same resources entry
+  point). H01 adds 005_hedge_advisor.sql and H11 verifies the full 005
+  manifest; R01 adds 006_optimization_repair.sql (D13 seven tables + eight
+  indexes). Never create a placeholder 005/006 file to satisfy the bundle.
 - All runtime reads go through resources.read_resource_text
   (importlib.resources + a _MEIPASS fallback that is only covered by the
   frozen product smoke, never by unit-test fakes).
@@ -93,8 +94,9 @@ _VERIFIED_ASSETS_YAML = os.path.join(
     _ROOT, "src", "diveintocrypto_desktop", "shortlab", "identity",
     "verified_assets.yaml",
 )
-# F01 base migrations 001-004 plus H01 Hedge advisor 005 (explicit list;
-# no placeholder: 005_hedge_advisor.sql is frozen by H01, reviewed by F09).
+# F01 base migrations 001-004 plus H01 Hedge advisor 005 plus R01 repair 006
+# (explicit list; no placeholder: 005_hedge_advisor.sql is frozen by H01,
+# reviewed by F09; 006_optimization_repair.sql is frozen by R01).
 _MIGRATIONS = [
     os.path.join(
         _ROOT, "src", "diveintocrypto_desktop", "shortlab", "migrations",
@@ -106,6 +108,7 @@ _MIGRATIONS = [
         "003_catalyst.sql",
         "004_core_completion.sql",
         "005_hedge_advisor.sql",
+        "006_optimization_repair.sql",
     )
 ]
 
