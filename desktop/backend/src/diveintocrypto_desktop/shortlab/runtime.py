@@ -197,6 +197,8 @@ class ShortLabRuntime:
         request_budget: Any | None = None,
         observed_cache: Any | None = None,
         quality_policy: Any | None = None,
+        repair_ports: Any | None = None,
+        allow_test_bindings: bool = False,
     ) -> None:
         self._config = config
         self._db_path = Path(db_path).expanduser() if db_path is not None else None
@@ -214,6 +216,11 @@ class ShortLabRuntime:
         self._request_budget = request_budget
         self._observed_cache = observed_cache
         self._quality_policy = quality_policy
+        # R10a boundary: explicit repair bundle + test-binding gate (D19.1).
+        # Defaults None/False; production never falls back to True and never
+        # reads config/env to enable test bindings.
+        self._repair_ports = repair_ports
+        self._allow_test_bindings = bool(allow_test_bindings)
         self._available = False
         self._unavailable_reason = SHORTLAB_UNAVAILABLE_REASON
         self._started = False
@@ -269,6 +276,16 @@ class ShortLabRuntime:
     @property
     def quality_policy(self) -> Any | None:
         return self._quality_policy
+
+    @property
+    def repair_ports(self) -> Any | None:
+        """Explicit RepairPorts bundle (None = unbound; R10b binds real producers)."""
+        return self._repair_ports
+
+    @property
+    def allow_test_bindings(self) -> bool:
+        """Test-binding gate (default False; only tests pass True via explicit factory)."""
+        return bool(self._allow_test_bindings)
 
     @property
     def hedge_available(self) -> bool:
@@ -469,9 +486,17 @@ class ShortLabRuntime:
                 observed_cache=self._observed_cache,
                 quality_policy=self._quality_policy,
                 data_dir=self._data_dir,
+                repair_ports=self._repair_ports,
             )
         else:
             self._service._repository = self._repository
+            # R10a: propagate the explicit repair bundle to an externally
+            # provided service when it does not already carry one.
+            try:
+                if getattr(self._service, "_repair_ports", None) is None and self._repair_ports is not None:
+                    self._service._repair_ports = self._repair_ports
+            except Exception:
+                pass
             # Inject F06a handles into an externally provided service when it
             # does not already carry them (tests inject fakes + handles).
             for _name, _value in (

@@ -28,6 +28,7 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -170,7 +171,14 @@ def _configure_logging() -> None:
     logging.getLogger("trading_bot").setLevel(logging.INFO)
 
 
-def create_app() -> FastAPI:
+def create_app(*, shortlab_runtime_factory: Callable[[], object] | None = None) -> FastAPI:
+    """Create the desktop FastAPI app (D19.1 factory seam).
+
+    ``shortlab_runtime_factory`` synchronously constructs an *unstarted*
+    ShortLabRuntime; the app lifespan owns start/stop exactly once. Tests
+    carry data_dir/scenario/clock via closure; ``None`` keeps the real
+    default runtime. Existing no-arg calls stay valid.
+    """
     # Live-feed + symbol state is per-app so tests (and restarts) start clean.
     _live_cache: dict[str, tuple[float, dict]] = {}
     _live_fails: dict[str, int] = {}
@@ -284,12 +292,22 @@ def create_app() -> FastAPI:
         return await call_next(request)
     # Task 14 (sole owner of this block): mount the Short-Lab router on the
     # same FastAPI process. No old path/schema is touched.
+    # R10a boundary: frozen factory seam + repair router (D19.1/D12).
+    # Factory synchronously builds an unstarted Runtime; lifespan start/stop
+    # owns lifecycle. Legacy tests may still override app.state afterwards.
     try:
         from diveintocrypto_desktop.api import shortlab as _shortlab_api
+        from diveintocrypto_desktop.api import shortlab_repair as _repair_api
         from diveintocrypto_desktop.shortlab.runtime import ShortLabRuntime as _ShortLabRuntime
 
-        app.state.shortlab_runtime = _ShortLabRuntime()
+        if shortlab_runtime_factory is not None:
+            if not callable(shortlab_runtime_factory):
+                raise ValueError("shortlab_runtime_factory must be callable or None")
+            app.state.shortlab_runtime = shortlab_runtime_factory()
+        elif getattr(app.state, "shortlab_runtime", None) is None:
+            app.state.shortlab_runtime = _ShortLabRuntime()
         app.include_router(_shortlab_api.router)
+        app.include_router(_repair_api.router)
     except Exception as e:  # router must never break legacy app construction
         logger.warning("shortlab router mount failed: %s", str(e)[:150])
 

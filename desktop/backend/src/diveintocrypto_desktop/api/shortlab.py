@@ -255,14 +255,42 @@ def _hedge_capabilities_for(service: Any) -> dict[str, Any]:
 
 
 def _hedge_error(status: int, error: str, reason: str, detail: str | None = None) -> JSONResponse:
-    body: dict[str, Any] = {"error": error, "reason": reason, "reason_code": reason, "code": error}
+    # R10a boundary: freeze error envelope with reasonCode alias (D12/D18).
+    # Wire keeps both snake + camel for compat; R10b reuses this envelope.
+    body: dict[str, Any] = {
+        "error": error,
+        "reason": reason,
+        "reasonCode": reason,
+        "reason_code": reason,
+        "code": error,
+    }
     if detail:
         body["detail"] = str(detail)[:300]
     return JSONResponse(body, status_code=status)
 
 
+def _repair_unavailable_response(
+    detail: str | None = None,
+) -> JSONResponse:
+    """R10a unbound repair bundle (503 IMPLEMENTATION_UNAVAILABLE, D19.1)."""
+    return _hedge_error(503, "IMPLEMENTATION_UNAVAILABLE", "IMPLEMENTATION_UNAVAILABLE", detail)
+
+
 def _map_hedge_exception(exc: Exception) -> JSONResponse:
     """Map frozen Hedge/service errors to B33 HTTP codes (never 500 for known)."""
+    # R10a boundary: unbound RepairPorts -> 503 IMPLEMENTATION_UNAVAILABLE.
+    # Old archive reads (simulate/get_simulation/list/plans) never raise this;
+    # only new repair methods do (service_calls.json call points).
+    try:
+        from diveintocrypto_desktop.shortlab.repair_ports import (
+            RepairDependencyUnavailable as _RepairUnbound,
+        )
+
+        if isinstance(exc, _RepairUnbound):
+            reason = str(getattr(exc, "reason_code", None) or "IMPLEMENTATION_UNAVAILABLE")
+            return _hedge_error(503, reason, reason, str(exc)[:300])
+    except Exception:
+        pass
     status = int(getattr(exc, "status_code", 500) or 500)
     code = str(getattr(exc, "error_code", None) or getattr(exc, "reason_code", None) or type(exc).__name__)
     reason = str(getattr(exc, "reason_code", None) or code)

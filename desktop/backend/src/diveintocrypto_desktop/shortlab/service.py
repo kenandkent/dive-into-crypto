@@ -449,6 +449,9 @@ class ShortLabService:
         hedge_futures_rules_fn: Callable[..., Any] | None = None,
         hedge_spot_rules_fn: Callable[..., Any] | None = None,
         hedge_available: bool | None = None,
+        repair_ports: Any | None = None,
+        repository_port: Any | None = None,
+        market_port: Any | None = None,
     ) -> None:
         from diveintocrypto_desktop.shortlab.providers.base import ProviderRegistry
 
@@ -515,6 +518,14 @@ class ShortLabService:
         # Explicit hedge gate (runtime sets it after 005 probing; None means
         # auto-probe the tables on first hedge call).
         self._hedge_available = hedge_available
+        # R10a boundary: explicit RepairPorts/RepositoryPort/MarketPort seams
+        # (D19.1, service_calls.json). Old archive reads (simulate/get_*
+        # /list_*/hedge_venues) never consult these; new repair methods
+        # require them and raise RepairDependencyUnavailable when unbound
+        # (HTTP 503 IMPLEMENTATION_UNAVAILABLE, never Fake READY).
+        self._repair_ports = repair_ports
+        self._repository_port = repository_port
+        self._market_port = market_port
         self._hedge_seq = 0
         self._completed_jobs: dict[str, JobStatus] = {}
         self._hedge_plan_locks: dict[Any, dict[str, asyncio.Lock]] = {}
@@ -625,6 +636,39 @@ class ShortLabService:
     @property
     def data_dir(self) -> Any | None:
         return self._data_dir
+
+    # -- R10a repair boundary seams (D19.1, service_calls.json) ------------------
+    @property
+    def repair_ports(self) -> Any | None:
+        """Explicit RepairPorts bundle (None = unbound; R10b binds real producers)."""
+        return self._repair_ports
+
+    @property
+    def repository_port(self) -> Any | None:
+        """Explicit RepositoryPort seam (D13.1 20 async methods; None = unbound)."""
+        return self._repository_port
+
+    @property
+    def market_port(self) -> Any | None:
+        """Explicit MarketPort seam (3 async collectors; None = unbound)."""
+        return self._market_port
+
+    def _require_repair_port(self, name: str) -> Any:
+        """Return the bound callback for ``name`` or raise unbound (503 upstream).
+
+        Frozen call points (docs/contracts/shortlab_repair_service_calls.json):
+        producers bind via RepairPorts in R10b; unbound raises
+        RepairDependencyUnavailable (IMPLEMENTATION_UNAVAILABLE).
+        """
+        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+
+        ports = self._repair_ports
+        if ports is None:
+            raise RepairDependencyUnavailable(name)
+        require = getattr(ports, "require", None)
+        if not callable(require):
+            raise RepairDependencyUnavailable(name)
+        return require(name)
 
     @property
     def grader_callback(self) -> Callable[[JobContext], Awaitable[JobStatus]] | None:
@@ -4674,6 +4718,65 @@ class ShortLabService:
         if isinstance(result, Unavailable):
             return result
         return result
+
+    # -- R10a repair boundary methods (skeleton; real wiring is R10b) ---------
+    async def create_repair_decision(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        """POST /hedge/decisions boundary (D12/D18.1; service_calls.json).
+
+        R10a freezes the call point only: requires the repair bundle and
+        raises RepairDependencyUnavailable when unbound (503 upstream).
+        Real Decision POST/validation is R10b.
+        """
+        self._require_repair_port("build_ratio_proposal")
+        # R10b binds real producers; R10a skeleton never returns Fake READY.
+        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+
+        raise RepairDependencyUnavailable("build_ratio_proposal")
+
+    async def get_repair_decision(self, decision_id: str) -> Mapping[str, Any]:
+        """GET /hedge/decisions/{id} boundary (frozen read; R10b implements)."""
+        self._require_repair_port("build_ratio_proposal")
+        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+
+        raise RepairDependencyUnavailable("build_ratio_proposal")
+
+    async def repair_exit_guidance(self, plan_id: str) -> Mapping[str, Any]:
+        """GET /hedge/plans/{id}/exit-guidance boundary (R10b implements)."""
+        self._require_repair_port("build_pair_exit_guidance")
+        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+
+        raise RepairDependencyUnavailable("build_pair_exit_guidance")
+
+    async def confirm_repair_protection(
+        self, plan_id: str, body: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """POST /hedge/plans/{id}/protection boundary (R10b implements)."""
+        self._require_repair_port("build_pair_exit_guidance")
+        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+
+        raise RepairDependencyUnavailable("build_pair_exit_guidance")
+
+    def repair_capabilities(self) -> Mapping[str, Any]:
+        """GET /capabilities boundary summary (binding sources; R10b enriches)."""
+        from diveintocrypto_desktop.shortlab.repair_contracts import REPAIR_CONTRACT_VERSION
+        from diveintocrypto_desktop.shortlab.repair_ports import REPAIR_PORT_KEYS
+
+        ports = self._repair_ports
+        bound: dict[str, bool] = {}
+        for key in REPAIR_PORT_KEYS:
+            try:
+                bound[key] = bool(ports is not None and getattr(ports, key, None) is not None)
+            except Exception:
+                bound[key] = False
+        missing = sorted([k for k, v in bound.items() if not v])
+        ready = not missing
+        return {
+            "contractSchemaVersion": REPAIR_CONTRACT_VERSION,
+            "readiness": "READY" if ready else "NOT_READY",
+            "reasons": [] if ready else ["IMPLEMENTATION_UNAVAILABLE"],
+            "missingBindings": missing,
+            "bindings": bound,
+        }
 
 
 # ---------------------------------------------------------------------------
