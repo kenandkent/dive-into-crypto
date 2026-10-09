@@ -76,16 +76,27 @@ def _ensure_backend_src_on_path() -> Path:
     return Path(candidates[0])
 
 
-def build_harness_app(scenario: str, data_dir: Path, clock: Any | None = None) -> tuple[Any, Any]:
+def build_harness_app(scenario: str, data_dir: Path, clock: Any | None = None, *, acceptance: bool = False) -> tuple[Any, Any]:
     """Build the harness app for the isolated process (real Runtime)."""
     _ensure_backend_src_on_path()
     try:
         from tests.repair_harness import FakeClock, create_repair_test_app  # type: ignore[import-not-found]
+        try:
+            from tests.repair_harness import create_repair_acceptance_app as _accept  # type: ignore[import-not-found]
+        except Exception:
+            _accept = None  # type: ignore
     except Exception:
         from repair_harness import FakeClock, create_repair_test_app  # type: ignore[import-not-found]
+        try:
+            from repair_harness import create_repair_acceptance_app as _accept  # type: ignore[import-not-found]
+        except Exception:
+            _accept = None  # type: ignore
     if clock is None:
         clock = FakeClock()
-    app = create_repair_test_app(Path(data_dir), scenario, clock)
+    if acceptance and _accept is not None:
+        app = _accept(Path(data_dir), scenario, clock)
+    else:
+        app = create_repair_test_app(Path(data_dir), scenario, clock)
     return app, clock
 
 
@@ -117,7 +128,7 @@ def fetch_harness_state(origin: str, timeout_s: float = 5.0) -> dict[str, Any]:
 
 
 def run_server(host: str = HARNESS_HOST, port: int = HARNESS_PORT, scenario: str = "normal",
-               data_dir: Path | None = None, log_level: str = "warning") -> None:
+               data_dir: Path | None = None, log_level: str = "warning", *, acceptance: bool = False) -> None:
     """Serve the harness app with uvicorn (loopback only, harness-only)."""
     _ensure_backend_src_on_path()
     import uvicorn
@@ -128,7 +139,7 @@ def run_server(host: str = HARNESS_HOST, port: int = HARNESS_PORT, scenario: str
         raise ValueError(f"harness server only serves {HARNESS_PORT} (got {port!r})")
     target = Path(data_dir) if data_dir is not None else Path(tempfile.mkdtemp(prefix="repair-harness-"))
     target.mkdir(parents=True, exist_ok=True)
-    app, _clock = build_harness_app(scenario, target)
+    app, _clock = build_harness_app(scenario, target, acceptance=acceptance)
     config = uvicorn.Config(app, host=host, port=int(port), log_level=log_level)
     server = uvicorn.Server(config)
     server.run()
@@ -142,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                         choices=["normal", "negative-funding", "unknown-schedule", "slow-provider", "plan-switch", "plan-switchakit"])
     parser.add_argument("--data-dir", default=None, help="test data dir (records stay here)")
     parser.add_argument("--log-level", default="warning")
+    parser.add_argument("--acceptance", action="store_true", help="R15b acceptance mode: enabled switches + raw HTTP fixtures (real ports)")
     args = parser.parse_args(argv)
     # Isolated conftest-mock note: this process must not import the root
     # tests/conftest.py mocks for crypcodile/aiolimiter/httpx; urllib only.
@@ -151,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["no_proxy"] = "127.0.0.1,localhost"
     run_server(host=args.host, port=args.port, scenario=args.scenario,
                data_dir=Path(args.data_dir) if args.data_dir else None,
-               log_level=args.log_level)
+               log_level=args.log_level, acceptance=bool(args.acceptance))
     return 0
 
 

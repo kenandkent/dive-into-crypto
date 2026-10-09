@@ -519,3 +519,385 @@ def create_repair_test_app(
     except Exception:
         pass
     return app
+
+
+# ---------------------------------------------------------------------------
+# R15b acceptance helper (extends R15a skeleton; production untouched).
+# Real nine RepairPorts (bindings=None) + enabled switches + raw HTTP
+# fixtures only (mark/quote/funding/rules/identity/metadata). No computed
+# scores / net carry / PnL / outcome are injected; producers compute them.
+# Scenario-aware funding/metadata read the live harness_state so
+# POST /test/harness/scenario switches matrix without restart.
+# ---------------------------------------------------------------------------
+
+ACCEPTANCE_MODE = "REAL_PRODUCERS_WITH_RAW_FIXTURES"
+
+
+def _acceptance_identity_overrides() -> dict[str, Any]:
+    return {
+        "1000PEPEUSDT": {
+            "canonical_id": "pepe",
+            "display_symbol": "1000PEPEUSDT",
+            "contract_multiplier": 1000,
+            "multiplier_source": "EXCHANGE",
+            "mapping_confidence": "VERIFIED",
+            "mapping_source": "MANUAL",
+            "binance_spot_symbol": "1000PEPEUSDT",
+            "coingecko_id": "pepe",
+        },
+        "BTCUSDT": {
+            "canonical_id": "bitcoin",
+            "display_symbol": "BTCUSDT",
+            "contract_multiplier": 1,
+            "multiplier_source": "EXCHANGE",
+            "mapping_confidence": "VERIFIED",
+            "mapping_source": "MANUAL",
+            "binance_spot_symbol": "BTCUSDT",
+            "coingecko_id": "bitcoin",
+        },
+    }
+
+
+def _acceptance_enabled_config() -> Any:
+    import dataclasses as _dc
+
+    from diveintocrypto_desktop.shortlab.config import load_shortlab_config as _load
+
+    base = _load()
+    try:
+        hedge = _dc.replace(base.hedge, enabled=True)
+        funding = _dc.replace(base.funding_capture, enabled=True)
+        return _dc.replace(base, hedge=hedge, funding_capture=funding)
+    except Exception:
+        return base
+
+
+def create_repair_acceptance_app(
+    data_dir: Path,
+    scenario: str,
+    clock_ms: Callable[[], int],
+    *,
+    bindings: Any | None = None,
+) -> Any:
+    """R15b acceptance app: real producers + raw HTTP fixtures (offline-safe).
+
+    Same frozen seam as :func:`create_repair_test_app` (factory called once,
+    lifespan start/stop once, harness control routes only here), but the
+    Runtime uses an explicitly enabled config (hedge + funding_capture) and,
+    after start, the service's raw HTTP layer returns deterministic R00-style
+    raw fixtures (mark/quote/funding/rules/identity/metadata). The nine
+    RepairPorts stay real (bindings=None => REAL_PRODUCERS/False); explicit
+    non-None bindings must still be D19.6 TEST_FAKE or this helper raises
+    TEST_BINDINGS_REQUIRED. No computed Score/PnL/Outcome is ever injected.
+    """
+    if scenario not in HARNESS_SCENARIOS:
+        raise ValueError(f"unknown harness scenario {scenario!r}; want {list(HARNESS_SCENARIOS)}")
+    if not callable(clock_ms):
+        raise TypeError("clock_ms must be a callable () -> int (ms)")
+    try:
+        data_path = Path(data_dir).expanduser()
+    except Exception as exc:
+        raise TypeError(f"data_dir must be path-like: {exc}") from exc
+    data_path.mkdir(parents=True, exist_ok=True)
+
+    if bindings is not None:
+        try:
+            from diveintocrypto_desktop.shortlab.repair_ports import RepairPorts as _RP
+
+            if not isinstance(bindings, _RP):
+                raise RuntimeError(
+                    "TEST_BINDINGS_REQUIRED: harness bindings must be RepairPorts "
+                    f"(got {type(bindings).__name__}); real producers use bindings=None."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        _require_test_fake_bindings(bindings)
+
+    from diveintocrypto_desktop.api.app import create_app
+    from diveintocrypto_desktop.shortlab.runtime import ShortLabRuntime
+
+    enabled_cfg = _acceptance_enabled_config()
+    factory_calls: list[int] = []
+    harness_state: dict[str, Any] = {
+        "scenario": scenario,
+        "canonical_scenario": canonical_scenario(scenario),
+        "data_dir": str(data_path),
+        "bindings_mode": "TEST_FAKE" if bindings is not None else "REAL_PRODUCERS",
+        "origin": HARNESS_ORIGIN,
+        "acceptance": ACCEPTANCE_MODE,
+    }
+
+    def shortlab_runtime_factory() -> Any:
+        factory_calls.append(1)
+        rt = ShortLabRuntime(
+            data_dir=data_path,
+            clock=clock_ms,
+            repair_ports=bindings,
+            allow_test_bindings=(bindings is not None),
+            config=enabled_cfg,
+        )
+        _orig_start = rt.start
+
+        async def _acceptance_start() -> Any:
+            out = await _orig_start()
+            try:
+                svc = rt.service
+            except Exception:
+                return out
+            # -- raw HTTP fixture injection (test process only) --------------
+            # Identity overrides (static raw, not computed scores).
+            try:
+                if getattr(svc, "_identity_overrides", None) in (None, {}):
+                    svc._identity_overrides = _acceptance_identity_overrides()
+                else:
+                    merged = dict(_acceptance_identity_overrides())
+                    try:
+                        merged.update(dict(getattr(svc, "_identity_overrides") or {}))
+                    except Exception:
+                        pass
+                    svc._identity_overrides = merged
+            except Exception:
+                pass
+
+            def _now() -> int:
+                try:
+                    return int(clock_ms())
+                except Exception:
+                    return 1791417600000
+
+            async def _mark_fn(symbol: str) -> dict[str, Any]:
+                sym = str(symbol).upper()
+                now = _now()
+                if "PEPE" in sym:
+                    px = "0.012"
+                elif sym == "BTCUSDT":
+                    px = "67000"
+                else:
+                    px = "100"
+                return {
+                    "mark_price": px,
+                    "native_price": px,
+                    "quote_currency": "USDT",
+                    "quote_to_usd": "1",
+                    "symbol": sym,
+                    "as_of_ms": now,
+                    "fetched_at_ms": now,
+                    "known_at_ms": now,
+                    "expires_at_ms": now + 60_000,
+                }
+
+            async def _quote_fn(symbol: str, qty: str, venue: Any = None) -> dict[str, Any]:
+                sym = str(symbol).upper()
+                now = _now()
+                if "PEPE" in sym:
+                    mid, buy, sell = "0.012", "0.0121", "0.0119"
+                    canon = "pepe"
+                elif sym == "BTCUSDT":
+                    mid, buy, sell = "67000", "67010", "66990"
+                    canon = "bitcoin"
+                else:
+                    mid, buy, sell = "100", "100.1", "99.9"
+                    canon = sym.lower()
+                return {
+                    "venue": str(venue or "BINANCE_SPOT"),
+                    "canonical_id": canon,
+                    "symbol": sym,
+                    "chain": None,
+                    "contract_address": None,
+                    "as_of_ms": now,
+                    "fetched_at_ms": now,
+                    "known_at_ms": now,
+                    "expires_at_ms": now + 60_000,
+                    "reference_notional_usd": "10000",
+                    "mid_price": mid,
+                    "buy_vwap": buy,
+                    "sell_vwap": sell,
+                    "buy_executable_qty": "1000000",
+                    "sell_executable_qty": "1000000",
+                    "buy_slippage_bps": 5.0,
+                    "sell_slippage_bps": 5.0,
+                    "estimated_fee_usd": None,
+                    "estimated_gas_usd": None,
+                    "direction_costs": {},
+                    "entry_feasible": True,
+                    "exit_feasible": True,
+                    "exit_feasibility": "CONFIRMED",
+                    "quote_currency": "USDT",
+                    "quote_to_usd": "1",
+                    "source_timestamp_ms": now - 1_000,
+                    "requested_canonical_qty": "100000",
+                    "trading_rules": {},
+                    "capabilities": {},
+                    "identity_confidence": "VERIFIED",
+                    "status": "OK",
+                    "reason_code": None,
+                }
+
+            async def _funding_fn(sym: str) -> dict[str, Any]:
+                s = str(sym).upper()
+                scen = canonical_scenario(str(harness_state.get("scenario") or "normal"))
+                # Scenario-aware raw funding (never computed carry).
+                if scen == "negative-funding":
+                    return {
+                        "symbol": s,
+                        "current_rate": "-0.0005",
+                        "last_settled_rate": "-0.0005",
+                        "funding_30d": "0.018",
+                        "funding_7d": "-0.004",
+                        "funding_90d": "0.05",
+                        "positive_ratio_30d": "0.85",
+                        "positive_ratio_90d": "0.8",
+                        "coverage_30d": "0.95",
+                        "coverage_90d": "0.92",
+                        "conservative_apr": "0.25",
+                        "history_coverage": "0.95",
+                    }
+                if scen == "unknown-schedule" or harness_state.get("scenario") == "unknown-schedule":
+                    return {"symbol": s}
+                return {
+                    "symbol": s,
+                    "current_rate": "0.0005",
+                    "last_settled_rate": "0.0004",
+                    "funding_30d": "0.018",
+                    "funding_7d": "0.004",
+                    "funding_90d": "0.05",
+                    "positive_ratio_30d": "0.85",
+                    "positive_ratio_90d": "0.8",
+                    "coverage_30d": "0.95",
+                    "coverage_90d": "0.92",
+                    "conservative_apr": "0.25",
+                    "history_coverage": "0.95",
+                }
+
+            def _rules_fn() -> dict[str, Any]:
+                return {
+                    "symbol": "1000PEPEUSDT",
+                    "lot_rules": {"step_size": "0.001", "min_qty": "0.001", "max_qty": "10000000"},
+                    "notional_rules": {"min_notional": "5", "max_notional": "1000000"},
+                    "price_rules": {"min_price": "0.000001", "max_price": "1000000"},
+                    "order_types": ["LIMIT", "MARKET", "STOP", "STOP_MARKET"],
+                    "stop_orders_supported": True,
+                    "conditional_orders_source_ref": "exchangeInfo:1000PEPEUSDT",
+                }
+
+            async def _metadata_fn() -> dict[str, Any]:
+                now = _now()
+                scen = str(harness_state.get("scenario") or "normal")
+                if scen == "unknown-schedule":
+                    # Unknown listing (no onboard) -> HISTORY_CLASS_UNKNOWN.
+                    return {
+                        "1000PEPEUSDT": {"symbol": "1000PEPEUSDT", "status": "TRADING", "contract_type": "PERPETUAL", "observed_at_ms": now},
+                        "BTCUSDT": {"symbol": "BTCUSDT", "status": "TRADING", "contract_type": "PERPETUAL", "observed_at_ms": now},
+                    }
+                onboard = now - 200 * 86_400_000
+                return {
+                    "1000PEPEUSDT": {"symbol": "1000PEPEUSDT", "status": "TRADING", "contract_type": "PERPETUAL", "onboard_at_ms": onboard, "observed_at_ms": now},
+                    "BTCUSDT": {"symbol": "BTCUSDT", "status": "TRADING", "contract_type": "PERPETUAL", "onboard_at_ms": onboard, "observed_at_ms": now},
+                }
+
+            try:
+                # Only fill when unbound so explicit test doubles still win.
+                if getattr(svc, "_hedge_mark_fn", None) is None:
+                    svc._hedge_mark_fn = _mark_fn  # type: ignore[attr-defined]
+                # ProductionHedgeMarket already set mark/quote/funding; for
+                # acceptance we override with deterministic raw fixtures so
+                # offline runs are reproducible (real ports still compute).
+                svc._hedge_mark_fn = _mark_fn  # type: ignore[attr-defined]
+                svc._hedge_quote_fn = _quote_fn  # type: ignore[attr-defined]
+                svc._hedge_funding_fn = _funding_fn  # type: ignore[attr-defined]
+                svc._hedge_futures_rules_fn = _rules_fn  # type: ignore[attr-defined]
+                svc._hedge_spot_rules_fn = _rules_fn  # type: ignore[attr-defined]
+                svc._metadata_fn = _metadata_fn  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return out
+
+        rt.start = _acceptance_start  # type: ignore[method-assign]
+        return rt
+
+    sig = inspect.signature(shortlab_runtime_factory)
+    assert len(sig.parameters) == 0, "harness factory must take no arguments"
+
+    app = create_app(shortlab_runtime_factory=shortlab_runtime_factory)
+
+    from fastapi import APIRouter
+    from fastapi.responses import JSONResponse
+
+    control = APIRouter(prefix="/test/harness", tags=["repair-harness"])
+
+    @control.get("/state")
+    async def _harness_state() -> Any:
+        try:
+            now_ms = int(clock_ms())
+        except Exception:
+            now_ms = -1
+        provider = FakeHarnessRawProvider(harness_state["scenario"])
+        return {
+            "scenario": harness_state["scenario"],
+            "canonicalScenario": harness_state["canonical_scenario"],
+            "nowMs": now_ms,
+            "origin": HARNESS_ORIGIN,
+            "bindingsMode": harness_state["bindings_mode"],
+            "fundingCase": provider.funding_case(),
+            "slowProviderDelayMs": provider.slow_provider_delay_ms(),
+            "planSequence": list(provider.plan_sequence()),
+            "acceptance": ACCEPTANCE_MODE,
+        }
+
+    @control.post("/advance")
+    async def _harness_advance(payload: dict[str, Any]) -> Any:
+        try:
+            ms = int((payload or {}).get("ms", 0))
+        except Exception:
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        if ms < 0:
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        try:
+            new_now = advance_harness_clock(clock_ms, ms)
+        except TypeError:
+            return JSONResponse({"error": "HARNESS_CLOCK_NOT_ADVANCEABLE"}, status_code=400)
+        return {"nowMs": int(new_now), "advancedMs": int(ms)}
+
+    @control.post("/scenario")
+    async def _harness_switch(payload: dict[str, Any]) -> Any:
+        name = str((payload or {}).get("scenario", ""))
+        if name not in HARNESS_SCENARIOS:
+            return JSONResponse({"error": "HARNESS_SCENARIO_UNKNOWN"}, status_code=422)
+        harness_state["scenario"] = name
+        harness_state["canonical_scenario"] = canonical_scenario(name)
+        return {"scenario": name, "canonicalScenario": harness_state["canonical_scenario"]}
+
+    app.include_router(control)
+
+    try:
+        _harness_paths = {"/test/harness/state", "/test/harness/advance", "/test/harness/scenario"}
+        _harness_routes = [r for r in app.routes if str(getattr(r, "path", "")) in _harness_paths]
+        if _harness_routes:
+            _rest = [r for r in app.routes if r not in _harness_routes]
+            _mounts: list[Any] = []
+            _plain: list[Any] = []
+            for r in _rest:
+                _name = type(r).__name__
+                if _name == "Mount" or "StaticFiles" in _name or str(getattr(r, "path", "")) == "/":
+                    _mounts.append(r)
+                else:
+                    _plain.append(r)
+            app.routes[:] = _plain + _harness_routes + _mounts  # type: ignore[attr-defined]
+            try:
+                app.router.routes[:] = app.routes  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        app.state._repair_harness_state = harness_state  # type: ignore[attr-defined]
+        app.state._repair_factory_calls = factory_calls  # type: ignore[attr-defined]
+        app.state._repair_harness_clock = clock_ms  # type: ignore[attr-defined]
+        app.state._repair_harness_scenario = scenario  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return app
+
