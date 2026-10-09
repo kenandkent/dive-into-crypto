@@ -109,6 +109,64 @@ async def _default_http_get(
     return await get_json(url, dict(params))
 
 
+def _validate_verified_metadata(symbol: Any, entry: Any) -> None:
+    """R02b: verified-directory metadata check (fail loud, never guessed).
+
+    Supplements :func:`overrides.validate_override_entry` without adding any
+    speculative mapping:
+
+    - ``canonical_id`` is required (non-empty str): without it the resolver
+      could not bind a stable canonical asset.
+    - ``contract_multiplier`` + ``multiplier_source`` are both required with
+      explicit provenance (``MANUAL``/``EXCHANGE``, multiplier > 0). A bare
+      symbol or an unsourced/non-positive multiplier must fail at load
+      instead of serving a candidate the resolver could mistake for a
+      verified 1x binding (D04.1: never guess 1000 from the prefix).
+    - ``contract_address`` without ``chain`` fails loud (uncomparable
+      on-chain identity). ``chain`` without an address stays allowed
+      (native/settlement rows such as ETH).
+
+    Structural address validity (length/checksum) is deliberately NOT
+    re-checked here: the frozen ``verified_assets.yaml`` carries its known
+    quirks byte-for-byte (e.g. the 41-hex SHIB row) and F04 forbids silently
+    rewriting or guessing a replacement -- comparison-time normalization in
+    ``resolver.normalize_chain_address`` still applies. Only the
+    presence-pairing above is enforced.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"verified entry for {symbol!r} must be a mapping")
+    canonical = entry.get("canonical_id")
+    if not isinstance(canonical, str) or not canonical.strip():
+        raise ValueError(
+            f"verified entry for {symbol!r}: canonical_id must be a non-empty string"
+        )
+    mult = entry.get("contract_multiplier")
+    if isinstance(mult, bool) or not isinstance(mult, (int, float)) or not mult > 0:
+        raise ValueError(
+            f"verified entry for {symbol!r}: contract_multiplier must be > 0 with "
+            "explicit provenance (never guess from the symbol prefix)"
+        )
+    src = entry.get("multiplier_source")
+    if src not in ("MANUAL", "EXCHANGE"):
+        raise ValueError(
+            f"verified entry for {symbol!r}: multiplier_source must be MANUAL or "
+            f"EXCHANGE, got {src!r}"
+        )
+    address = entry.get("contract_address")
+    chain = entry.get("chain")
+    if address is not None:
+        if not isinstance(address, str) or not address.strip():
+            raise ValueError(
+                f"verified entry for {symbol!r}: contract_address must be a non-empty "
+                "string or absent"
+            )
+        if not isinstance(chain, str) or not chain.strip():
+            raise ValueError(
+                f"verified entry for {symbol!r}: contract_address without chain is "
+                "uncomparable (set an explicit chain)"
+            )
+
+
 def load_verified_assets(path: str | pathlib.Path | None = None) -> dict:
     """Load the human-verified asset set (layer 1).
 
@@ -134,6 +192,7 @@ def load_verified_assets(path: str | pathlib.Path | None = None) -> dict:
     for symbol, entry in assets.items():
         try:
             _overrides.validate_override_entry(symbol, entry)
+            _validate_verified_metadata(symbol, entry)
         except ValueError as exc:
             raise ValueError(f"{doc_path}: {exc}") from exc
     return {"version": version, "assets": dict(assets)}
@@ -662,7 +721,13 @@ class IdentityCatalog:
 
 
 def _checked_verified(doc: Mapping[str, Any]) -> dict:
-    """Validate an embedded verified-assets document (tests/F06 wiring)."""
+    """Validate an embedded verified-assets document (tests/F06 wiring).
+
+    Applies the same R02b metadata check as :func:`load_verified_assets`
+    (canonical_id + explicit multiplier provenance + address/chain pairing).
+    Empty ``assets`` stays allowed so directory-only tests can isolate the
+    network layer; every present row must still be fully specified.
+    """
     if not isinstance(doc, Mapping):
         raise ValueError("verified assets must be a mapping")
     version = doc.get("version")
@@ -673,4 +738,5 @@ def _checked_verified(doc: Mapping[str, Any]) -> dict:
         raise ValueError("verified assets 'assets' must be a mapping")
     for symbol, entry in assets.items():
         _overrides.validate_override_entry(symbol, entry)
+        _validate_verified_metadata(symbol, entry)
     return {"version": version, "assets": dict(assets)}
