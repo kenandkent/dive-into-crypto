@@ -515,6 +515,67 @@ class ShortLabRuntime:
                     self._service._data_dir = self._data_dir
             except Exception:
                 pass
+        # R10b D19.6: default real RepairPorts binding (production).
+        # Explicit repair_ports wins; None + allow_test_bindings=False builds
+        # real producers (never Fake). Explicit test fakes require
+        # allow_test_bindings=True (harness only); production never falls back
+        # to True and never reads config/env for it.
+        try:
+            from diveintocrypto_desktop.shortlab.service import (
+                build_default_repair_ports as _build_ports,
+            )
+            from diveintocrypto_desktop.shortlab.service import (
+                is_real_repair_callback as _is_real,
+            )
+
+            _svc_ports = getattr(self._service, "_repair_ports", None)
+            if _svc_ports is None and self._repair_ports is None:
+                if not bool(self._allow_test_bindings):
+                    try:
+                        _real = _build_ports()
+                        self._service._repair_ports = _real
+                        self._repair_ports = _real
+                    except Exception as exc:  # noqa: BLE001 - binding failure stays unbound (503)
+                        log.warning("shortlab default repair binding skipped: %s", str(exc)[:150])
+                # allow_test_bindings=True with None ports keeps unbound (boundary test).
+            elif _svc_ports is not None or self._repair_ports is not None:
+                # Explicit bundle: verify D19.6 when test bindings are forbidden.
+                _bundle = _svc_ports if _svc_ports is not None else self._repair_ports
+                if not bool(self._allow_test_bindings):
+                    try:
+                        from diveintocrypto_desktop.shortlab.repair_ports import REPAIR_PORT_KEYS as _KEYS
+
+                        for _k in _KEYS:
+                            _cb = getattr(_bundle, _k, None)
+                            if _cb is not None and not _is_real(_cb):
+                                log.warning(
+                                    "shortlab fake repair binding rejected for %s (allow_test_bindings=False); treating as unbound",
+                                    _k,
+                                )
+                                # Neutralise the fake slot (frozen dataclass -> replace).
+                                try:
+                                    import dataclasses as _dc_r
+
+                                    _bundle = _dc_r.replace(_bundle, **{_k: None})
+                                except Exception:
+                                    pass
+                        # Publish the sanitised bundle back.
+                        try:
+                            self._service._repair_ports = _bundle
+                            self._repair_ports = _bundle
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                else:
+                    # Harness with explicit TEST_FAKE: publish as-is.
+                    try:
+                        if getattr(self._service, "_repair_ports", None) is None:
+                            self._service._repair_ports = self._repair_ports
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         from diveintocrypto_desktop.shortlab.hedge.market import ProductionHedgeMarket
         from diveintocrypto_desktop.shortlab.evidence.historical_market import RepositoryHistoricalMarketProvider
         from diveintocrypto_desktop.shortlab.hedge.jobs import HedgeJobs
@@ -528,7 +589,46 @@ class ShortLabRuntime:
                                ("_hedge_funding_fn", market.funding)):
             if getattr(service, name, None) is None:
                 setattr(service, name, callback)
-        service._hedge_market_provider = RepositoryHistoricalMarketProvider(self._repository)
+        # R10b: RepositoryPort/MarketPort seams (D13.1/D19.1). The real
+        # repository already implements the 20-method protocol; the real
+        # ProductionHedgeMarket implements the 3 collectors. Bind them
+        # explicitly when unbound (never Fake).
+        try:
+            if getattr(service, "_repository_port", None) is None:
+                service._repository_port = self._repository
+        except Exception:
+            pass
+        try:
+            if getattr(service, "_market_port", None) is None:
+                service._market_port = market
+        except Exception:
+            pass
+        # R10b: Directional metrics provider (real, empty DB -> 200/0, never permanent not-wired).
+        try:
+            if getattr(service, "_metrics_provider", None) is None:
+                from diveintocrypto_desktop.shortlab.evidence.metrics import (
+                    build_metrics_provider as _bmp,
+                )
+
+                try:
+                    service._metrics_provider = _bmp(self._repository, config, self._clock)
+                except TypeError:
+                    service._metrics_provider = _bmp(self._repository, config)
+        except Exception as exc:  # noqa: BLE001 - wiring is observable via 503
+            log.debug("shortlab default metrics wiring skipped: %s", str(exc)[:120])
+        # R10b: Historical MARK provider with R03 fetch_mark_klines_range injection.
+        try:
+            from diveintocrypto_desktop.data.binance_klines import fetch_mark_klines_range as _mark_fn
+        except Exception:
+            _mark_fn = None  # type: ignore[assignment]
+        try:
+            service._hedge_market_provider = RepositoryHistoricalMarketProvider(
+                self._repository, mark_price_bars_fn=_mark_fn
+            )
+        except TypeError:
+            service._hedge_market_provider = RepositoryHistoricalMarketProvider(self._repository)
+        except Exception:
+            pass
         if getattr(service, "_hedge_jobs", None) is None:
             HedgeJobs(service)
         if self._scheduler is None:

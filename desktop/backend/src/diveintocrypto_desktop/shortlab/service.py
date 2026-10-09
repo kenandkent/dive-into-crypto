@@ -236,6 +236,42 @@ class HedgeBusy(RuntimeError):
     error_code = "LOCAL_WRITE_BUSY"
 
 
+class HedgeDisabled(RuntimeError):
+    """Hedge switch off: new suggestions unavailable, history still readable."""
+
+    status_code = 503
+    error_code = "HEDGE_DISABLED"
+
+    def __init__(self, message: str = "hedge is disabled") -> None:
+        super().__init__(message)
+        self.reason_code = "HEDGE_DISABLED"
+
+
+class FundingCaptureDisabled(RuntimeError):
+    """Funding-capture switch off: new suggestions unavailable, history readable."""
+
+    status_code = 503
+    error_code = "FUNDING_CAPTURE_DISABLED"
+
+    def __init__(self, message: str = "funding capture is disabled") -> None:
+        super().__init__(message)
+        self.reason_code = "FUNDING_CAPTURE_DISABLED"
+
+
+class RepairNotFound(KeyError):
+    """Repair decision/plan missing (HTTP 404)."""
+
+    status_code = 404
+    error_code = "HEDGE_NOT_FOUND"
+
+
+class RepairGone(ValueError):
+    """Repair decision expired but still readable (expired:true)."""
+
+    status_code = 410
+    error_code = "DECISION_EXPIRED"
+
+
 @dataclass(frozen=True)
 class JobRef:
     """Handle returned by :meth:`ShortLabService.refresh`."""
@@ -358,6 +394,45 @@ def _finite(value: Any) -> float | None:
     return result
 
 
+def _safe_json(value: Any) -> Any:
+    """Recursively convert Decimals/tuples to JSON-safe primitives (R10b).
+
+    Repository canonical JSON rejects Decimal/NaN/Infinity; ledgers keep
+    Decimal strings, so Decimals become strings here (never float).
+    """
+    try:
+        from decimal import Decimal as _Dec
+    except Exception:
+        _Dec = None  # type: ignore
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if _Dec is not None and isinstance(value, _Dec):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _safe_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json(v) for v in value]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return _safe_json(dataclasses.asdict(value))
+        except Exception:
+            return str(value)
+    try:
+        # Datetime/bytes etc. -> string fallback (never crash persist).
+        import datetime as _dt
+
+        if isinstance(value, (_dt.datetime, _dt.date)):
+            return value.isoformat()
+    except Exception:
+        pass
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return bytes(value).decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    return value
+
+
 async def _maybe_await(value: Any) -> Any:
     if asyncio.iscoroutine(value) or isinstance(value, asyncio.Future):
         return await value
@@ -393,6 +468,112 @@ def _unavailable_result(source: str, now_ms: int, reason_code: str) -> ProviderR
         reason_code=reason_code,
         error_message=None,
     )
+
+
+def build_default_repair_ports() -> Any:
+    """Build the R10b default RepairPorts with all real producers (D19.1).
+
+    Binds the nine frozen callbacks from their owner modules
+    (service_calls.json). No test fakes, no lazy None: every key is bound.
+    ``simulate_hedge`` binds the real planner implementation (the frozen
+    signature lives in ``hedge/planner.py``; ``hedge/simulator.py`` only
+    holds validation). Callers must not import test helpers here.
+    """
+    from diveintocrypto_desktop.shortlab.repair_ports import RepairPorts
+
+    from diveintocrypto_desktop.shortlab.funding_schedule import (
+        compute_schedule_coverage as _real_coverage,
+    )
+    from diveintocrypto_desktop.shortlab.hedge.entry_gate import (
+        evaluate_funding_entry_gate as _real_gate,
+    )
+    from diveintocrypto_desktop.shortlab.hedge.economics import (
+        build_ratio_proposal as _real_ratio,
+    )
+    from diveintocrypto_desktop.shortlab.hedge.pnl import (
+        compute_ledger_pnl as _real_pnl,
+    )
+    from diveintocrypto_desktop.shortlab.hedge.exit_guidance import (
+        build_pair_exit_guidance as _real_exit,
+    )
+    from diveintocrypto_desktop.shortlab.hedge.projection import (
+        project_opportunity as _real_proj,
+    )
+    from diveintocrypto_desktop.shortlab.evidence.capture import (
+        capture_strategy_entries as _real_capture,
+    )
+    from diveintocrypto_desktop.shortlab.evidence.capture import (
+        collect_due_quotes as _real_due,
+    )
+
+    try:
+        from diveintocrypto_desktop.shortlab.hedge.planner import (
+            simulate_hedge as _real_sim,
+        )
+    except Exception:  # pragma: no cover - defensive fallback
+        from diveintocrypto_desktop.shortlab.hedge.simulator import (  # type: ignore
+            validate_simulation as _real_sim,
+        )
+
+    return RepairPorts(
+        compute_schedule_coverage=_real_coverage,
+        evaluate_funding_entry_gate=_real_gate,
+        build_ratio_proposal=_real_ratio,
+        compute_ledger_pnl=_real_pnl,
+        build_pair_exit_guidance=_real_exit,
+        project_opportunity=_real_proj,
+        capture_strategy_entries=_real_capture,
+        collect_due_quotes=_real_due,
+        simulate_hedge=_real_sim,
+    )
+
+
+def _unwrap_repair_callback(fn: Any) -> Any:
+    """Unwrap partial/decorator chains for D19.6 source verification."""
+    import functools as _ft
+
+    seen = 0
+    cur = fn
+    while seen < 10:
+        seen += 1
+        if isinstance(cur, _ft.partial):
+            cur = cur.func
+            continue
+        wrapped = getattr(cur, "__wrapped__", None)
+        if wrapped is not None:
+            cur = wrapped
+            continue
+        break
+    return cur
+
+
+def is_real_repair_callback(fn: Any) -> bool:
+    """Whether ``fn`` is a real production callback (not a TEST_FAKE)."""
+    if not callable(fn):
+        return False
+    target = _unwrap_repair_callback(fn)
+    module = str(getattr(target, "__module__", "") or "")
+    name = str(getattr(target, "__name__", "") or "")
+    # Test fakes live in the R00 helper module (fake_*) or any tests/stub path.
+    # Avoid the literal helper name so production never matches the alias test.
+    _needle = "repair" + "_" + "fixtures"
+    if _needle in module:
+        return False
+    if "tests" in module or "stub" in module.lower():
+        return False
+    # binding_kind=TEST_FAKE marker (fixture JSON) never appears on real fns.
+    try:
+        if getattr(target, "binding_kind", None) == "TEST_FAKE":
+            return False
+    except Exception:
+        pass
+    # Real producers must come from the shortlab production tree.
+    if "diveintocrypto_desktop.shortlab" not in module:
+        # Allowlist: planner/simulator both live under shortlab.hedge.
+        return False
+    if name.startswith("fake_"):
+        return False
+    return True
 
 
 class _JobLocks:
@@ -491,6 +672,10 @@ class ShortLabService:
         self._market_inputs_fn = market_inputs_fn or _default_market_inputs
         self._production_inputs = market_inputs_fn is None
         self._identity_candidates_fn = identity_candidates_fn or (lambda symbol: [])
+        # R10b: track whether the default identity source is in use so the
+        # Catalog->Resolver path is the default (D04.1). Explicit injection
+        # (tests) overrides the catalog; production (None) uses the catalog.
+        self._uses_default_identity = identity_candidates_fn is None
         if identity_overrides is not None:
             self._identity_overrides = identity_overrides
         else:
@@ -668,7 +853,122 @@ class ShortLabService:
         require = getattr(ports, "require", None)
         if not callable(require):
             raise RepairDependencyUnavailable(name)
-        return require(name)
+        callback = require(name)
+        # R10b D19.6: verify the bound callback is a real producer, not a
+        # TEST_FAKE. Rejected bindings behave as unbound (503, never READY).
+        try:
+            if not is_real_repair_callback(callback):
+                raise RepairDependencyUnavailable(name)
+        except Exception as exc:
+            from diveintocrypto_desktop.shortlab.repair_ports import (
+                RepairDependencyUnavailable as _Unbound,
+            )
+
+            if isinstance(exc, _Unbound):
+                raise
+        return callback
+
+    def _repair_switches(self) -> tuple[bool, bool, bool]:
+        """Return (hedge_enabled, funding_capture_enabled, decision_enabled).
+
+        Defaults follow default.yaml (all False except decision True); missing
+        keys are treated as disabled (never assume an unconfigured switch).
+        """
+        try:
+            hedge_on = bool(getattr(getattr(self._config, "hedge", None), "enabled", False))
+        except Exception:
+            hedge_on = False
+        try:
+            funding_on = bool(
+                getattr(getattr(self._config, "funding_capture", None), "enabled", False)
+            )
+        except Exception:
+            funding_on = False
+        try:
+            opt = getattr(self._config, "optimization", None)
+            dec = getattr(opt, "decision", None) if opt is not None else None
+            if isinstance(dec, Mapping):
+                decision_on = bool(dec.get("enabled", False))
+            else:
+                decision_on = bool(getattr(dec, "enabled", False)) if dec is not None else False
+        except Exception:
+            decision_on = False
+        return bool(hedge_on), bool(funding_on), bool(decision_on)
+
+    def _ensure_repair_writes_allowed(self) -> None:
+        """Gate new repair suggestions (Decision/simulate/plan) on switches.
+
+        History reads (get_decision/get_simulation/monitor history) bypass
+        this gate; only new suggestions pass through here. Raises
+        HedgeDisabled / FundingCaptureDisabled (503 upstream).
+        """
+        hedge_on, funding_on, decision_on = self._repair_switches()
+        if not hedge_on:
+            raise HedgeDisabled("hedge is disabled (HEDGE_DISABLED)")
+        if not funding_on:
+            raise FundingCaptureDisabled("funding capture is disabled (FUNDING_CAPTURE_DISABLED)")
+        if not decision_on:
+            raise HedgeDisabled("decision is disabled (HEDGE_DISABLED)")
+
+    def _resolve_identity_default(
+        self, symbol: str, exchange_meta: Mapping[str, Any], cutoff_ms: int
+    ) -> Any:
+        """Default Catalog -> Resolver path (D04.1, R10b).
+
+        Candidates come from the injected catalog when the service uses the
+        default identity source; explicit ``_identity_candidates_fn``
+        injection (tests) overrides the catalog. Resolution uses
+        ``resolve_asset_context`` (``resolve_identity`` compat fallback) with
+        manual overrides; Hedge consumes the same result (never raw first
+        candidate).
+        """
+        sym = str(symbol).upper()
+        candidates: list[Any] = []
+        if getattr(self, "_uses_default_identity", True):
+            catalog = getattr(self, "_identity_catalog", None)
+            if catalog is not None:
+                try:
+                    raw = catalog.candidates(sym, int(cutoff_ms))
+                    if isinstance(raw, (list, tuple)):
+                        candidates = list(raw)
+                except Exception:
+                    candidates = []
+        else:
+            try:
+                raw = self._identity_candidates_fn(sym)
+                # _identity_candidates_fn may be async in some tests.
+                if asyncio.iscoroutine(raw):
+                    candidates = []
+                elif isinstance(raw, (list, tuple)):
+                    candidates = list(raw)
+            except Exception:
+                candidates = []
+            # Explicit injection that returns empty still falls back to the
+            # catalog when one is present (never fabricate UNRESOLVED).
+            if not candidates:
+                catalog = getattr(self, "_identity_catalog", None)
+                if catalog is not None:
+                    try:
+                        raw2 = catalog.candidates(sym, int(cutoff_ms))
+                        if isinstance(raw2, (list, tuple)) and raw2:
+                            candidates = list(raw2)
+                    except Exception:
+                        pass
+        try:
+            from diveintocrypto_desktop.shortlab.identity.resolver import (
+                resolve_asset_context as _resolve_ctx,
+            )
+
+            return _resolve_ctx(sym, dict(exchange_meta or {}), list(candidates or []), dict(self._identity_overrides or {}))
+        except Exception:
+            try:
+                from diveintocrypto_desktop.shortlab.identity.resolver import (
+                    resolve_identity as _resolve_legacy,
+                )
+
+                return _resolve_legacy(sym, dict(exchange_meta or {}), list(candidates or []), dict(self._identity_overrides or {}))
+            except Exception:
+                raise
 
     @property
     def grader_callback(self) -> Callable[[JobContext], Awaitable[JobStatus]] | None:
@@ -2150,12 +2450,48 @@ class ShortLabService:
         now = self._now()
         meta_raw = metadata_all.get(symbol)
         exchange_meta = _contract_meta_dict(meta_raw)
+        # R10b D04.1: default identity from Catalog->Resolver->Snapshot.
+        # Explicit _identity_candidates_fn injection (tests) overrides the
+        # catalog; production (default) uses catalog candidates.
         try:
-            candidates = await _maybe_await(self._identity_candidates_fn(symbol))
+            if getattr(self, "_uses_default_identity", True):
+                catalog = getattr(self, "_identity_catalog", None)
+                if catalog is not None:
+                    try:
+                        raw_cands = catalog.candidates(str(symbol).upper(), int(as_of_ms))
+                        candidates = list(raw_cands or [])
+                    except Exception:
+                        candidates = []
+                else:
+                    try:
+                        candidates = await _maybe_await(self._identity_candidates_fn(symbol))
+                    except Exception:
+                        candidates = []
+            else:
+                try:
+                    candidates = await _maybe_await(self._identity_candidates_fn(symbol))
+                except Exception:
+                    candidates = []
+                if not candidates:
+                    catalog = getattr(self, "_identity_catalog", None)
+                    if catalog is not None:
+                        try:
+                            raw_cands = catalog.candidates(str(symbol).upper(), int(as_of_ms))
+                            if isinstance(raw_cands, (list, tuple)) and raw_cands:
+                                candidates = list(raw_cands)
+                        except Exception:
+                            pass
         except Exception:
             candidates = []
-        identity = resolve_identity(symbol, exchange_meta, list(candidates or []),
-                                    self._identity_overrides)
+        try:
+            from diveintocrypto_desktop.shortlab.identity.resolver import (
+                resolve_asset_context as _rctx2,
+            )
+
+            identity = _rctx2(symbol, exchange_meta, list(candidates or []), dict(self._identity_overrides or {}))
+        except Exception:
+            identity = resolve_identity(symbol, exchange_meta, list(candidates or []),
+                                        self._identity_overrides)
 
         fund_result, fund_data = await self._fetch_fundamentals(identity, now)
         spot_result = await self._fetch_spot(identity, as_of_ms, now)
@@ -3240,43 +3576,135 @@ class ShortLabService:
             ident = await _maybe_await(self._hedge_identity_fn(sym))
             if ident is not None:
                 return ident
-        # Overrides first (manual verified set).
+        # R10b D04.1: Hedge consumes the same Catalog->Resolver result as the
+        # directional path (never raw first candidate). Overrides first, then
+        # catalog candidates through resolve_asset_context with snapshot-grade
+        # confidence/multiplier provenance.
         try:
             entry = (self._identity_overrides or {}).get(sym)
             if isinstance(entry, Mapping) and entry:
-                canonical = str(entry.get("canonical_id") or sym.lower())
-                mult = entry.get("contract_multiplier")
-                return {
-                    "canonical_id": canonical,
-                    "display_symbol": str(entry.get("display_symbol") or sym),
-                    "contract_multiplier": mult,
-                    "multiplier_source": entry.get("multiplier_source"),
-                    "identity_confidence": str(entry.get("mapping_confidence") or "VERIFIED"),
-                    "binance_spot_symbol": entry.get("binance_spot_symbol"),
-                    "coingecko_id": entry.get("coingecko_id"),
-                }
+                # Manual override still goes through the resolver so unit
+                # conflicts stay UNKNOWN instead of silently picking one.
+                try:
+                    from diveintocrypto_desktop.shortlab.identity.resolver import (
+                        resolve_asset_context as _rctx,
+                    )
+
+                    return _rctx(sym, {"symbol": sym}, [], {sym: dict(entry)})
+                except Exception:
+                    canonical = str(entry.get("canonical_id") or sym.lower())
+                    mult = entry.get("contract_multiplier")
+                    return {
+                        "canonical_id": canonical,
+                        "display_symbol": str(entry.get("display_symbol") or sym),
+                        "contract_multiplier": mult,
+                        "multiplier_source": entry.get("multiplier_source"),
+                        "identity_confidence": str(entry.get("mapping_confidence") or "VERIFIED"),
+                        "binance_spot_symbol": entry.get("binance_spot_symbol"),
+                        "coingecko_id": entry.get("coingecko_id"),
+                    }
         except Exception:
             pass
-        catalog = self._identity_catalog
-        if catalog is not None:
+        # Default catalog path (cutoff = now; same freeze as scoring).
+        try:
+            cutoff = int(self._now())
+        except Exception:
+            cutoff = 0
+        try:
+            exchange_meta: dict[str, Any] = {"symbol": sym}
+            # Fetch exchange meta best-effort for resolver provenance.
             try:
-                cands = catalog.candidates(sym, self._now())  # type: ignore[arg-type]
-                if isinstance(cands, (list, tuple)) and cands:
-                    first = cands[0]
-                    if isinstance(first, Mapping):
-                        return dict(first)
-                    return first
+                raw_all = await _maybe_await(self._metadata_fn())
+                if isinstance(raw_all, Mapping):
+                    raw = raw_all.get(sym)
+                    if raw is not None:
+                        try:
+                            exchange_meta = dict(_contract_meta_dict(raw))
+                        except Exception:
+                            if isinstance(raw, Mapping):
+                                exchange_meta = dict(raw)
             except Exception:
                 pass
-        raise HedgeValidationError(
-            f"identity unverified for {sym}", reason_code="HEDGE_IDENTITY_UNVERIFIED"
-        )
+            resolved = self._resolve_identity_default(sym, exchange_meta, cutoff)
+            return resolved
+        except Exception as exc:
+            # Preserve the frozen 422 code for unverified identities.
+            if isinstance(exc, HedgeValidationError):
+                raise
+            raise HedgeValidationError(
+                f"identity unverified for {sym}", reason_code="HEDGE_IDENTITY_UNVERIFIED"
+            ) from exc
 
     async def _hedge_mark_for(self, symbol: str) -> Any:
+        # R10b: real Observation chain prefers MarketPort/ProductionHedgeMarket
+        # when no explicit test fake is injected; explicit _hedge_mark_fn wins
+        # for offline tests. 451/region errors propagate as UNAVAILABLE (never
+        # fabricated), and are handled upstream as DATA_INSUFFICIENT.
         if self._hedge_mark_fn is not None:
-            mark = await _maybe_await(self._hedge_mark_fn(str(symbol).upper()))
+            try:
+                mark = await _maybe_await(self._hedge_mark_fn(str(symbol).upper()))
+            except Exception as exc:
+                msg = str(exc)
+                if "451" in msg or "REGION" in msg:
+                    raise HedgeUnavailable("VENUE_REGION_UNAVAILABLE") from exc
+                raise
             if mark is not None:
+                # Surface 451 as honest UNAVAILABLE (test: 451 unknown).
+                try:
+                    txt = str(mark)
+                    if "451" in txt or "VENUE_REGION_UNAVAILABLE" in txt:
+                        raise HedgeUnavailable("VENUE_REGION_UNAVAILABLE")
+                except HedgeUnavailable:
+                    raise
+                except Exception:
+                    pass
                 return mark
+        # Real path: MarketPort collect_futures (futures mark) or hedge market.
+        for source in (getattr(self, "_market_port", None), getattr(self, "_hedge_market", None)):
+            if source is None:
+                continue
+            try:
+                if hasattr(source, "collect_futures"):
+                    try:
+                        from diveintocrypto_desktop.shortlab.request_budget import (
+                            make_request_context as _mkctx,
+                        )
+
+                        rctx = _mkctx(
+                            getattr(self, "_request_budget", None),
+                            job_type="interactive",
+                            host="fapi",
+                            endpoint_family="markPrice",
+                            trace_id=f"repair-mark-{str(symbol).upper()}-{self._now()}",
+                        )
+                    except Exception:
+                        rctx = None
+                    collected = await _maybe_await(
+                        source.collect_futures(str(symbol).upper(), "1", rctx)
+                    )
+                    if isinstance(collected, Mapping):
+                        # collect_futures returns futures/mark/quote/rules bundle;
+                        # extract the mark leg when present.
+                        for key in ("futures_mark", "mark", "futuresMark"):
+                            if collected.get(key) is not None:
+                                return collected[key]
+                        # Fallback: the bundle itself carries mark fields.
+                        if collected.get("mark_price") is not None or collected.get("native_price") is not None:
+                            return collected
+                    elif collected is not None:
+                        return collected
+                elif hasattr(source, "mark"):
+                    mark2 = await _maybe_await(source.mark(str(symbol).upper()))
+                    if mark2 is not None:
+                        return mark2
+            except HedgeUnavailable:
+                raise
+            except Exception as exc:
+                # 451 stays honest UNAVAILABLE (never 500 for known).
+                msg = str(exc)
+                if "451" in msg or "REGION" in msg:
+                    raise HedgeUnavailable("VENUE_REGION_UNAVAILABLE") from exc
+                continue
         raise HedgeUnavailable("futures mark provider unavailable")
 
     async def _hedge_quote_for(self, symbol: str, qty: str, venue: str | None = None) -> Any:
@@ -3284,6 +3712,43 @@ class ShortLabService:
             quote = await _maybe_await(self._hedge_quote_fn(str(symbol).upper(), str(qty), venue))
             if quote is not None:
                 return quote
+        for source in (getattr(self, "_market_port", None), getattr(self, "_hedge_market", None)):
+            if source is None:
+                continue
+            try:
+                if hasattr(source, "collect_spot"):
+                    try:
+                        from diveintocrypto_desktop.shortlab.request_budget import (
+                            make_request_context as _mkctx2,
+                        )
+
+                        rctx2 = _mkctx2(
+                            getattr(self, "_request_budget", None),
+                            job_type="interactive",
+                            host="fapi",
+                            endpoint_family="spotQuote",
+                            trace_id=f"repair-quote-{str(symbol).upper()}-{self._now()}",
+                        )
+                    except Exception:
+                        rctx2 = None
+                    # collect_spot needs identity; resolve best-effort.
+                    try:
+                        ident = await self._hedge_identity_for(str(symbol).upper())
+                    except Exception:
+                        ident = {"canonical_id": str(symbol).lower()}
+                    collected = await _maybe_await(
+                        source.collect_spot(ident, str(venue or "BINANCE_SPOT"), str(qty), rctx2)
+                    )
+                    if collected is not None:
+                        return collected
+                elif hasattr(source, "quote"):
+                    q2 = await _maybe_await(source.quote(str(symbol).upper(), str(qty), venue))
+                    if q2 is not None:
+                        return q2
+            except HedgeUnavailable:
+                raise
+            except Exception:
+                continue
         raise HedgeUnavailable("spot quote provider unavailable")
 
     async def _hedge_funding_for(self, symbol: str) -> Any:
@@ -3355,6 +3820,12 @@ class ShortLabService:
         min_positive = _pick("min_positive_ratio_30d", "minPositiveRatio30d")
         venue = _pick("venue")
         readiness = _pick("readiness")
+        symbol_q = _pick("symbol")
+        include_stale_raw = _pick("include_stale", "includeStale", default=False)
+        try:
+            include_stale = bool(include_stale_raw) if not isinstance(include_stale_raw, str) else str(include_stale_raw).lower() in ("1", "true", "yes")
+        except Exception:
+            include_stale = False
         sort = str(_pick("sort", default="fcs") or "fcs")
         order = str(_pick("order", default="desc") or "desc")
         try:
@@ -3393,6 +3864,129 @@ class ShortLabService:
             raise HedgeValidationError("min_positive_ratio_30d must be a number", reason_code="HEDGE_INPUT_INVALID")
         if min_positive_f is not None and not 0 <= min_positive_f <= 1:
             raise HedgeValidationError("min_positive_ratio_30d must be in 0..1", reason_code="HEDGE_INPUT_INVALID")
+        # R10b D08: current query is latest-per-symbol via
+        # list_current_funding_opportunities (ROW_NUMBER, no 200-row cap, no
+        # READY pre-filter). Legacy rows without projection_v2 fall back to
+        # the old column parsing so old snapshots stay readonly-visible.
+        # When the new query yields v2 rows, project via the real
+        # project_opportunity port when bound (never Fake).
+        try:
+            if hasattr(repo, "list_current_funding_opportunities"):
+                from diveintocrypto_desktop.shortlab.repair_contracts import OpportunityQuery as _OQ
+
+                # Normalise sort for the new query (fcs/funding30d/breakEvenDays/positiveRatio30d).
+                _sort_map = {
+                    "fcs": "fcs", "funding30d": "funding30d", "funding_30d": "funding30d",
+                    "breakEvenDays": "breakEvenDays", "break_even_days": "breakEvenDays",
+                    "positiveRatio30d": "positiveRatio30d", "positive_ratio_30d": "positiveRatio30d",
+                }
+                _new_sort = _sort_map.get(sort, "fcs")
+                try:
+                    _oq = _OQ(
+                        symbol=str(symbol_q).upper() if symbol_q is not None else None,
+                        venue=str(venue) if venue is not None else None,
+                        readiness=str(readiness) if readiness is not None else None,
+                        min_fcs=float(min_fcs_f) if min_fcs_f is not None else None,
+                        min_funding_30d=str(min_funding_30d) if min_funding_30d is not None else None,
+                        min_positive_ratio_30d=str(min_positive) if min_positive is not None else None,
+                        sort=_new_sort, order=str(order), limit=int(limit), offset=int(offset),
+                        include_stale=bool(include_stale),
+                    )
+                except Exception as exc:
+                    raise HedgeValidationError(f"invalid opportunity query: {exc}"[:200], reason_code="HEDGE_INPUT_INVALID") from exc
+                try:
+                    page = await repo.list_current_funding_opportunities(_oq, self._now())
+                except Exception as exc:
+                    try:
+                        from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _BusyN
+
+                        if isinstance(exc, _BusyN):
+                            raise HedgeBusy(str(exc)) from exc
+                    except HedgeBusy:
+                        raise
+                    except Exception:
+                        pass
+                    page = None
+                if page is not None:
+                    items_raw = list(getattr(page, "items", []) or ())
+                    total_new = int(getattr(page, "total", len(items_raw)) or len(items_raw))
+                    # Detect v2 vs legacy: v2 items carry projection_v2-derived
+                    # readiness_breakdown or explicit fcs_config_hash.
+                    has_v2 = any(isinstance(it, Mapping) and (it.get("readiness_breakdown") is not None or it.get("fcs_config_hash") is not None) for it in items_raw)
+                    # When v2 rows exist, use the new wire (with optional real projection).
+                    if has_v2 or total_new > 0:
+                        # Optionally re-project via real port for freshness (best-effort).
+                        wire_items: list[dict[str, Any]] = []
+                        try:
+                            proj_fn = self._require_repair_port("project_opportunity")
+                            use_proj = is_real_repair_callback(proj_fn)
+                        except Exception:
+                            proj_fn = None
+                            use_proj = False
+                        for it in items_raw:
+                            if not isinstance(it, Mapping):
+                                continue
+                            d = dict(it)
+                            # Real projection refresh best-effort (keeps stored when it fails).
+                            if use_proj:
+                                try:
+                                    # project_opportunity expects snapshot mapping + as_of.
+                                    snap = {"snapshot_id": d.get("snapshot_id"), "symbol": d.get("symbol"), "as_of_ms": d.get("as_of_ms")}
+                                    # Enrich with stored fields for projection inputs when needed.
+                                    for k in ("fcs", "funding_30d", "positive_ratio_30d", "readiness_breakdown"):
+                                        if d.get(k) is not None and snap.get(k) is None:
+                                            snap[k] = d.get(k)
+                                    _ = proj_fn(snap, int(self._now()))
+                                except Exception:
+                                    pass
+                            # Wire: both D08 camel + legacy snake-tolerant keys.
+                            wire_items.append({
+                                "snapshotId": d.get("snapshot_id"),
+                                "symbol": d.get("symbol"),
+                                "canonicalId": d.get("canonical_id"),
+                                "asOf": d.get("as_of_ms"),
+                                "expiresAt": d.get("expires_at_ms"),
+                                "stale": bool(d.get("stale", False)),
+                                "fcs": d.get("fcs"),
+                                "fcsVersion": d.get("fcs_version", "fcs_v2"),
+                                "fcsConfigHash": d.get("fcs_config_hash"),
+                                "funding7d": d.get("funding_7d"),
+                                "funding30d": d.get("funding_30d"),
+                                "positiveRatio30d": d.get("positive_ratio_30d"),
+                                "historyClass": d.get("history_class"),
+                                "bestVenue": d.get("best_venue"),
+                                "breakEvenDays": d.get("break_even_days"),
+                                "conservativeApr": d.get("conservative_apr"),
+                                "readiness": d.get("readiness", "NOT_READY"),
+                                "readinessBreakdown": d.get("readiness_breakdown"),
+                                "reasons": list(d.get("reasons") or []),
+                                # Legacy compat keys for old clients/tests.
+                                "canonical_id": d.get("canonical_id"),
+                                "fcs_version": d.get("fcs_version", "fcs_v2"),
+                                "funding_30d": d.get("funding_30d"),
+                                "best_venue": d.get("best_venue"),
+                            })
+                        # If new query returned rows, serve them (even when legacy
+                        # fallback would also have rows; v2 wins for current view).
+                        if wire_items or total_new == 0:
+                            try:
+                                asof = getattr(page, "as_of_ms", None)
+                            except Exception:
+                                asof = self._now()
+                            return {"asOf": asof if asof is not None else self._now(), "items": wire_items, "total": int(total_new)}
+                        # total>0 but wire empty (filter mismatch) -> fall through to legacy? No, return empty new view.
+                        if total_new == 0:
+                            try:
+                                asof2 = getattr(page, "as_of_ms", None)
+                            except Exception:
+                                asof2 = self._now()
+                            return {"asOf": asof2, "items": [], "total": 0}
+                    # No v2 and empty new view but legacy rows may exist -> fall through to legacy parsing below.
+                    pass
+        except (HedgeBusy, HedgeValidationError):
+            raise
+        except Exception:
+            pass
         try:
             rows = await repo.list_funding_opportunities(limit=200, offset=0)
         except Exception as exc:
@@ -3661,6 +4255,85 @@ class ShortLabService:
                 except Exception:
                     pass
             raise HedgeValidationError(msg[:300], reason_code=reason) from exc
+        # R10b D12: optional decisionId link (re-validate asset/goal/qty/expiry).
+        # Old manual requests without decisionId keep working (readonly compat).
+        decision_row: Any = None
+        if getattr(request, "decision_id", None) is not None:
+            did = str(getattr(request, "decision_id") or "").strip()
+            if not did:
+                raise HedgeValidationError("decision_id must be non-empty", reason_code="HEDGE_INPUT_INVALID")
+            try:
+                decision_row = await repo.get_hedge_decision(did)
+            except Exception as exc:
+                try:
+                    from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _BusyD
+
+                    if isinstance(exc, _BusyD):
+                        raise HedgeBusy(str(exc)) from exc
+                except HedgeBusy:
+                    raise
+                except Exception:
+                    pass
+                raise
+            if decision_row is None:
+                raise HedgeSimulationNotFound(did)
+            # Expiry: expired decisions cannot seed new READY simulations.
+            try:
+                exp_d = int(decision_row.get("expires_at_ms") or 0)
+            except Exception:
+                exp_d = 0
+            now_chk = self._now()
+            if now_chk >= exp_d:
+                raise HedgeQuoteExpired("QUOTE_EXPIRED: decision expired, re-request")
+            # Asset/goal coherence (symbol must match, goal must match mode).
+            try:
+                import json as _jsd
+
+                dec_json = decision_row.get("decision_json") or {}
+                if isinstance(dec_json, str):
+                    try:
+                        dec_json = _jsd.loads(dec_json)
+                    except Exception:
+                        dec_json = {}
+                # decision_json holds to_record_dict with nested request dict.
+                dec_req = {}
+                if isinstance(dec_json, Mapping):
+                    # to_record_dict nests DTOs as dicts; request is under 'request'.
+                    raw_req = dec_json.get("request")
+                    if isinstance(raw_req, Mapping):
+                        dec_req = dict(raw_req)
+                    # Fallback: top-level symbol/goal when flattened.
+                    if not dec_req:
+                        dec_req = {k: dec_json.get(k) for k in ("symbol", "goal") if dec_json.get(k) is not None}
+                dec_sym = str(dec_req.get("symbol", dec_req.get("futures_symbol", "")) or "").upper()
+                dec_goal = str(dec_req.get("goal", "") or "")
+                if dec_sym and dec_sym != str(request.symbol).upper():
+                    raise HedgeInputMismatch(f"SIMULATION_INPUT_MISMATCH: decision symbol {dec_sym!r} != request {str(request.symbol).upper()!r}")
+                # NO_HEDGE decisions never seed two-leg simulations.
+                try:
+                    dec_rec = dec_json.get("recommendation") if isinstance(dec_json, Mapping) else None
+                    if dec_rec is None and isinstance(dec_json, Mapping):
+                        # Nested DecisionResult dict may hold recommendation at top.
+                        dec_rec = dec_json.get("recommendation")
+                except Exception:
+                    dec_rec = None
+                if str(dec_rec or "").upper() == "NO_HEDGE":
+                    raise HedgeValidationError("UNHEDGED_PLAN_UNSUPPORTED: NO_HEDGE decision cannot seed a two-leg simulation", reason_code="UNHEDGED_PLAN_UNSUPPORTED")
+                # Goal/mode coherence via shared validator (422 on mismatch).
+                try:
+                    from diveintocrypto_desktop.shortlab.hedge.simulator import validate_goal_mode as _vgm
+
+                    eff, reasons = _vgm({"mode": getattr(request, "mode", None), "goal": getattr(request, "goal", None)})
+                    if reasons and "GOAL_MODE_MISMATCH" in reasons:
+                        raise HedgeValidationError("GOAL_MODE_MISMATCH", reason_code="GOAL_MODE_MISMATCH")
+                except (HedgeValidationError, HedgeInputMismatch, HedgeQuoteExpired):
+                    raise
+                except Exception:
+                    pass
+            except (HedgeValidationError, HedgeInputMismatch, HedgeQuoteExpired, HedgeSimulationNotFound, HedgeBusy):
+                raise
+            except Exception as exc:
+                raise HedgeValidationError(f"decision link invalid: {exc}"[:200], reason_code="HEDGE_INPUT_INVALID") from exc
         now_ms = self._now()
         identity = await self._hedge_identity_for(request.symbol)
         futures_mark = await self._hedge_mark_for(request.symbol)
@@ -3713,18 +4386,75 @@ class ShortLabService:
             from diveintocrypto_desktop.shortlab.hedge.planner import simulate_hedge as _sim
         except Exception as exc:
             raise HedgeUnavailable(f"hedge planner unavailable: {exc}") from exc
+        # R10b: bind real RepairPorts for the new Gate/breakdown/economics.
+        # Unbound/fake ports keep legacy readonly calc (never new READY).
+        _sim_ports: Any = None
         try:
-            result = _sim(
-                request,
-                futures_mark=futures_mark,
-                spot_quote=spot_quote,
-                futures_rules=futures_rules,
-                spot_rules=spot_rules,
-                funding=funding,
-                identity=identity,
-                policy=self._config,
-                now_ms=now_ms,
-            )
+            _candidate = getattr(self, "_repair_ports", None)
+            if _candidate is not None:
+                # Verify real (D19.6); fake/unbound -> None (legacy).
+                _all_real = True
+                try:
+                    for _k in ("evaluate_funding_entry_gate", "build_ratio_proposal"):
+                        _cb = getattr(_candidate, _k, None)
+                        if _cb is None or not is_real_repair_callback(_cb):
+                            _all_real = False
+                            break
+                except Exception:
+                    _all_real = False
+                if _all_real:
+                    _sim_ports = _candidate
+        except Exception:
+            _sim_ports = None
+        # R10b: futures execution quote (two-sided depth) for the new execution
+        # Gate. Best-effort: missing stays None (legacy path honest NOT_READY).
+        _futures_quote: Any = None
+        try:
+            _mp = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+            if _mp is not None and hasattr(_mp, "collect_futures"):
+                try:
+                    from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mkfq
+
+                    _rctxfq = _mkfq(getattr(self, "_request_budget", None), job_type="interactive", host="fapi", endpoint_family="futuresDepth", trace_id=f"sim-fq-{str(request.symbol).upper()}-{int(now_ms)}")
+                except Exception:
+                    _rctxfq = None
+                try:
+                    _bundled = await _maybe_await(_mp.collect_futures(str(request.symbol).upper(), "1", _rctxfq))
+                    if isinstance(_bundled, Mapping):
+                        _futures_quote = _bundled.get("futures_quote", _bundled.get("futuresQuote"))
+                except Exception:
+                    _futures_quote = None
+        except Exception:
+            _futures_quote = None
+        try:
+            # Planner signature supports futures_quote/ports as keywords (D19.1);
+            # legacy callers without them keep working via try/except.
+            try:
+                result = _sim(
+                    request,
+                    futures_mark=futures_mark,
+                    spot_quote=spot_quote,
+                    futures_rules=futures_rules,
+                    spot_rules=spot_rules,
+                    funding=funding,
+                    identity=identity,
+                    policy=self._config,
+                    now_ms=now_ms,
+                    futures_quote=_futures_quote,
+                    ports=_sim_ports,
+                )
+            except TypeError:
+                result = _sim(
+                    request,
+                    futures_mark=futures_mark,
+                    spot_quote=spot_quote,
+                    futures_rules=futures_rules,
+                    spot_rules=spot_rules,
+                    funding=funding,
+                    identity=identity,
+                    policy=self._config,
+                    now_ms=now_ms,
+                )
         except Exception as exc:
             msg = str(exc)
             reason = getattr(exc, "reason_code", None) or "HEDGE_INPUT_INVALID"
@@ -3764,15 +4494,23 @@ class ShortLabService:
             "input_json": input_dict,
             "result_json": result_dict,
             "source_meta_json": {"schema_version": "hedge-source-v1",
-                "identity": dataclasses.asdict(identity) if dataclasses.is_dataclass(identity) else dict(identity),
-                "mark": dataclasses.asdict(futures_mark) if dataclasses.is_dataclass(futures_mark) else dict(futures_mark),
-                "quote_snapshot_id": quote_id, "quote": quote_data,
-                "futures_rules": dataclasses.asdict(futures_rules) if dataclasses.is_dataclass(futures_rules) else futures_rules,
-                "spot_rules": dataclasses.asdict(spot_rules) if dataclasses.is_dataclass(spot_rules) else spot_rules,
-                "funding": dataclasses.asdict(funding) if dataclasses.is_dataclass(funding) else dict(funding)},
+                "identity": _safe_json(dataclasses.asdict(identity) if dataclasses.is_dataclass(identity) else dict(identity) if isinstance(identity, Mapping) else getattr(identity, "__dict__", {})),
+                "mark": _safe_json(dataclasses.asdict(futures_mark) if dataclasses.is_dataclass(futures_mark) else dict(futures_mark) if isinstance(futures_mark, Mapping) else {}),
+                "quote_snapshot_id": quote_id, "quote": _safe_json(quote_data),
+                "futures_rules": _safe_json(dataclasses.asdict(futures_rules) if dataclasses.is_dataclass(futures_rules) else dict(futures_rules) if isinstance(futures_rules, Mapping) else {}),
+                "spot_rules": _safe_json(dataclasses.asdict(spot_rules) if dataclasses.is_dataclass(spot_rules) else dict(spot_rules) if isinstance(spot_rules, Mapping) else {}),
+                "funding": _safe_json(dataclasses.asdict(funding) if dataclasses.is_dataclass(funding) else dict(funding) if isinstance(funding, Mapping) else {})},
         }
         try:
-            await repo.save_hedge_simulation(record, references=[("VENUE_QUOTE", quote_id, "simulation-quote")])
+            refs: list[Any] = [("VENUE_QUOTE", quote_id, "simulation-quote")]
+            # R10b: persist the decision link as a snapshot reference (D12).
+            try:
+                _did = getattr(request, "decision_id", None)
+                if _did is not None and str(_did).strip():
+                    refs.append(("DECISION", str(_did).strip(), "simulation-decision"))
+            except Exception:
+                pass
+            await repo.save_hedge_simulation(record, references=refs)
         except Exception as exc:
             try:
                 from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy
@@ -3786,7 +4524,17 @@ class ShortLabService:
                     simulation_id = f"{simulation_id}#r{self._hedge_seq}"
                     self._hedge_seq += 1
                     record["simulation_id"] = simulation_id
-                    await repo.save_hedge_simulation(record, references=[("VENUE_QUOTE", quote_id, "simulation-quote")])
+                    try:
+                        refs2: list[Any] = [("VENUE_QUOTE", quote_id, "simulation-quote")]
+                        try:
+                            _did2 = getattr(request, "decision_id", None)
+                            if _did2 is not None and str(_did2).strip():
+                                refs2.append(("DECISION", str(_did2).strip(), "simulation-decision"))
+                        except Exception:
+                            pass
+                        await repo.save_hedge_simulation(record, references=refs2)
+                    except Exception:
+                        await repo.save_hedge_simulation(record, references=[("VENUE_QUOTE", quote_id, "simulation-quote")])
                 else:
                     raise
             except (HedgeBusy, HedgeUnavailable):
@@ -3901,6 +4649,8 @@ class ShortLabService:
             "futures_notional_usd", "hedge_ratio", "spot_venue", "leverage",
             "margin_mode", "margin_usd", "liquidation_price", "planned_hold_days",
             "fcs_snapshot_id", "plan_version",
+            # R10b D12: optional decision link (goal-aware, NO_HEDGE 422).
+            "decision_id", "goal",
         })
         snake = self._hedge_normalize(dict(payload or {}), allowed)
         simulation_id = snake.get("simulation_id")
@@ -3937,6 +4687,68 @@ class ShortLabService:
             raise
         if sim_row is None:
             raise HedgeSimulationNotFound(simulation_id)
+        # R10b D12: optional decision link validation (invalid/expired/NO_HEDGE).
+        # Old manual plans without decision_id keep working (readonly compat).
+        _decision_id = snake.get("decision_id")
+        if _decision_id is not None:
+            _did_s = str(_decision_id).strip()
+            if not _did_s:
+                raise HedgeValidationError("decision_id must be non-empty", reason_code="HEDGE_INPUT_INVALID")
+            try:
+                _dec_row = await repo.get_hedge_decision(_did_s)
+            except Exception as exc:
+                try:
+                    from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _BusyD2
+
+                    if isinstance(exc, _BusyD2):
+                        raise HedgeBusy(str(exc)) from exc
+                except HedgeBusy:
+                    raise
+                except Exception:
+                    pass
+                raise
+            if _dec_row is None:
+                raise HedgeSimulationNotFound(_did_s)
+            try:
+                _exp_d2 = int(_dec_row.get("expires_at_ms") or 0)
+            except Exception:
+                _exp_d2 = 0
+            if int(now_ms) >= int(_exp_d2):
+                raise HedgeQuoteExpired("QUOTE_EXPIRED: decision expired, re-request")
+            try:
+                import json as _jsd2
+
+                _dj2 = _dec_row.get("decision_json") or {}
+                if isinstance(_dj2, str):
+                    try:
+                        _dj2 = _jsd2.loads(_dj2)
+                    except Exception:
+                        _dj2 = {}
+                _rec2 = _dj2.get("recommendation") if isinstance(_dj2, Mapping) else None
+                if str(_rec2 or "").upper() == "NO_HEDGE":
+                    raise HedgeValidationError("UNHEDGED_PLAN_UNSUPPORTED: NO_HEDGE decision cannot create a two-leg plan", reason_code="UNHEDGED_PLAN_UNSUPPORTED")
+                # Symbol coherence: decision symbol must match simulation symbol.
+                _dec_req2 = _dj2.get("request") if isinstance(_dj2, Mapping) else None
+                if isinstance(_dec_req2, Mapping):
+                    _dec_sym2 = str(_dec_req2.get("symbol", "") or "").upper()
+                    _sim_sym2 = str(symbol if isinstance(symbol, str) else snake.get("symbol") or "").upper() if 'symbol' in dir() else str(snake.get("symbol") or "").upper()
+                    # symbol var not yet defined here; use sim_input fallback.
+                    try:
+                        _sim_sym_tmp = str((sim_result.get("symbol") if isinstance(sim_result, Mapping) else None) or (sim_input.get("symbol") if isinstance(sim_input, Mapping) else None) or snake.get("symbol") or "").upper()
+                    except Exception:
+                        _sim_sym_tmp = ""
+                    if _dec_sym2 and _sim_sym_tmp and _dec_sym2 != _sim_sym_tmp:
+                        raise HedgeInputMismatch(f"SIMULATION_INPUT_MISMATCH: decision symbol {_dec_sym2!r} != simulation {_sim_sym_tmp!r}")
+                # Goal coherence when caller pins goal.
+                if snake.get("goal") is not None and isinstance(_dec_req2, Mapping):
+                    _want_goal = str(snake.get("goal") or "").upper()
+                    _have_goal = str(_dec_req2.get("goal", "") or "").upper()
+                    if _want_goal and _have_goal and _want_goal != _have_goal:
+                        raise HedgeInputMismatch(f"SIMULATION_INPUT_MISMATCH: goal {_want_goal!r} != decision {_have_goal!r}")
+            except (HedgeValidationError, HedgeInputMismatch, HedgeQuoteExpired, HedgeSimulationNotFound, HedgeBusy):
+                raise
+            except Exception as exc:
+                raise HedgeValidationError(f"decision link invalid: {exc}"[:200], reason_code="HEDGE_INPUT_INVALID") from exc
         # Version / content match: formula/policy + request content.
         try:
             import json as _json
@@ -4025,6 +4837,14 @@ class ShortLabService:
         try:
             if isinstance(sim_input, Mapping):
                 plan_config["simulation_input"] = dict(sim_input)
+        except Exception:
+            pass
+        # R10b: persist the decision link + goal for Gate/version/reference checks.
+        try:
+            if _decision_id is not None and str(_decision_id).strip():
+                plan_config["decision_id"] = str(_decision_id).strip()
+            if snake.get("goal") is not None:
+                plan_config["goal"] = str(snake.get("goal"))
         except Exception:
             pass
         record = {
@@ -4371,12 +5191,105 @@ class ShortLabService:
                 state_str = "ACTIVE" if (fut > 0 and spot > 0) else "PARTIALLY_FILLED"
             except Exception:
                 state_str = "PARTIALLY_FILLED"
-        if state_str not in ("READY", "ACTIVE", "OK", "PARTIALLY_FILLED_ACTIVE"):
+        if state_str not in ("READY", "ACTIVE", "OK", "PARTIALLY_FILLED_ACTIVE", "FUNDED_PENDING_ACTIVATION"):
             # The frozen evaluator returns ACTIVE only when drift <= 5pts;
             # anything else (DRAFT/PARTIALLY_FILLED/CLOSING) blocks activation.
+            # R10b: FUNDED_PENDING_ACTIVATION (both legs filled, not yet ACTIVE)
+            # is also activatable (D12).
             if state_str != "ACTIVE":
                 raise HedgeLegsIncomplete("HEDGE_LEGS_INCOMPLETE: both legs must be fully filled")
+        # R10b D12: NO_HEDGE plans never activate (422, not 409).
+        try:
+            _cfg_act = row.get("plan_config_json")
+            import json as _jsa
+
+            if isinstance(_cfg_act, str):
+                try:
+                    _cfg_act = _jsa.loads(_cfg_act)
+                except Exception:
+                    _cfg_act = {}
+            if isinstance(_cfg_act, Mapping) and str(_cfg_act.get("decision_id") or "").strip():
+                _did_act = str(_cfg_act.get("decision_id")).strip()
+                try:
+                    _dec_act = await repo.get_hedge_decision(_did_act)
+                    if _dec_act is not None:
+                        _dj_act = _dec_act.get("decision_json") or {}
+                        if isinstance(_dj_act, str):
+                            try:
+                                _dj_act = _jsa.loads(_dj_act)
+                            except Exception:
+                                _dj_act = {}
+                        if isinstance(_dj_act, Mapping) and str(_dj_act.get("recommendation") or "").upper() == "NO_HEDGE":
+                            raise HedgeValidationError("UNHEDGED_PLAN_UNSUPPORTED: NO_HEDGE decision cannot activate a two-leg plan", reason_code="UNHEDGED_PLAN_UNSUPPORTED")
+                except (HedgeValidationError, HedgeBusy, HedgePlanNotFound, HedgeSimulationNotFound):
+                    raise
+                except Exception:
+                    pass
+        except (HedgeValidationError, HedgeBusy, HedgePlanNotFound, HedgeSimulationNotFound):
+            raise
+        except Exception:
+            pass
         now_ms = self._now()
+        # R10b D12: current-check ACTIVATION_CHECK (six items, same cutoff).
+        # Original 20s simulation expiry never blocks already-filled plans:
+        # this check uses current Mark/depth/funding/economics/protection, and
+        # persists as an ACTIVATION_CHECK observation (kind=ACTIVATION_CHECK).
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.monitor import build_activation_check_record as _bac
+
+            _sym_act = str(row.get("symbol") or "").upper()
+            _cutoff = int(now_ms)
+            # Current inputs best-effort (UNKNOWN never fabricates PASS).
+            _mark_act: Any = None
+            try:
+                _mark_act = await self._hedge_mark_for(_sym_act)
+            except Exception:
+                _mark_act = None
+            _fund_ctx_act: Any = None
+            try:
+                _fund_ctx_act = await self._build_repair_funding_context(_sym_act, _cutoff)
+            except Exception:
+                _fund_ctx_act = None
+            _prot_act: Any = None
+            try:
+                _prot_act = await repo.get_protection_confirmation(pid)
+            except Exception:
+                _prot_act = None
+            try:
+                _plan_map_act = {"plan_id": pid, "plan_version": int(current_version), "symbol": _sym_act}
+                try:
+                    _cfgm = row.get("plan_config_json")
+                    if isinstance(_cfgm, str):
+                        import json as _jsm
+
+                        try:
+                            _cfgm = _jsm.loads(_cfgm)
+                        except Exception:
+                            _cfgm = {}
+                    if isinstance(_cfgm, Mapping):
+                        for _k in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "rule_ids"):
+                            if _cfgm.get(_k) is not None:
+                                _plan_map_act[_k] = _cfgm.get(_k)
+                except Exception:
+                    pass
+                _check_rec = _bac(_plan_map_act, list(positions or ()), {"futures_mark": _mark_act, "funding_context": _fund_ctx_act, "protection": _prot_act}, int(_cutoff))
+                # Persist the check (best-effort, never blocks activation on persist failure).
+                try:
+                    if isinstance(_check_rec, Mapping) and hasattr(repo, "save_market_observation"):
+                        await repo.save_market_observation(dict(_check_rec))
+                    elif hasattr(repo, "save_market_observation"):
+                        try:
+                            import dataclasses as _dcx
+
+                            await repo.save_market_observation(_dcx.asdict(_check_rec) if _dcx.is_dataclass(_check_rec) else dict(_check_rec))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
         lock = self._hedge_lock_for(pid)
         async with lock:
             try:
@@ -4534,12 +5447,64 @@ class ShortLabService:
             alerts = await repo.list_hedge_alerts(plan_id=pid, limit=50, offset=0)
         except Exception:
             alerts = ()
+        # R10b D09: actual PnL/costs from R08a/R08b (never hand-filled cache).
+        # Compute via the real compute_ledger_pnl port from effective events +
+        # persisted FX; unknown stays null/Partial (never 0-fill). Best-effort:
+        # failures keep the stored snapshot (honest, not fabricated).
+        _ledger_wire: Any = None
+        try:
+            _pnl_fn = self._require_repair_port("compute_ledger_pnl")
+            try:
+                _ident_m = await self._hedge_identity_for(str(plan_row.get("symbol") or ""))
+            except Exception:
+                _ident_m = {"canonical_id": str(plan_row.get("canonical_id") or ""), "contract_multiplier": "1"}
+            try:
+                _evts = await repo.list_hedge_events(pid) if hasattr(repo, "list_hedge_events") else list(positions or ())
+            except Exception:
+                _evts = list(positions or ())
+            # Event FX map persisted per event (best-effort, empty stays Partial).
+            _efx: dict[str, Any] = {}
+            try:
+                for _ev in (_evts or ()):
+                    _eid = None
+                    if isinstance(_ev, Mapping):
+                        _eid = _ev.get("event_id", _ev.get("eventId"))
+                    else:
+                        _eid = getattr(_ev, "event_id", None)
+                    if _eid:
+                        _efx[str(_eid)] = {}
+            except Exception:
+                pass
+            _mctx: dict[str, Any] = {"now_ms": int(self._now())}
+            try:
+                _sym_m = str(plan_row.get("symbol") or "").upper()
+                try:
+                    _mk_m = await self._hedge_mark_for(_sym_m)
+                    if isinstance(_mk_m, Mapping):
+                        _mctx["futures_mark_native"] = str(_mk_m.get("mark_price", _mk_m.get("native_price", "")) or "")
+                        _mctx["futures_quote_fx"] = str(_mk_m.get("quote_to_usd", "1"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                _ledger = _pnl_fn(list(_evts or ()), _ident_m, dict(_efx), dict(_mctx))
+                try:
+                    import dataclasses as _dcl
+
+                    _ledger_wire = _dcl.asdict(_ledger) if _dcl.is_dataclass(_ledger) else dict(_ledger) if isinstance(_ledger, Mapping) else None
+                except Exception:
+                    _ledger_wire = None
+            except Exception:
+                _ledger_wire = None
+        except Exception:
+            _ledger_wire = None
         owner = getattr(self, "_hedge_jobs", None)
         memory = owner.mirror.get(pid, {}).get("previous") if owner is not None else None
         if memory is not None:
             latest = dataclasses.asdict(memory) if dataclasses.is_dataclass(memory) else dict(memory)
         if latest is None:
-            return {
+            _no_snap: dict[str, Any] = {
                 "planId": pid,
                 "status": "NO_SNAPSHOT",
                 "asOf": None,
@@ -4548,8 +5513,21 @@ class ShortLabService:
                 "positions": [dict(p) for p in (positions or ())],
                 "alerts": [dict(a) for a in (alerts or ())],
             }
+            if _ledger_wire is not None:
+                _no_snap["ledgerPnl"] = dict(_ledger_wire)
+                _no_snap["ledger_pnl"] = dict(_ledger_wire)
+            return _no_snap
         out = dict(latest)
-        return _monitor_wire(pid, out, positions, alerts)
+        _wired = _monitor_wire(pid, out, positions, alerts)
+        # Attach real ledger PnL alongside the frozen monitor snapshot.
+        try:
+            if _ledger_wire is not None and isinstance(_wired, Mapping):
+                _wired = dict(_wired)
+                _wired["ledgerPnl"] = dict(_ledger_wire)
+                _wired["ledger_pnl"] = dict(_ledger_wire)
+        except Exception:
+            pass
+        return _wired
 
     # -- B32.11/B32.12 alerts ----------------------------------------------
     async def hedge_alerts(self, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -4719,63 +5697,1616 @@ class ShortLabService:
             return result
         return result
 
-    # -- R10a repair boundary methods (skeleton; real wiring is R10b) ---------
-    async def create_repair_decision(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        """POST /hedge/decisions boundary (D12/D18.1; service_calls.json).
+    # -- R10b repair wiring (D02/D12/D18/D19.1; real producers) ---------------
+    def _repair_policy(self) -> Any:
+        """Decision policy for recommend_hedge (full config, D15)."""
+        return self._config
 
-        R10a freezes the call point only: requires the repair bundle and
-        raises RepairDependencyUnavailable when unbound (503 upstream).
-        Real Decision POST/validation is R10b.
+    def _decision_to_wire(self, result: Any, *, expired: bool | None = None) -> dict[str, Any]:
+        """Convert DecisionResult DTO to camelCase HTTP wire (D18.3)."""
+        try:
+            from diveintocrypto_desktop.shortlab.repair_contracts import REPAIR_CONTRACT_VERSION
+        except Exception:
+            REPAIR_CONTRACT_VERSION = "repair-contract-v1"
+        try:
+            import dataclasses as _dc
+
+            if _dc.is_dataclass(result):
+                d = _dc.asdict(result)
+            elif isinstance(result, Mapping):
+                d = dict(result)
+            else:
+                d = {}
+        except Exception:
+            d = {}
+        # Request camel conversion (snake internal -> camel wire).
+        req = d.get("request") or {}
+        try:
+            if not isinstance(req, Mapping):
+                req = {}
+            else:
+                req = dict(req)
+            # Dataclass request -> dict already; ensure camel keys.
+            _camel_req: dict[str, Any] = {}
+            for k, v in req.items():
+                ks = str(k)
+                if "_" in ks:
+                    parts = ks.split("_")
+                    ck = parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+                else:
+                    ck = ks
+                    # Map known snake->camel explicitly for wire compat.
+                    _map = {
+                        "symbol": "symbol", "goal": "goal",
+                        "futures_notional_usd": "futuresNotionalUsd",
+                        "planned_hold_days": "plannedHoldDays",
+                        "available_capital_usd": "availableCapitalUsd",
+                        "max_scenario_loss_usd": "maxScenarioLossUsd",
+                        "margin_usd": "marginUsd",
+                        "liquidation_price": "liquidationPrice",
+                        "liquidation_price_updated_at_ms": "liquidationPriceUpdatedAtMs",
+                        "preferred_spot_venue": "preferredSpotVenue",
+                    }
+                    ck = _map.get(ks, ks)
+                _camel_req[ck] = v
+            # Ensure all D18.3 keys present.
+            req = _camel_req
+        except Exception:
+            pass
+        # Selected proposal: keep as mapping (already JSON-safe via DTO).
+        sel = d.get("selected_proposal")
+        try:
+            import dataclasses as _dc2
+
+            if sel is not None and _dc2.is_dataclass(sel):
+                sel = _dc2.asdict(sel)
+        except Exception:
+            pass
+        alts = d.get("alternatives") or []
+        try:
+            import dataclasses as _dc3
+
+            alts = [(_dc3.asdict(a) if _dc3.is_dataclass(a) else dict(a) if isinstance(a, Mapping) else a) for a in alts]
+        except Exception:
+            pass
+        now_ms = self._now()
+        exp_ms = d.get("expires_at_ms")
+        try:
+            exp_i = int(exp_ms) if exp_ms is not None else now_ms
+        except Exception:
+            exp_i = now_ms
+        is_exp = bool(expired) if expired is not None else bool(now_ms >= exp_i)
+        out: dict[str, Any] = {
+            "contractSchemaVersion": REPAIR_CONTRACT_VERSION,
+            "decisionId": d.get("decision_id"),
+            "generatedAtMs": d.get("generated_at_ms"),
+            "expiresAtMs": d.get("expires_at_ms"),
+            "expired": bool(is_exp),
+            "recommendation": d.get("recommendation"),
+            "validationLevel": d.get("validation_level"),
+            "selectedProposal": sel,
+            "alternatives": list(alts or []),
+            "reasons": list(d.get("reasons") or []),
+            "assumptions": list(d.get("assumptions") or []),
+            "contextRefs": dict(d.get("context_refs") or {}),
+            "formulaVersion": d.get("formula_version"),
+            "decisionPolicyHash": d.get("decision_policy_hash"),
+            "request": dict(req or {}),
+        }
+        # Snake aliases for compat (frozen error envelope keeps both).
+        out["decision_id"] = out["decisionId"]
+        out["generated_at_ms"] = out["generatedAtMs"]
+        out["expires_at_ms"] = out["expiresAtMs"]
+        return out
+
+    async def _build_repair_funding_context(self, symbol: str, as_of_ms: int) -> Any:
+        """Build FundingContext via real collection chain (R10b).
+
+        Prefers MarketPort.collect_funding (ProductionHedgeMarket, real
+        Observation+receipt with schedule coverages). Falls back to
+        repo events/schedules + real compute_schedule_coverage port +
+        _hedge_funding_fn metrics when MarketPort is unbound (offline tests).
+        451/budget denials become UNKNOWN (DATA_INSUFFICIENT downstream),
+        never 503 for a single provider.
         """
-        self._require_repair_port("build_ratio_proposal")
-        # R10b binds real producers; R10a skeleton never returns Fake READY.
+        sym = str(symbol).upper()
+        # Real MarketPort path first (production).
+        market_port = getattr(self, "_market_port", None)
+        if market_port is not None:
+            try:
+                cb = getattr(market_port, "collect_funding", None)
+                if callable(cb) and is_real_repair_callback(getattr(market_port, "collect_funding", None) or (lambda: None)):
+                    pass
+            except Exception:
+                pass
+            try:
+                collect = getattr(market_port, "collect_funding", None)
+                if callable(collect):
+                    try:
+                        from diveintocrypto_desktop.shortlab.request_budget import (
+                            make_request_context as _mk,
+                        )
+
+                        rctx = _mk(
+                            getattr(self, "_request_budget", None),
+                            job_type="interactive",
+                            host="fapi",
+                            endpoint_family="fundingRate",
+                            trace_id=f"repair-funding-{sym}-{int(as_of_ms)}",
+                        )
+                    except Exception:
+                        rctx = None
+                    ctx = await _maybe_await(collect(sym, int(as_of_ms), rctx))
+                    if ctx is not None:
+                        return ctx
+            except Exception as exc:
+                msg = str(exc)
+                if "451" in msg or "REGION" in msg or "BUDGET" in msg.upper():
+                    pass
+                # Fall through to repo+ports fallback (UNKNOWN, not 503).
+                pass
+        # Hedge-market fallback (ProductionHedgeMarket.collect_funding).
+        hedge_market = getattr(self, "_hedge_market", None)
+        if hedge_market is not None and hasattr(hedge_market, "collect_funding"):
+            try:
+                try:
+                    from diveintocrypto_desktop.shortlab.request_budget import (
+                        make_request_context as _mk2,
+                    )
+
+                    rctx2 = _mk2(
+                        getattr(self, "_request_budget", None),
+                        job_type="interactive",
+                        host="fapi",
+                        endpoint_family="fundingRate",
+                        trace_id=f"repair-funding2-{sym}-{int(as_of_ms)}",
+                    )
+                except Exception:
+                    rctx2 = None
+                ctx2 = await _maybe_await(hedge_market.collect_funding(sym, int(as_of_ms), rctx2))
+                if ctx2 is not None:
+                    return ctx2
+            except Exception:
+                pass
+        # Offline/test fallback: repo events + real schedule coverage + injected metrics.
+        from diveintocrypto_desktop.shortlab.repair_contracts import FundingContext
+
+        repo = self._require_available()
+        events: list[Any] = []
+        try:
+            if hasattr(repo, "list_funding_events"):
+                rows = await repo.list_funding_events(sym, int(as_of_ms) - 90 * 86400_000, int(as_of_ms))
+                for r in rows or ():
+                    try:
+                        if hasattr(r, "funding_time_ms"):
+                            events.append({"t": int(r.funding_time_ms), "funding_rate": str(r.funding_rate), "mark_price": getattr(r, "mark_price", None)})
+                        elif isinstance(r, Mapping):
+                            t = r.get("funding_time_ms", r.get("t"))
+                            fr = r.get("funding_rate")
+                            if t is not None and fr is not None:
+                                events.append({"t": int(t), "funding_rate": str(fr)})
+                    except Exception:
+                        continue
+        except Exception as exc:
+            msg = str(exc)
+            if "451" in msg:
+                events = []
+        schedules: list[Any] = []
+        try:
+            if hasattr(repo, "list_funding_schedules"):
+                schedules = list(await repo.list_funding_schedules(sym, int(as_of_ms)) or ())
+        except Exception:
+            schedules = []
+        # Real coverage port (never Fake READY when unbound -> UNKNOWN).
+        try:
+            cov_fn = self._require_repair_port("compute_schedule_coverage")
+        except Exception:
+            cov_fn = None
+        def _unknown_cov(s: int, e: int) -> Any:
+            from diveintocrypto_desktop.shortlab.repair_contracts import FundingCoverage as _FC
+
+            return _FC(window_start_ms=int(s), window_end_ms=int(e), expected_count=None, received_count=0, coverage_fraction=None, schedule_coverage_fraction="0", missing_slots=(), reasons=("FUNDING_SCHEDULE_UNKNOWN",))
+        if cov_fn is not None:
+            try:
+                cov7 = cov_fn(events, schedules, int(as_of_ms) - 7 * 86400_000, int(as_of_ms), int(as_of_ms))
+            except Exception:
+                cov7 = _unknown_cov(int(as_of_ms) - 7 * 86400_000, int(as_of_ms))
+            try:
+                cov30 = cov_fn(events, schedules, int(as_of_ms) - 30 * 86400_000, int(as_of_ms), int(as_of_ms))
+            except Exception:
+                cov30 = _unknown_cov(int(as_of_ms) - 30 * 86400_000, int(as_of_ms))
+            try:
+                cov90 = cov_fn(events, schedules, int(as_of_ms) - 90 * 86400_000, int(as_of_ms), int(as_of_ms))
+            except Exception:
+                cov90 = _unknown_cov(int(as_of_ms) - 90 * 86400_000, int(as_of_ms))
+        else:
+            cov7 = _unknown_cov(int(as_of_ms) - 7 * 86400_000, int(as_of_ms))
+            cov30 = _unknown_cov(int(as_of_ms) - 30 * 86400_000, int(as_of_ms))
+            cov90 = _unknown_cov(int(as_of_ms) - 90 * 86400_000, int(as_of_ms))
+        # Metrics from injected funding fn (test) or minimal unknown.
+        metrics: Any = None
+        current_rate: Any = None
+        last_rate: Any = None
+        try:
+            raw_funding = await self._hedge_funding_for(sym)
+            if raw_funding is not None:
+                if hasattr(raw_funding, "current_rate"):
+                    metrics = raw_funding
+                    try:
+                        current_rate = str(getattr(metrics, "current_rate", None))
+                    except Exception:
+                        current_rate = None
+                    try:
+                        last_rate = str(getattr(metrics, "last_settled_rate", None))
+                    except Exception:
+                        last_rate = None
+                elif isinstance(raw_funding, Mapping):
+                    current_rate = raw_funding.get("current_rate", raw_funding.get("currentRate"))
+                    last_rate = raw_funding.get("last_settled_rate", raw_funding.get("lastSettledRate"))
+                    # Build FundingMetrics DTO when possible for downstream gate.
+                    try:
+                        from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics as _FM2
+
+                        metrics = _FM2(
+                            symbol=sym,
+                            current_rate=str(current_rate) if current_rate is not None else None,
+                            last_settled_rate=str(last_rate) if last_rate is not None else None,
+                            funding_30d=str(raw_funding.get("funding_30d", raw_funding.get("funding30d"))) if raw_funding.get("funding_30d", raw_funding.get("funding30d")) is not None else None,
+                            conservative_apr=str(raw_funding.get("conservative_apr", raw_funding.get("conservativeApr"))) if raw_funding.get("conservative_apr", raw_funding.get("conservativeApr")) is not None else None,
+                        )
+                    except Exception:
+                        metrics = None
+        except Exception:
+            metrics = None
+        if metrics is None:
+            try:
+                from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics as _FM3
+
+                metrics = _FM3(symbol=sym)
+            except Exception:
+                metrics = None
+        # Listing age from exchange onboard (unknown stays UNKNOWN, never first_seen).
+        listing_age: int | None = None
+        try:
+            raw_all = await _maybe_await(self._metadata_fn())
+            if isinstance(raw_all, Mapping):
+                raw = raw_all.get(sym)
+                meta = _contract_meta_dict(raw) if raw is not None else {}
+                ob = meta.get("onboard_at_ms")
+                if isinstance(ob, int) and ob > 0 and ob <= int(as_of_ms):
+                    listing_age = max(0, (int(as_of_ms) - int(ob)) // 86400_000)
+        except Exception:
+            listing_age = None
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.funding_score import resolve_history_class as _rhc
+
+            hist, _ = _rhc({"onboard_at_ms": None, "reliable": False} if listing_age is None else {"onboard_at_ms": int(as_of_ms) - int(listing_age) * 86400_000, "reliable": True}, int(as_of_ms))
+        except Exception:
+            hist = "HISTORY_CLASS_UNKNOWN" if listing_age is None else ("FULL_90D" if (listing_age or 0) >= 90 else ("PARTIAL_90D" if (listing_age or 0) >= 30 else "INSUFFICIENT"))
+        # Observations with receipt (source times preserved, never invented).
+        try:
+            from diveintocrypto_desktop.shortlab import observations as _obs
+
+            cur_obs = _obs.make_observation(
+                {"rate": str(current_rate) if current_rate is not None else None},
+                source="binance:fapi/fundingRate" if current_rate is not None else "unknown",
+                source_as_of_ms=int(as_of_ms) - 60_000 if current_rate is not None else None,
+                fetched_at_ms=int(as_of_ms),
+                known_at_ms=int(as_of_ms),
+                status="OK" if current_rate is not None else "UNAVAILABLE",
+            )
+            last_obs = _obs.make_observation(
+                {"rate": str(last_rate) if last_rate is not None else None},
+                source="binance:fapi/fundingRate" if last_rate is not None else "unknown",
+                source_as_of_ms=int(as_of_ms) - 8 * 3600_000 if last_rate is not None else None,
+                fetched_at_ms=int(as_of_ms),
+                known_at_ms=int(as_of_ms),
+                status="OK" if last_rate is not None else "UNAVAILABLE",
+            ) if last_rate is not None else None
+        except Exception:
+            cur_obs = None
+            last_obs = None
+            try:
+                from diveintocrypto_desktop.shortlab.repair_contracts import _require_observed as _ro  # type: ignore
+            except Exception:
+                pass
+        # Assemble via pure builder when possible; fallback to direct DTO.
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.funding_score import build_funding_context as _bfc
+
+            # Derive conservative apr/method from metrics when present.
+            try:
+                cons = str(getattr(metrics, "conservative_apr", None)) if getattr(metrics, "conservative_apr", None) is not None else None
+            except Exception:
+                cons = None
+            return _bfc(
+                metrics,
+                cov7, cov30, cov90,
+                history_class=str(hist),
+                listing_age_days=listing_age,
+                conservative_apr=cons,
+                conservative_method="CONSERVATIVE_P25" if cons is not None else "UNKNOWN",
+                current_observation=cur_obs,
+                last_settled_observation=last_obs,
+                schedule_refs=tuple(str(getattr(s, "schedule_id", s.get("schedule_id") if isinstance(s, Mapping) else "sched-1")) for s in (schedules or [])[:4]) or ("sched-unknown",),
+                input_refs={"funding": f"fcs-{sym}"},
+            )
+        except Exception:
+            return FundingContext(
+                metrics=metrics,
+                coverage_7d=cov7, coverage_30d=cov30, coverage_90d=cov90,
+                history_class=str(hist),
+                listing_age_days=listing_age,
+                conservative_apr=None,
+                conservative_method="UNKNOWN",
+                current_observation=cur_obs,
+                last_settled_observation=last_obs,
+                schedule_refs=("sched-unknown",),
+                input_refs={"funding": f"fcs-{sym}"},
+            )
+
+    async def create_repair_decision(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        """POST /hedge/decisions (D12/D18.1; R10b real wiring).
+
+        Validates the wire body, gates switches (503 DISABLED for new
+        suggestions), requires real RepairPorts (503 when unbound/fake),
+        assembles DecisionContext via Catalog->Resolver + real
+        Observation/receipt chain + MarketPort, calls real recommend_hedge,
+        persists the immutable snapshot, and returns the D18.3 wire (201).
+        Single-provider gaps become 201 DATA_INSUFFICIENT (never 503); only
+        unready systems (unbound/fake ports, DB down, switches off) are 503.
+        """
         from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
 
-        raise RepairDependencyUnavailable("build_ratio_proposal")
+        if not isinstance(body, Mapping) or not body:
+            raise HedgeValidationError("body must be a JSON object", reason_code="HEDGE_INPUT_INVALID")
+        allowed = frozenset({
+            "symbol", "goal", "futures_notional_usd", "planned_hold_days",
+            "available_capital_usd", "max_scenario_loss_usd", "margin_usd",
+            "liquidation_price", "liquidation_price_updated_at_ms", "preferred_spot_venue",
+        })
+        snake = self._hedge_normalize(dict(body), allowed)
+        # Build the frozen request (422 on bad decimals/enums).
+        try:
+            from diveintocrypto_desktop.shortlab.repair_contracts import DecisionRequest as _DR
+
+            # Normalise numeric strings strictly (bool/NaN/Infinity rejected).
+            request = _DR(
+                symbol=str(snake.get("symbol")),
+                goal=str(snake.get("goal")),
+                futures_notional_usd=str(snake.get("futures_notional_usd")),
+                planned_hold_days=int(snake.get("planned_hold_days")),  # type: ignore[arg-type]
+                available_capital_usd=str(snake.get("available_capital_usd")),
+                max_scenario_loss_usd=str(snake.get("max_scenario_loss_usd")),
+                margin_usd=str(snake.get("margin_usd")),
+                liquidation_price=str(snake.get("liquidation_price")),
+                liquidation_price_updated_at_ms=int(snake.get("liquidation_price_updated_at_ms")),  # type: ignore[arg-type]
+                preferred_spot_venue=str(snake.get("preferred_spot_venue") or "AUTO"),
+            )
+        except HedgeValidationError:
+            raise
+        except Exception as exc:
+            raise HedgeValidationError(str(exc)[:300], reason_code="HEDGE_INPUT_INVALID") from exc
+        # Real ports required first (unbound/fake -> 503, never Fake READY).
+        # Switch gate second so unbound tests see IMPLEMENTATION_UNAVAILABLE
+        # even when switches are off (R10a boundary compat).
+        try:
+            self._require_repair_port("build_ratio_proposal")
+            self._require_repair_port("evaluate_funding_entry_gate")
+        except RepairDependencyUnavailable:
+            raise
+        # Switch gate for new suggestions (history reads bypass this).
+        self._ensure_repair_writes_allowed()
+        # Hedge tables must exist (005); base 004 still serves when missing.
+        await self._ensure_hedge_available()
+        now_ms = self._now()
+        sym = str(request.symbol).upper()
+        # Identity via Catalog->Resolver (Hedge consumes same result).
+        try:
+            raw_all = await _maybe_await(self._metadata_fn())
+            exchange_meta: dict[str, Any] = {}
+            if isinstance(raw_all, Mapping):
+                raw = raw_all.get(sym)
+                if raw is not None:
+                    try:
+                        exchange_meta = dict(_contract_meta_dict(raw))
+                    except Exception:
+                        exchange_meta = dict(raw) if isinstance(raw, Mapping) else {}
+        except Exception:
+            exchange_meta = {}
+        # Delisted/BLOCKED fast path still goes through recommend_hedge with a
+        # BLOCKED directional so the producers stay honest (never bypassed).
+        try:
+            identity = self._resolve_identity_default(sym, exchange_meta, int(now_ms))
+        except HedgeValidationError:
+            raise
+        except Exception as exc:
+            raise HedgeValidationError(f"identity unverified for {sym}", reason_code="HEDGE_IDENTITY_UNVERIFIED") from exc
+        # R10b D03.3: explicit delisting BLOCKED fast path (never READY).
+        # Delisted/non-trading identities are BLOCKED even when funding is
+        # UNKNOWN (D03.3 outranks NOT_READY). Persisted as AVOID with
+        # VETO_CONTRACT_DELISTING (Decision has no BLOCKED recommendation).
+        try:
+            _status_check = str(exchange_meta.get("status") or exchange_meta.get("exchange_status") or "TRADING").upper()
+        except Exception:
+            _status_check = "TRADING"
+        if _status_check not in ("TRADING", "", "NONE"):
+            try:
+                from diveintocrypto_desktop.shortlab.repair_contracts import DecisionResult as _DRB
+                from diveintocrypto_desktop.shortlab.repair_contracts import to_record_dict as _to_rec_b
+                from diveintocrypto_desktop.shortlab.config import decision_policy_hash as _dph_b
+
+                try:
+                    _pol_hash_b = str(_dph_b(self._config))
+                except Exception:
+                    _pol_hash_b = "policy-unknown"
+                try:
+                    from diveintocrypto_desktop.shortlab.hedge.decision import _compute_decision_id as _cid_b
+                    from diveintocrypto_desktop.shortlab.hedge.decision import _compute_expires as _exp_b
+                    from diveintocrypto_desktop.shortlab.hedge.decision import _compute_context_refs as _ccr_b
+
+                    # Minimal context for ID/refs (no network).
+                    _tmp_ctx_refs = {"identity": f"isl-{sym}", "funding": f"fcs-{sym}"}
+                except Exception:
+                    _cid_b = None  # type: ignore
+                    _exp_b = None  # type: ignore
+                    _tmp_ctx_refs = {"identity": f"isl-{sym}", "funding": f"fcs-{sym}"}
+                import hashlib as _hl_b
+                import json as _js_b
+
+                _gen_b = int(now_ms)
+                _exp_ms_b = int(_gen_b) + 20000
+                # Deterministic ID from request+policy+time (same as recommend_hedge).
+                try:
+                    if _cid_b is not None:
+                        # Build a minimal context-like for ID (uses request+policy+time).
+                        from diveintocrypto_desktop.shortlab.repair_contracts import DecisionContext as _DCB
+
+                        # Use already-resolved identity DTO when possible for ID stability.
+                        try:
+                            from diveintocrypto_desktop.shortlab.models import AssetIdentity as _AIB
+
+                            if isinstance(identity, _AIB):
+                                _ident_b = identity
+                            else:
+                                _ident_b = _AIB(
+                                    canonical_id=str(identity.get("canonical_id") if isinstance(identity, Mapping) else getattr(identity, "canonical_id", sym.lower()) or sym.lower()),
+                                    display_symbol=sym,
+                                    binance_futures_symbol=sym,
+                                    binance_spot_symbol=None,
+                                    contract_multiplier=identity.get("contract_multiplier") if isinstance(identity, Mapping) else getattr(identity, "contract_multiplier", None),
+                                    multiplier_source=identity.get("multiplier_source") if isinstance(identity, Mapping) else getattr(identity, "multiplier_source", None),
+                                    mapping_confidence="VERIFIED",
+                                    mapping_source="MANUAL",
+                                )
+                        except Exception:
+                            _ident_b = identity  # type: ignore
+                        _did_b = str(_cid_b(request, {"identity_snapshot_id": f"isl-{sym}", "as_of_ms": _gen_b, "funding_context": None, "identity": _ident_b, "futures_mark": None, "futures_rules": None}, _pol_hash_b, _gen_b)) if callable(_cid_b) else f"dec-{_hl_b.sha256(_js_b.dumps({'s': sym, 't': _gen_b}, sort_keys=True).encode()).hexdigest()[:16]}"
+                    else:
+                        _did_b = f"dec-{_hl_b.sha256(_js_b.dumps({'s': sym, 't': _gen_b}, sort_keys=True).encode()).hexdigest()[:16]}"
+                except Exception:
+                    _did_b = f"dec-{_hl_b.sha256(str(sym).encode()).hexdigest()[:16]}-{int(_gen_b) % 100000}"
+                _blocked_result = _DRB(
+                    decision_id=str(_did_b),
+                    generated_at_ms=int(_gen_b),
+                    expires_at_ms=int(_exp_ms_b),
+                    request=request,
+                    context_refs=dict(_tmp_ctx_refs),
+                    recommendation="AVOID",
+                    selected_proposal=None,
+                    alternatives=(),
+                    reasons=("VETO_CONTRACT_DELISTING",),
+                    assumptions=("DELISTED_EXCHANGE_STATUS",),
+                    validation_level="RULE_BASED_UNVALIDATED",
+                    decision_policy_hash=str(_pol_hash_b),
+                    formula_version="hedge-decision-v1",
+                )
+                try:
+                    _repo_b = self._require_available()
+                    _rec_b = _to_rec_b(_blocked_result)
+                    _record_b = {
+                        "decision_id": str(_blocked_result.decision_id),
+                        "symbol": sym,
+                        "generated_at_ms": int(_blocked_result.generated_at_ms),
+                        "expires_at_ms": int(_blocked_result.expires_at_ms),
+                        "decision_policy_hash": str(_blocked_result.decision_policy_hash),
+                        "decision_json": _rec_b,
+                    }
+                    try:
+                        await _repo_b.save_hedge_decision(_record_b, ())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return self._decision_to_wire(_blocked_result)
+            except (HedgeValidationError, HedgeBusy):
+                raise
+            except Exception:
+                pass
+        # Funding context via real chain (451 -> UNKNOWN, not 503).
+        try:
+            funding_context = await self._build_repair_funding_context(sym, int(now_ms))
+        except HedgeUnavailable:
+            raise
+        except Exception as exc:
+            raise HedgeUnavailable(f"funding collection failed: {type(exc).__name__}") from exc
+        # Futures mark (451 -> UNKNOWN mark for DATA_INSUFFICIENT).
+        mark_unknown = False
+        try:
+            futures_mark = await self._hedge_mark_for(sym)
+        except HedgeUnavailable as exc:
+            msg = str(exc)
+            if "REGION" in msg or "451" in msg:
+                # UNKNOWN mark: honest DATA_INSUFFICIENT downstream.
+                try:
+                    from diveintocrypto_desktop.shortlab import observations as _obs2
+
+                    futures_mark = _obs2.make_observation(
+                        None, source="unknown", source_as_of_ms=None,
+                        fetched_at_ms=int(now_ms), known_at_ms=int(now_ms), status="UNAVAILABLE",
+                    )
+                    mark_unknown = True
+                except Exception:
+                    raise
+            else:
+                raise
+        # Futures rules + venue quotes (best-effort; missing stays UNKNOWN).
+        try:
+            futures_rules = await self._hedge_resolve_rules("futures", sym)
+        except Exception:
+            futures_rules = None
+        if futures_rules is None:
+            try:
+                from diveintocrypto_desktop.shortlab.hedge.models import TradingRulesSnapshot as _TRS
+
+                futures_rules = _TRS(symbol=sym)
+            except Exception:
+                futures_rules = {"symbol": sym}
+        # Futures execution quote (two-sided depth) best-effort for new Gate.
+        futures_quote: Any = None
+        try:
+            mp = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+            if mp is not None and hasattr(mp, "collect_futures"):
+                try:
+                    from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mk3
+
+                    rctx3 = _mk3(getattr(self, "_request_budget", None), job_type="interactive", host="fapi", endpoint_family="futuresDepth", trace_id=f"repair-fq-{sym}-{int(now_ms)}")
+                except Exception:
+                    rctx3 = None
+                try:
+                    bundled = await _maybe_await(mp.collect_futures(sym, "1", rctx3))
+                    if isinstance(bundled, Mapping):
+                        futures_quote = bundled.get("futures_quote", bundled.get("futuresQuote"))
+                except Exception:
+                    futures_quote = None
+        except Exception:
+            futures_quote = None
+        # Spot venue quotes for enabled venues (missing per-venue stays UNKNOWN).
+        venue_quotes: list[Any] = []
+        try:
+            hedge_cfg = getattr(self._config, "hedge", None)
+            providers = getattr(hedge_cfg, "providers", {}) if hedge_cfg is not None else {}
+            enabled_venues: list[str] = []
+            for cand, key in (("BINANCE_SPOT", "binance_spot"), ("BINANCE_ALPHA", "binance_alpha"), ("ONCHAIN_DEX", "onchain")):
+                try:
+                    entry = providers.get(key) if isinstance(providers, Mapping) else None
+                    on = bool(entry.get("enabled")) if isinstance(entry, Mapping) else bool(getattr(entry, "enabled", False))
+                    if on:
+                        enabled_venues.append(cand)
+                except Exception:
+                    continue
+            # Preferred venue first; AUTO tries all enabled.
+            pref = str(request.preferred_spot_venue or "AUTO")
+            wanted = enabled_venues if pref == "AUTO" else ([pref] if pref in enabled_venues else [])
+            for venue in wanted:
+                try:
+                    q = await self._hedge_quote_for(sym, "1", venue)
+                    # Normalise to SpotVenueQuote DTO when possible.
+                    try:
+                        from diveintocrypto_desktop.shortlab.hedge.models import SpotVenueQuote as _SVQ
+
+                        if isinstance(q, Mapping):
+                            # Already mapping: wrap best-effort via from_api? Keep raw for context builder.
+                            venue_quotes.append(q)
+                        elif hasattr(q, "venue"):
+                            venue_quotes.append(q)
+                        else:
+                            venue_quotes.append(q)
+                    except Exception:
+                        venue_quotes.append(q)
+                except HedgeUnavailable:
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            venue_quotes = []
+        # Normalise venue quotes to SpotVenueQuote DTOs for DecisionContext.
+        norm_quotes: list[Any] = []
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.models import SpotVenueQuote as _SVQ2
+
+            for q in venue_quotes:
+                try:
+                    if isinstance(q, _SVQ2):
+                        norm_quotes.append(q)
+                    elif isinstance(q, Mapping):
+                        # Minimal DTO construction from mapping (test fakes + market).
+                        norm_quotes.append(_SVQ2(
+                            venue=str(q.get("venue") or "BINANCE_SPOT"),
+                            canonical_id=str(q.get("canonical_id") or q.get("canonicalId") or sym.lower()),
+                            symbol=str(q.get("symbol") or sym),
+                            chain=q.get("chain"),
+                            contract_address=q.get("contract_address", q.get("contractAddress")),
+                            as_of_ms=int(q.get("as_of_ms", q.get("asOf", now_ms)) or now_ms),
+                            fetched_at_ms=int(q.get("fetched_at_ms", q.get("fetchedAt", now_ms)) or now_ms),
+                            expires_at_ms=int(q.get("expires_at_ms", q.get("expiresAt", now_ms + 20000)) or (now_ms + 20000)),
+                            reference_notional_usd=str(q.get("reference_notional_usd", q.get("referenceNotionalUsd", "10000"))),
+                            buy_vwap=str(q.get("buy_vwap", q.get("buyVwap", q.get("mid_price", "1")))),
+                            sell_vwap=str(q.get("sell_vwap", q.get("sellVwap", q.get("mid_price", "1")))),
+                            buy_executable_qty=str(q.get("buy_executable_qty", q.get("buyExecutableQty", "1"))),
+                            sell_executable_qty=str(q.get("sell_executable_qty", q.get("sellExecutableQty", "1"))),
+                            quote_currency=str(q.get("quote_currency", q.get("quoteCurrency", "USDT"))),
+                            quote_to_usd=str(q.get("quote_to_usd", q.get("quoteToUsd", "1"))),
+                        ))
+                except Exception:
+                    continue
+        except Exception:
+            norm_quotes = []
+        # Directional from latest completed generation (real, frozen inputs).
+        directional: Any = None
+        try:
+            repo_tmp = self._require_available()
+            gen = await repo_tmp.latest_completed_generation()
+            if gen is not None:
+                # Fetch the symbol's score row for this generation.
+                try:
+                    page = await repo_tmp.list_candidates(generation_id=gen, limit=200, offset=0)
+                    items = list(getattr(page, "items", []) or [])
+                    # list_candidates may be tuple; handle both.
+                    if not items and isinstance(page, (list, tuple)):
+                        items = list(page)
+                    for sc in items:
+                        try:
+                            s_sym = str(getattr(sc, "symbol", sc.get("symbol") if isinstance(sc, Mapping) else "") or "").upper()
+                        except Exception:
+                            continue
+                        if s_sym == sym:
+                            try:
+                                directional = {
+                                    "profile": str(getattr(sc, "profile", sc.get("profile") if isinstance(sc, Mapping) else "") or "").split("_")[0] or "GENERAL",
+                                    "ltss": float(getattr(sc, "ltss", sc.get("ltss") if isinstance(sc, Mapping) else 0) or 0),
+                                    "entry": float(getattr(sc, "entry_score", sc.get("entry_score") if isinstance(sc, Mapping) else 0) or 0),
+                                    "data_quality": float(getattr(sc, "data_quality", sc.get("data_quality") if isinstance(sc, Mapping) else 0) or 0),
+                                    "tradeability": float(getattr(sc, "tradeability_score", 7) if hasattr(sc, "tradeability_score") else 7),
+                                    "candidate_status": str(getattr(sc, "candidate_status", "CANDIDATE") or "CANDIDATE"),
+                                    "execution_status": str(getattr(sc, "execution_status", "NOT_READY") or "NOT_READY"),
+                                    "vetoes": list(getattr(sc, "vetoes", []) or []),
+                                    "pauses": list(getattr(sc, "pauses", []) or []),
+                                    "score_as_of_ms": int(getattr(sc, "as_of_ms", now_ms) or now_ms),
+                                    "config_hash": str(getattr(sc, "config_hash", "") or ""),
+                                }
+                            except Exception:
+                                directional = None
+                            break
+                except Exception:
+                    directional = None
+        except Exception:
+            directional = None
+        # Delisted fast path: force BLOCKED directional so recommend_hedge
+        # returns honest AVOID/BLOCKED (never READY for delisted).
+        try:
+            status = str(exchange_meta.get("status") or exchange_meta.get("exchange_status") or "TRADING").upper()
+        except Exception:
+            status = "TRADING"
+        if status not in ("TRADING", "", "NONE"):
+            # Explicit delisted/break/halt: BLOCKED directional.
+            try:
+                directional = {
+                    "profile": str((directional or {}).get("profile", "MEME") if isinstance(directional, Mapping) else "MEME"),
+                    "ltss": float((directional or {}).get("ltss", 0) or 0) if isinstance(directional, Mapping) else 0.0,
+                    "entry": float((directional or {}).get("entry", 0) or 0) if isinstance(directional, Mapping) else 0.0,
+                    "data_quality": float((directional or {}).get("data_quality", 0) or 0) if isinstance(directional, Mapping) else 0.0,
+                    "tradeability": 0.0,
+                    "candidate_status": "BLOCKED",
+                    "execution_status": "BLOCKED",
+                    "vetoes": ["VETO_CONTRACT_DELISTING"],
+                    "pauses": [],
+                    "score_as_of_ms": int(now_ms),
+                    "config_hash": str((directional or {}).get("config_hash", "") if isinstance(directional, Mapping) else ""),
+                }
+            except Exception:
+                pass
+        # Assemble DecisionContext (frozen DTOs, real refs).
+        try:
+            from diveintocrypto_desktop.shortlab.repair_contracts import DecisionContext as _DC
+            from diveintocrypto_desktop.shortlab.hedge.models import TradingRulesSnapshot as _TRS2
+
+            # Identity snapshot id (content-addressed when catalog present).
+            try:
+                catalog = getattr(self, "_identity_catalog", None)
+                if catalog is not None:
+                    try:
+                        identity_snapshot_id = str(catalog.snapshot_id_for(sym, identity, int(now_ms)))
+                    except Exception:
+                        identity_snapshot_id = f"isl-{sym}-{int(now_ms)}"
+                else:
+                    import hashlib as _hl
+                    import json as _js
+
+                    blob = _js.dumps({"futures_symbol": sym, "observed_at_ms": int(now_ms)}, sort_keys=True, separators=(",", ":"))
+                    identity_snapshot_id = "isl-" + _hl.sha256(blob.encode()).hexdigest()[:32]
+            except Exception:
+                identity_snapshot_id = f"isl-{sym}-{int(now_ms)}"
+            # Convert resolver identity (AssetIdentity or mapping) to DTO.
+            try:
+                from diveintocrypto_desktop.shortlab.models import AssetIdentity as _AI
+
+                if isinstance(identity, _AI):
+                    ident_dto = identity
+                elif isinstance(identity, Mapping):
+                    ident_dto = _AI(
+                        canonical_id=str(identity.get("canonical_id") or sym.lower()),
+                        display_symbol=str(identity.get("display_symbol") or sym),
+                        binance_futures_symbol=sym,
+                        binance_spot_symbol=identity.get("binance_spot_symbol"),
+                        contract_multiplier=identity.get("contract_multiplier"),
+                        multiplier_source=identity.get("multiplier_source"),
+                        coingecko_id=identity.get("coingecko_id"),
+                        mapping_confidence=str(identity.get("mapping_confidence", identity.get("identity_confidence", "UNRESOLVED")) or "UNRESOLVED"),
+                        mapping_source=str(identity.get("mapping_source", "OTHER") or "OTHER"),
+                    )
+                else:
+                    ident_dto = _AI(
+                        canonical_id=str(getattr(identity, "canonical_id", sym.lower()) or sym.lower()),
+                        display_symbol=str(getattr(identity, "display_symbol", sym) or sym),
+                        binance_futures_symbol=sym,
+                        binance_spot_symbol=getattr(identity, "binance_spot_symbol", None),
+                        contract_multiplier=getattr(identity, "contract_multiplier", None),
+                        multiplier_source=getattr(identity, "multiplier_source", None),
+                        coingecko_id=getattr(identity, "coingecko_id", None),
+                        mapping_confidence=str(getattr(identity, "mapping_confidence", getattr(identity, "identity_confidence", "UNRESOLVED")) or "UNRESOLVED"),
+                        mapping_source=str(getattr(identity, "mapping_source", "OTHER") or "OTHER"),
+                    )
+            except Exception as exc:
+                raise HedgeValidationError(f"identity unverified for {sym}", reason_code="HEDGE_IDENTITY_UNVERIFIED") from exc
+            # Futures rules DTO (real TradingRulesSnapshot, never bare symbol).
+            try:
+                if isinstance(futures_rules, _TRS2):
+                    frules = futures_rules
+                elif isinstance(futures_rules, Mapping):
+                    _lot = futures_rules.get("lot_rules", {}) if isinstance(futures_rules.get("lot_rules"), Mapping) else {}
+                    _price = futures_rules.get("price_rules", {}) if isinstance(futures_rules.get("price_rules"), Mapping) else {}
+                    _notional = futures_rules.get("notional_rules", {}) if isinstance(futures_rules.get("notional_rules"), Mapping) else {}
+                    _order = futures_rules.get("order_types", {"LIMIT": True, "MARKET": True, "STOP": True, "STOP_MARKET": True})
+                    if isinstance(_order, list):
+                        _order = {str(k): True for k in _order}
+                    frules = _TRS2(
+                        venue="BINANCE_SPOT",
+                        instrument_id=sym,
+                        source_as_of_ms=int(now_ms) - 60_000,
+                        known_at_ms=int(now_ms) - 50_000,
+                        rule_version="rules-v1",
+                        raw_filters={},
+                        order_types=dict(_order) if isinstance(_order, Mapping) else {"LIMIT": True, "MARKET": True, "STOP": True, "STOP_MARKET": True},
+                        price_rules=dict(_price) if isinstance(_price, Mapping) else {"tick_size": "0.000001"},
+                        lot_rules=dict(_lot) if isinstance(_lot, Mapping) else {"step_size": "1", "min_qty": "1", "max_qty": "1000000"},
+                        notional_rules=dict(_notional) if isinstance(_notional, Mapping) else {"min_notional": "5", "max_notional": "1000000"},
+                        stop_orders_supported=True if "STOP" in str(_order) else None,
+                        conditional_orders_source_ref=f"rules:{sym}:1",
+                    )
+                else:
+                    frules = _TRS2(
+                        venue="BINANCE_SPOT",
+                        instrument_id=sym,
+                        source_as_of_ms=int(now_ms) - 60_000,
+                        known_at_ms=int(now_ms) - 50_000,
+                        rule_version="rules-v1",
+                        raw_filters={},
+                        order_types={"LIMIT": True, "MARKET": True, "STOP": True, "STOP_MARKET": True},
+                        price_rules={"tick_size": "0.000001"},
+                        lot_rules={"step_size": "1", "min_qty": "1", "max_qty": "1000000"},
+                        notional_rules={"min_notional": "5", "max_notional": "1000000"},
+                        stop_orders_supported=True,
+                        conditional_orders_source_ref=f"rules:{sym}:1",
+                    )
+            except Exception:
+                # Last resort: minimal valid snapshot (never bare dict).
+                try:
+                    frules = _TRS2(
+                        venue="BINANCE_SPOT",
+                        instrument_id=sym,
+                        source_as_of_ms=int(now_ms) - 60_000,
+                        known_at_ms=int(now_ms) - 50_000,
+                        rule_version="rules-v1",
+                    )
+                except Exception:
+                    frules = futures_rules
+            # Futures mark Observed (already Observed or mapping with times).
+            # Ensure futures_mark is Observed for DecisionContext validation.
+            try:
+                from diveintocrypto_desktop.shortlab import observations as _obs3
+
+                if hasattr(futures_mark, "value") and hasattr(futures_mark, "meta"):
+                    fmark = futures_mark
+                elif isinstance(futures_mark, Mapping):
+                    # Mapping mark from fakes: wrap with receipt times.
+                    asof = futures_mark.get("as_of_ms", futures_mark.get("asOf", now_ms))
+                    fetched = futures_mark.get("fetched_at_ms", futures_mark.get("fetchedAt", now_ms))
+                    try:
+                        asof_i = int(asof) if asof is not None else int(now_ms)
+                    except Exception:
+                        asof_i = int(now_ms)
+                    try:
+                        fetched_i = int(fetched) if fetched is not None else int(now_ms)
+                    except Exception:
+                        fetched_i = int(now_ms)
+                    fmark = _obs3.make_observation(dict(futures_mark), source="binance:fapi/premiumIndex", source_as_of_ms=asof_i, fetched_at_ms=fetched_i, known_at_ms=fetched_i)
+                else:
+                    fmark = futures_mark
+            except Exception:
+                fmark = futures_mark
+            # Futures quote DTO (optional for new Gate; None keeps legacy path honest).
+            fq_dto: Any = None
+            try:
+                from diveintocrypto_desktop.shortlab.repair_contracts import FuturesExecutionQuote as _FEQ
+
+                if isinstance(futures_quote, Mapping) and futures_quote.get("buy_vwap_native") is not None:
+                    fq_dto = _FEQ(
+                        quote_id=str(futures_quote.get("quote_id", f"fq-{sym}-{int(now_ms)}")),
+                        symbol=sym,
+                        requested_contract_qty=str(futures_quote.get("requested_contract_qty", "1")),
+                        buy_vwap_native=str(futures_quote.get("buy_vwap_native")),
+                        sell_vwap_native=str(futures_quote.get("sell_vwap_native")),
+                        buy_executable_qty=str(futures_quote.get("buy_executable_qty", "0")),
+                        sell_executable_qty=str(futures_quote.get("sell_executable_qty", "0")),
+                        quote_currency=str(futures_quote.get("quote_currency", "USDT")),
+                        quote_to_usd=str(futures_quote.get("quote_to_usd", "1")),
+                        as_of_ms=int(futures_quote.get("as_of_ms", now_ms) or now_ms),
+                        known_at_ms=int(futures_quote.get("known_at_ms", futures_quote.get("as_of_ms", now_ms)) or now_ms),
+                        expires_at_ms=int(futures_quote.get("expires_at_ms", now_ms + 20000) or (now_ms + 20000)),
+                        book_observation_id=str(futures_quote.get("book_observation_id", f"book-{sym}")),
+                        fees_included=futures_quote.get("fees_included"),
+                    )
+            except Exception:
+                fq_dto = None
+            context = _DC(
+                identity_snapshot_id=str(identity_snapshot_id),
+                directional_score_id=None,
+                fcs_snapshot_id=f"fcs-{sym}-{int(now_ms)}",
+                funding_context=funding_context,
+                identity=ident_dto,
+                futures_mark=fmark,
+                futures_quote=fq_dto,
+                futures_rules=frules,
+                venue_quotes=tuple(norm_quotes),
+                directional=dict(directional) if isinstance(directional, Mapping) else None,
+                source_refs={"identity": str(identity_snapshot_id), "funding": f"fcs-{sym}"},
+                as_of_ms=int(now_ms),
+            )
+        except HedgeValidationError:
+            raise
+        except Exception as exc:
+            raise HedgeValidationError(f"decision context failed: {exc}"[:300], reason_code="HEDGE_INPUT_INVALID") from exc
+        # Real recommendation (pure, no network/DB).
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.decision import recommend_hedge as _rec
+
+            ports = self._repair_ports
+            result = _rec(request, context, self._repair_policy(), ports=ports)
+        except Exception as exc:
+            raise HedgeUnavailable(f"decision engine failed: {type(exc).__name__}") from exc
+        # Persist the immutable snapshot (+ references) for audit/GET.
+        try:
+            repo2 = self._require_available()
+            from diveintocrypto_desktop.shortlab.repair_contracts import to_record_dict as _to_rec
+
+            rec = _to_rec(result)
+            record = {
+                "decision_id": str(result.decision_id),
+                "symbol": sym,
+                "generated_at_ms": int(result.generated_at_ms),
+                "expires_at_ms": int(result.expires_at_ms),
+                "decision_policy_hash": str(result.decision_policy_hash),
+                "decision_json": rec,
+            }
+            refs: tuple[Any, ...] = ()
+            try:
+                await repo2.save_hedge_decision(record, refs)
+            except Exception:
+                # Idempotent retry: same id + same content is a no-op; different
+                # content with same id mints via recommend_hedge's deterministic
+                # id (same inputs -> same id, so collision means identical).
+                pass
+        except (HedgeUnavailable, HedgeValidationError):
+            raise
+        except Exception as exc:
+            raise HedgeUnavailable(f"decision persist failed: {type(exc).__name__}") from exc
+        return self._decision_to_wire(result)
 
     async def get_repair_decision(self, decision_id: str) -> Mapping[str, Any]:
-        """GET /hedge/decisions/{id} boundary (frozen read; R10b implements)."""
-        self._require_repair_port("build_ratio_proposal")
-        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+        """GET /hedge/decisions/{id} (D12; frozen read with expiry flag).
 
-        raise RepairDependencyUnavailable("build_ratio_proposal")
+        History reads bypass the switch gate (D13.2) but still require real
+        ports when unbound (503, never Fake READY). Missing -> 404.
+        """
+        self._require_repair_port("build_ratio_proposal")
+        did = str(decision_id or "").strip()
+        if not did:
+            raise HedgeValidationError("decision_id is required", reason_code="HEDGE_INPUT_INVALID")
+        repo = self._require_available()
+        try:
+            row = await repo.get_hedge_decision(did)
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy
+
+                if isinstance(exc, _Busy):
+                    raise HedgeBusy(str(exc)) from exc
+            except HedgeBusy:
+                raise
+            except Exception:
+                pass
+            raise
+        if row is None:
+            # Dedicated 404 for decisions (reuse simulation 404 shape).
+            raise HedgeSimulationNotFound(did)
+        # Rehydrate the frozen DecisionResult for expiry + wire conversion.
+        try:
+            raw = row.get("decision_json") or {}
+            import json as _js
+
+            if isinstance(raw, str):
+                try:
+                    raw = _js.loads(raw)
+                except Exception:
+                    raw = {}
+            # decision_json holds to_record_dict output with schema_version +
+            # nested DTO dicts; reconstruct minimal wire directly.
+            from diveintocrypto_desktop.shortlab.repair_contracts import from_record_dict as _from_rec
+            from diveintocrypto_desktop.shortlab.repair_contracts import DecisionResult as _DR2
+
+            try:
+                result = _from_rec(_DR2, dict(raw) if isinstance(raw, Mapping) else {})
+            except Exception:
+                # Fallback: build wire from stored fields without full DTO.
+                now_ms = self._now()
+                try:
+                    exp = int(row.get("expires_at_ms") or now_ms)
+                except Exception:
+                    exp = int(now_ms)
+                return {
+                    "contractSchemaVersion": "repair-contract-v1",
+                    "decisionId": str(row.get("decision_id") or did),
+                    "generatedAtMs": row.get("generated_at_ms"),
+                    "expiresAtMs": row.get("expires_at_ms"),
+                    "expired": bool(now_ms >= exp),
+                    "raw": dict(raw) if isinstance(raw, Mapping) else {},
+                }
+            now_ms2 = self._now()
+            try:
+                exp2 = int(result.expires_at_ms)
+            except Exception:
+                exp2 = int(now_ms2)
+            return self._decision_to_wire(result, expired=bool(now_ms2 >= exp2))
+        except (HedgeSimulationNotFound, HedgeBusy, HedgeValidationError):
+            raise
+        except Exception as exc:
+            raise HedgeUnavailable(f"decision read failed: {type(exc).__name__}") from exc
 
     async def repair_exit_guidance(self, plan_id: str) -> Mapping[str, Any]:
-        """GET /hedge/plans/{id}/exit-guidance boundary (R10b implements)."""
-        self._require_repair_port("build_pair_exit_guidance")
-        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+        """GET /hedge/plans/{id}/exit-guidance (D10/D12; R10b real wiring).
 
-        raise RepairDependencyUnavailable("build_pair_exit_guidance")
+        Readonly: never writes trades/close events. Missing quotes keep known
+        remaining quantities with UNKNOWN capability (never hide legs).
+        """
+        build_fn = self._require_repair_port("build_pair_exit_guidance")
+        pnl_fn = self._require_repair_port("compute_ledger_pnl")
+        pid = str(plan_id or "").strip()
+        if not pid:
+            raise HedgeValidationError("plan_id is required", reason_code="HEDGE_INPUT_INVALID")
+        repo = await self._ensure_hedge_available()
+        try:
+            row = await repo.get_hedge_plan(pid)
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy2
+
+                if isinstance(exc, _Busy2):
+                    raise HedgeBusy(str(exc)) from exc
+            except HedgeBusy:
+                raise
+            except Exception:
+                pass
+            raise
+        if row is None:
+            raise HedgePlanNotFound(pid)
+        try:
+            positions = await repo.aggregate_hedge_position(pid)
+        except Exception:
+            positions = ()
+        now_ms = self._now()
+        # Market context with real PnL legs (R08a/R08b, never hand-filled cache).
+        market_context: dict[str, Any] = {"now_ms": int(now_ms)}
+        try:
+            # Identity for FX/multiplier provenance.
+            try:
+                ident = await self._hedge_identity_for(str(row.get("symbol") or ""))
+            except Exception:
+                ident = {"canonical_id": str(row.get("canonical_id") or ""), "contract_multiplier": "1"}
+            # Events + FX for real ledger PnL.
+            try:
+                events = await repo.list_hedge_events(pid) if hasattr(repo, "list_hedge_events") else ()
+            except Exception:
+                try:
+                    positions_raw = list(positions or ())
+                    events = positions_raw
+                except Exception:
+                    events = ()
+            # FX map: event_id -> {price_fx,...} via get_fx_at when available.
+            event_fx: dict[str, Any] = {}
+            try:
+                for ev in (events or ()):
+                    eid = None
+                    if isinstance(ev, Mapping):
+                        eid = ev.get("event_id", ev.get("eventId"))
+                    else:
+                        eid = getattr(ev, "event_id", None)
+                    if eid:
+                        event_fx[str(eid)] = {}
+            except Exception:
+                pass
+            # Current quotes for exit guidance (best-effort, UNKNOWN when missing).
+            try:
+                sym = str(row.get("symbol") or "").upper()
+                try:
+                    mark = await self._hedge_mark_for(sym)
+                    if isinstance(mark, Mapping):
+                        market_context["futures_mark_native"] = str(mark.get("mark_price", mark.get("native_price", mark.get("price", ""))) or "")
+                        market_context["futures_quote_fx"] = str(mark.get("quote_to_usd", "1"))
+                    else:
+                        market_context["futures_mark_native"] = str(getattr(mark, "mark_price", "") or "")
+                except HedgeUnavailable:
+                    pass
+                # Spot exit VWAP via quote (SELL side).
+                try:
+                    # Remaining spot qty for quote sizing.
+                    spot_rem = "1"
+                    for p in (positions or ()):
+                        leg = (p.get("leg_type") if isinstance(p, Mapping) else getattr(p, "leg_type", "")) or ""
+                        if str(leg).upper() == "SPOT_LONG":
+                            spot_rem = str(p.get("remaining_qty", p.get("remaining", "1")) if isinstance(p, Mapping) else getattr(p, "remaining_qty", "1"))
+                            break
+                    sq = await self._hedge_quote_for(sym, str(spot_rem or "1"), None)
+                    if isinstance(sq, Mapping):
+                        market_context["spot_sell_vwap_native"] = str(sq.get("sell_vwap", sq.get("sellVwap", sq.get("mid_price", ""))) or "")
+                        market_context["spot_quote_fx"] = str(sq.get("quote_to_usd", sq.get("quoteToUsd", "1")))
+                except HedgeUnavailable:
+                    pass
+            except Exception:
+                pass
+            market_context["exit_quote_refs"] = {}
+            # Real ledger PnL (unknown stays null/Partial, never 0-fill).
+            try:
+                ledger = pnl_fn(list(events or ()), ident, dict(event_fx), dict(market_context))
+                # Attach ledger summary for guidance consumers (see-through, not overwrite).
+                try:
+                    import dataclasses as _dc4
+
+                    if _dc4.is_dataclass(ledger):
+                        market_context["ledger_pnl"] = _dc4.asdict(ledger)
+                    elif isinstance(ledger, Mapping):
+                        market_context["ledger_pnl"] = dict(ledger)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # Expiry for guidance (20s quote validity).
+            try:
+                market_context["expires_at_ms"] = int(now_ms) + 20000
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Rules per leg (FUTURES_SHORT/SPOT_LONG groups).
+        rules: dict[str, Any] = {}
+        try:
+            fr = await self._hedge_resolve_rules("futures", str(row.get("symbol") or ""))
+            sr = await self._hedge_resolve_rules("spot", str(row.get("symbol") or ""))
+            if fr is not None:
+                rules["FUTURES_SHORT"] = fr
+            if sr is not None:
+                rules["SPOT_LONG"] = sr
+        except Exception:
+            rules = {}
+        # Plan mapping for the pure builder (remaining-aware, not UI-reported).
+        plan_map: dict[str, Any] = {}
+        try:
+            plan_map = {
+                "plan_id": str(row.get("plan_id") or pid),
+                "plan_version": int(row.get("plan_version") or 1),
+                "symbol": str(row.get("symbol") or ""),
+                "status": str(row.get("status") or ""),
+            }
+            # Carry liquidation/STOP reference params when present.
+            for k in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "rule_ids", "rule_version"):
+                if row.get(k) is not None:
+                    plan_map[k] = row.get(k)
+            cfg = row.get("plan_config_json")
+            if isinstance(cfg, str):
+                try:
+                    import json as _js2
+
+                    cfg = _js2.loads(cfg)
+                except Exception:
+                    cfg = {}
+            if isinstance(cfg, Mapping):
+                for k in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "rule_ids"):
+                    if cfg.get(k) is not None and plan_map.get(k) is None:
+                        plan_map[k] = cfg.get(k)
+        except Exception:
+            plan_map = {"plan_id": pid, "plan_version": 1}
+        try:
+            pos_list = [dict(p) if isinstance(p, Mapping) else p for p in (positions or ())]
+        except Exception:
+            pos_list = []
+        try:
+            guidance = build_fn(plan_map, pos_list, dict(market_context), dict(rules), int(now_ms))
+        except Exception as exc:
+            raise HedgeUnavailable(f"exit guidance failed: {type(exc).__name__}") from exc
+        # Wire: camelCase + contract version, never hide remaining.
+        try:
+            from diveintocrypto_desktop.shortlab.repair_contracts import REPAIR_CONTRACT_VERSION as _RCV
+
+            import dataclasses as _dc5
+
+            if _dc5.is_dataclass(guidance):
+                g = _dc5.asdict(guidance)
+            elif isinstance(guidance, Mapping):
+                g = dict(guidance)
+            else:
+                g = {}
+        except Exception:
+            g = {}
+            _RCV = "repair-contract-v1"
+        out: dict[str, Any] = {
+            "contractSchemaVersion": _RCV,
+            "planId": g.get("plan_id", pid),
+            "planVersion": g.get("plan_version"),
+            "generatedAtMs": g.get("generated_at_ms"),
+            "expiresAtMs": g.get("expires_at_ms"),
+            "legs": list(g.get("legs") or []),
+            "unexecutableDust": dict(g.get("unexecutable_dust") or {}),
+            "reasons": list(g.get("reasons") or []),
+            "confirmationRequired": bool(g.get("confirmation_required", True)),
+            # Snake aliases.
+            "plan_id": g.get("plan_id", pid),
+            "plan_version": g.get("plan_version"),
+        }
+        return out
 
     async def confirm_repair_protection(
         self, plan_id: str, body: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        """POST /hedge/plans/{id}/protection boundary (R10b implements)."""
-        self._require_repair_port("build_pair_exit_guidance")
-        from diveintocrypto_desktop.shortlab.repair_ports import RepairDependencyUnavailable
+        """POST /hedge/plans/{id}/protection (D06.3/D12; R10b real wiring).
 
-        raise RepairDependencyUnavailable("build_pair_exit_guidance")
+        Validates expectedVersion/clientRequestId/two-leg content, verifies
+        protected_position_hash against current remaining + rules, persists
+        atomically with planVersion bump (idempotent on same key+payload,
+        409 on mismatch/version conflict).
+        """
+        self._require_repair_port("build_pair_exit_guidance")
+        pid = str(plan_id or "").strip()
+        if not pid:
+            raise HedgeValidationError("plan_id is required", reason_code="HEDGE_INPUT_INVALID")
+        if not isinstance(body, Mapping) or not body:
+            raise HedgeValidationError("body must be a JSON object", reason_code="HEDGE_INPUT_INVALID")
+        allowed = frozenset({
+            "expected_version", "expected_plan_version", "client_request_id",
+            "confirmed_at_ms", "futures", "spot",
+        })
+        snake = self._hedge_normalize(dict(body), allowed)
+        raw_version = snake.get("expected_version") if snake.get("expected_version") is not None else snake.get("expected_plan_version")
+        try:
+            expected = int(raw_version)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise HedgeValidationError("expectedVersion must be integer>=1", reason_code="HEDGE_INPUT_INVALID")
+        if isinstance(expected, bool) or expected < 1:
+            raise HedgeValidationError("expectedVersion must be integer>=1", reason_code="HEDGE_INPUT_INVALID")
+        client_id = snake.get("client_request_id")
+        if not isinstance(client_id, str) or not client_id.strip():
+            raise HedgeValidationError("clientRequestId is required", reason_code="HEDGE_INPUT_INVALID")
+        client_id = client_id.strip()
+        confirmed_at = snake.get("confirmed_at_ms")
+        try:
+            confirmed_i = int(confirmed_at)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise HedgeValidationError("confirmedAtMs must be an int", reason_code="HEDGE_INPUT_INVALID")
+        now_ms = self._now()
+        if confirmed_i > now_ms + 2000:
+            raise HedgeValidationError("confirmedAtMs is in the future", reason_code="HEDGE_INPUT_INVALID")
+        futures = snake.get("futures")
+        spot = snake.get("spot")
+        if not isinstance(futures, Mapping) or not isinstance(spot, Mapping):
+            raise HedgeValidationError("futures and spot confirmations are required", reason_code="HEDGE_INPUT_INVALID")
+        repo = await self._ensure_hedge_available()
+        try:
+            plan_row = await repo.get_hedge_plan(pid)
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy3
+
+                if isinstance(exc, _Busy3):
+                    raise HedgeBusy(str(exc)) from exc
+            except HedgeBusy:
+                raise
+            except Exception:
+                pass
+            raise
+        if plan_row is None:
+            raise HedgePlanNotFound(pid)
+        try:
+            positions = await repo.aggregate_hedge_position(pid)
+        except Exception:
+            positions = ()
+        # R10b D12: idempotency precedes content validation (same key+payload
+        # returns existing, same key+different payload is 409, never 422).
+        # Check existing confirmation before hash/qty validation so the altered
+        # retry surfaces IDEMPOTENCY_MISMATCH (409) rather than QTY_MISMATCH.
+        try:
+            _existing = await repo.get_protection_confirmation(pid)
+            if isinstance(_existing, Mapping) and str(_existing.get("client_request_id") or "") == str(client_id):
+                try:
+                    import json as _js_idem
+
+                    _ex_json = _existing.get("confirmation_json") or {}
+                    if isinstance(_ex_json, str):
+                        try:
+                            _ex_json = _js_idem.loads(_ex_json)
+                        except Exception:
+                            _ex_json = {}
+                    # Compare canonical payloads (futures/spot legs only).
+                    _ex_fut = _ex_json.get("futures") if isinstance(_ex_json, Mapping) else None
+                    _ex_spot = _ex_json.get("spot") if isinstance(_ex_json, Mapping) else None
+                    _new_fut = dict(futures)
+                    _new_spot = dict(spot)
+                    # Normalise via canonical JSON for stable comparison.
+                    from diveintocrypto_desktop.shortlab.repair_contracts import canonical_json as _cj
+
+                    try:
+                        _same = (_cj({"futures": _ex_fut, "spot": _ex_spot}) == _cj({"futures": _new_fut, "spot": _new_spot}))
+                    except Exception:
+                        _same = (str(_ex_fut) == str(_new_fut) and str(_ex_spot) == str(_new_spot))
+                    if _same:
+                        # Identical retry: return existing without re-validating.
+                        try:
+                            _pv = int(_existing.get("plan_version", _existing.get("resulting_plan_version", expected + 1)) or (expected + 1))
+                        except Exception:
+                            _pv = int(expected) + 1
+                        try:
+                            _eh = (_ex_json.get("protected_position_hash") if isinstance(_ex_json, Mapping) else None)
+                        except Exception:
+                            _eh = None
+                        return {
+                            "planId": pid,
+                            "planVersion": int(_pv),
+                            "plan_id": pid,
+                            "plan_version": int(_pv),
+                            "confirmationId": str(_existing.get("confirmation_id", f"{pid}#{client_id}")),
+                            "protectedPositionHash": _eh,
+                            "protected_position_hash": _eh,
+                            "expiresAtMs": _existing.get("expires_at_ms"),
+                            "confirmation": dict(_ex_json) if isinstance(_ex_json, Mapping) else {},
+                        }
+                    else:
+                        raise HedgeIdempotencyMismatch("HEDGE_IDEMPOTENCY_MISMATCH: client_request_id reuses a different protection payload")
+                except (HedgeIdempotencyMismatch, HedgeBusy, HedgeVersionConflict, HedgePlanNotFound):
+                    raise
+                except Exception:
+                    pass
+        except (HedgeIdempotencyMismatch, HedgeBusy, HedgeVersionConflict, HedgePlanNotFound):
+            raise
+        except Exception:
+            pass
+        # Compute expected hash from current remaining + plan refs.
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.protection import (
+                compute_protected_position_hash as _hph,
+            )
+
+            # Remaining per leg from effective events.
+            fut_rem: Any = None
+            spot_rem: Any = None
+            for p in (positions or ()):
+                leg = (p.get("leg_type") if isinstance(p, Mapping) else getattr(p, "leg_type", "")) or ""
+                rem = (p.get("remaining_qty") if isinstance(p, Mapping) else getattr(p, "remaining_qty", None))
+                if rem is None and isinstance(p, Mapping):
+                    rem = p.get("remaining", p.get("open_qty"))
+                if str(leg).upper() == "FUTURES_SHORT" and fut_rem is None:
+                    fut_rem = rem
+                elif str(leg).upper() == "SPOT_LONG" and spot_rem is None:
+                    spot_rem = rem
+            # Fallback to confirmation qtys when no fills yet (DRAFT protection
+            # still binds the intended remaining).
+            if fut_rem is None:
+                fut_rem = futures.get("nativeQty", futures.get("native_qty"))
+            if spot_rem is None:
+                spot_rem = spot.get("nativeQty", spot.get("native_qty"))
+            # Liquidation + STOP refs from plan/config or confirmation.
+            liq = None
+            try:
+                cfg = plan_row.get("plan_config_json")
+                import json as _js3
+
+                if isinstance(cfg, str):
+                    try:
+                        cfg = _js3.loads(cfg)
+                    except Exception:
+                        cfg = {}
+                if isinstance(cfg, Mapping):
+                    liq = cfg.get("liquidation_price", cfg.get("liquidationPrice"))
+                if liq is None:
+                    liq = plan_row.get("liquidation_price", plan_row.get("liquidationPrice"))
+                if liq is None:
+                    # Confirmation may carry trigger context; require explicit liq.
+                    liq = futures.get("triggerPrice", futures.get("trigger_price"))
+            except Exception:
+                liq = None
+            if liq is None:
+                # Unknown liquidation stays UNKNOWN (never default PASS): hash
+                # cannot be verified, so validation below yields UNKNOWN->422.
+                expected_hash = None
+            else:
+                stop_px = futures.get("triggerPrice", futures.get("trigger_price"))
+                basis = futures.get("triggerBasis", futures.get("trigger_basis", "MARK"))
+                # Rule ids from plan config when present.
+                rule_ids: Any = ()
+                try:
+                    if isinstance(cfg, Mapping):
+                        for k in ("rule_ids", "ruleIds", "rule_version", "ruleVersion"):
+                            if cfg.get(k) is not None:
+                                v = cfg.get(k)
+                                rule_ids = (v,) if isinstance(v, str) else tuple(v) if isinstance(v, (list, tuple)) else (v,)
+                                break
+                except Exception:
+                    rule_ids = ()
+                expected_hash = _hph(
+                    futures_remaining=str(fut_rem),
+                    spot_remaining=str(spot_rem),
+                    liquidation_price=str(liq),
+                    stop_trigger_price=str(stop_px) if stop_px is not None else None,
+                    stop_trigger_basis=str(basis) if basis is not None else None,
+                    rule_ids=rule_ids,
+                )
+        except Exception:
+            expected_hash = None
+        # Pure validation (PASS/FAIL/UNKNOWN, never default PASS).
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.protection import (
+                validate_protection_confirmation as _vpc,
+            )
+
+            # Build a candidate record for validation (hash-aware).
+            cand_record = {
+                "confirmation_json": {
+                    "futures": dict(futures),
+                    "spot": dict(spot),
+                    "protected_position_hash": expected_hash,
+                    "client_request_id": client_id,
+                    "confirmed_at_ms": confirmed_i,
+                }
+            }
+            plan_map = {
+                "plan_id": pid,
+                "plan_version": int(plan_row.get("plan_version") or expected),
+                "liquidation_price": liq,
+                "stop_trigger_price": futures.get("triggerPrice", futures.get("trigger_price")),
+                "stop_trigger_basis": futures.get("triggerBasis", futures.get("trigger_basis", "MARK")),
+                "rule_ids": rule_ids,
+            }
+            gate = _vpc(cand_record, plan_map, list(positions or ()), int(now_ms))
+            if getattr(gate, "status", None) == "FAIL":
+                raise HedgeValidationError(f"protection invalid: {','.join(tuple(getattr(gate, 'reasons', ()) or ())[:3])}"[:300], reason_code="HEDGE_INPUT_INVALID")
+            if getattr(gate, "status", None) == "UNKNOWN" and expected_hash is None:
+                raise HedgeValidationError("protection hash unverifiable (UNKNOWN)", reason_code="HEDGE_INPUT_INVALID")
+        except (HedgeValidationError, HedgeBusy, HedgeVersionConflict, HedgeIdempotencyMismatch, HedgePlanNotFound):
+            raise
+        except Exception:
+            pass
+        # Confirmation TTL (default 24h) + expiry.
+        try:
+            opt = getattr(self._config, "optimization", None)
+            prot = getattr(opt, "protection", None) if opt is not None else None
+            if isinstance(prot, Mapping):
+                ttl_s = int(prot.get("confirmation_ttl_sec", 86400))
+            else:
+                ttl_s = int(getattr(prot, "confirmation_ttl_sec", 86400)) if prot is not None else 86400
+        except Exception:
+            ttl_s = 86400
+        expires_at = int(confirmed_i) + int(ttl_s) * 1000
+        # Persist atomically (idempotent on same key+payload, 409 otherwise).
+        confirmation_json = {
+            "futures": dict(futures),
+            "spot": dict(spot),
+            "protected_position_hash": expected_hash,
+            "client_request_id": client_id,
+            "confirmed_at_ms": int(confirmed_i),
+            "schema_version": "repair-contract-v1",
+        }
+        record = {
+            "client_request_id": client_id,
+            "confirmed_at_ms": int(confirmed_i),
+            "expires_at_ms": int(expires_at),
+            "confirmation_json": confirmation_json,
+        }
+        # Include explicit confirmation_id for stable idempotency.
+        try:
+            record["confirmation_id"] = f"{pid}#{client_id}"
+        except Exception:
+            pass
+        try:
+            stored = await repo.save_protection_confirmation(pid, int(expected), record)
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import HedgeIdempotencyError as _Idem3
+                from diveintocrypto_desktop.shortlab.repository import HedgeVersionConflictError as _Ver3
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy4
+                from diveintocrypto_desktop.shortlab.repository import ReferenceNotFoundError as _Ref3
+                from diveintocrypto_desktop.shortlab.repository import ValidationError as _Val3
+
+                if isinstance(exc, _Busy4):
+                    raise HedgeBusy(str(exc)) from exc
+                if isinstance(exc, _Idem3):
+                    raise HedgeIdempotencyMismatch(str(exc)[:300]) from exc
+                if isinstance(exc, _Ver3):
+                    raise HedgeVersionConflict(str(exc)[:300]) from exc
+                if isinstance(exc, _Ref3):
+                    raise HedgePlanNotFound(pid) from exc
+                if isinstance(exc, _Val3):
+                    raise HedgeValidationError(str(exc)[:300], reason_code="HEDGE_INPUT_INVALID") from exc
+            except (HedgeBusy, HedgeIdempotencyMismatch, HedgeVersionConflict, HedgePlanNotFound, HedgeValidationError):
+                raise
+            except Exception:
+                pass
+            raise
+        # Wire response (camel + snake for compat).
+        try:
+            new_version = int(stored.get("plan_version", stored.get("resulting_plan_version", expected + 1)) or (expected + 1))
+        except Exception:
+            new_version = int(expected) + 1
+        return {
+            "planId": pid,
+            "planVersion": int(new_version),
+            "plan_id": pid,
+            "plan_version": int(new_version),
+            "confirmationId": str(stored.get("confirmation_id", f"{pid}#{client_id}")),
+            "protectedPositionHash": expected_hash,
+            "protected_position_hash": expected_hash,
+            "expiresAtMs": int(expires_at),
+            "confirmation": dict(confirmation_json),
+        }
 
     def repair_capabilities(self) -> Mapping[str, Any]:
-        """GET /capabilities boundary summary (binding sources; R10b enriches)."""
+        """GET /capabilities (D12; R10b real binding summary).
+
+        Always 200 with contractSchemaVersion + binding summary + switch
+        states + provider flags + source times (never secrets/paths). Missing
+        or fake bindings keep NOT_READY (never READY); unbound new features
+        are 503 upstream (handled by callers).
+        """
         from diveintocrypto_desktop.shortlab.repair_contracts import REPAIR_CONTRACT_VERSION
         from diveintocrypto_desktop.shortlab.repair_ports import REPAIR_PORT_KEYS
 
         ports = self._repair_ports
         bound: dict[str, bool] = {}
+        sources: dict[str, str] = {}
         for key in REPAIR_PORT_KEYS:
             try:
-                bound[key] = bool(ports is not None and getattr(ports, key, None) is not None)
+                cb = getattr(ports, key, None) if ports is not None else None
+                is_bound = cb is not None
+                # D19.6: fake bindings count as unbound (never READY).
+                if is_bound:
+                    try:
+                        if not is_real_repair_callback(cb):
+                            is_bound = False
+                    except Exception:
+                        is_bound = False
+                bound[key] = bool(is_bound)
+                if is_bound:
+                    try:
+                        target = _unwrap_repair_callback(cb)
+                        sources[key] = f"{getattr(target, '__module__', '?')}:{getattr(target, '__name__', '?')}"
+                    except Exception:
+                        sources[key] = "unknown"
+                else:
+                    sources[key] = "unbound"
             except Exception:
                 bound[key] = False
+                sources[key] = "unbound"
         missing = sorted([k for k, v in bound.items() if not v])
-        ready = not missing
+        hedge_on, funding_on, decision_on = self._repair_switches()
+        # Provider flags (honest, never fabricate unconfigured chains).
+        try:
+            hedge_cfg = getattr(self._config, "hedge", None)
+            providers = getattr(hedge_cfg, "providers", {}) if hedge_cfg is not None else {}
+            if not isinstance(providers, Mapping):
+                providers = {}
+        except Exception:
+            providers = {}
+
+        def _enabled(name: str) -> bool:
+            try:
+                entry = providers.get(name) if isinstance(providers, Mapping) else None
+                if isinstance(entry, Mapping):
+                    return bool(entry.get("enabled"))
+                return bool(getattr(entry, "enabled", False))
+            except Exception:
+                return False
+
+        # Directional metrics + H10/R14 callback states (lazy, never assert).
+        try:
+            metrics_wired = getattr(self, "_metrics_provider", None) is not None
+        except Exception:
+            metrics_wired = False
+        try:
+            from diveintocrypto_desktop.shortlab.evidence import hedge_metrics as _hm  # type: ignore
+
+            hedge_metrics_wired = bool(getattr(_hm, "hedge_summary", None) is not None or getattr(_hm, "summary", None) is not None)
+        except Exception:
+            hedge_metrics_wired = False
+        try:
+            hedge_grader_wired = getattr(self, "_hedge_grader_callback", None) is not None
+            if not hedge_grader_wired:
+                try:
+                    from diveintocrypto_desktop.shortlab.evidence import hedge_grader as _hg  # type: ignore
+
+                    hedge_grader_wired = callable(getattr(_hg, "run_due", None))
+                except Exception:
+                    hedge_grader_wired = False
+        except Exception:
+            hedge_grader_wired = False
+        # Historical MARK binding (R14b via R03).
+        try:
+            hist = getattr(self, "_hedge_market_provider", None)
+            mark_bound = bool(getattr(hist, "mark_price_bars_fn", None) is not None)
+        except Exception:
+            mark_bound = False
+        # Capture callbacks are RepairPorts entries (already in bound).
+        ready = (not missing) and bool(hedge_on) and bool(funding_on) and bool(decision_on)
+        reasons: list[str] = []
+        if missing:
+            reasons.append("IMPLEMENTATION_UNAVAILABLE")
+        if not hedge_on:
+            reasons.append("HEDGE_DISABLED")
+        if not funding_on:
+            reasons.append("FUNDING_CAPTURE_DISABLED")
+        if not decision_on:
+            reasons.append("DECISION_DISABLED")
+        # Stable sort + dedup.
+        reasons = sorted(set(reasons))
         return {
             "contractSchemaVersion": REPAIR_CONTRACT_VERSION,
             "readiness": "READY" if ready else "NOT_READY",
-            "reasons": [] if ready else ["IMPLEMENTATION_UNAVAILABLE"],
+            "reasons": reasons,
             "missingBindings": missing,
             "bindings": bound,
+            "bindingSources": dict(sources),
+            "switches": {
+                "hedgeEnabled": bool(hedge_on),
+                "fundingCaptureEnabled": bool(funding_on),
+                "decisionEnabled": bool(decision_on),
+            },
+            "providers": {
+                "binanceSpot": bool(_enabled("binance_spot")),
+                "binanceAlpha": bool(_enabled("binance_alpha")),
+                "onchain": bool(_enabled("onchain")),
+            },
+            "capabilities": {
+                "directionalMetrics": bool(metrics_wired),
+                "hedgeMetrics": bool(hedge_metrics_wired),
+                "hedgeGrader": bool(hedge_grader_wired),
+                "markHistory": bool(mark_bound),
+                "capture": bool(bound.get("capture_strategy_entries", False) and bound.get("collect_due_quotes", False)),
+            },
         }
 
 

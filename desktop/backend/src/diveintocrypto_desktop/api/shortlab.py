@@ -327,6 +327,8 @@ def _map_hedge_exception(exc: Exception) -> JSONResponse:
     try:
         from diveintocrypto_desktop.shortlab.service import HedgeAlertNotFound as _Alert404
         from diveintocrypto_desktop.shortlab.service import HedgeBusy as _Busy2
+        from diveintocrypto_desktop.shortlab.service import HedgeDisabled as _Disabled
+        from diveintocrypto_desktop.shortlab.service import FundingCaptureDisabled as _FundingOff
         from diveintocrypto_desktop.shortlab.service import HedgeInputMismatch as _Mismatch
         from diveintocrypto_desktop.shortlab.service import HedgeLegsIncomplete as _Legs
         from diveintocrypto_desktop.shortlab.service import HedgeOpenLegsRemain as _Open
@@ -340,7 +342,15 @@ def _map_hedge_exception(exc: Exception) -> JSONResponse:
 
         if isinstance(exc, _Busy2):
             return _hedge_error(503, "LOCAL_WRITE_BUSY", "LOCAL_WRITE_BUSY", detail)
+        # R10b D12/D13.2: switch-off new suggestions (history reads bypass).
+        if isinstance(exc, _Disabled):
+            return _hedge_error(503, "HEDGE_DISABLED", "HEDGE_DISABLED", detail)
+        if isinstance(exc, _FundingOff):
+            return _hedge_error(503, "FUNDING_CAPTURE_DISABLED", "FUNDING_CAPTURE_DISABLED", detail)
         if isinstance(exc, _Unavail):
+            # Preserve VENUE_REGION_UNAVAILABLE (451) as honest 503 with that code.
+            if "REGION" in code or "451" in detail:
+                return _hedge_error(503, code or "VENUE_REGION_UNAVAILABLE", reason or code, detail)
             return _hedge_error(503, "HEDGE_UNAVAILABLE", "HEDGE_UNAVAILABLE", detail)
         if isinstance(exc, (_Sim404, _Plan404, _Alert404)):
             return _hedge_error(404, code, code, detail)
