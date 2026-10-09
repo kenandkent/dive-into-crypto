@@ -388,7 +388,7 @@ def test_full_100_all_max():
     )
     assert res.fcs == 100
     assert res.readiness == "READY"
-    assert res.fcs_version == "fcs_v1"
+    assert res.fcs_version == "fcs_v2"  # R00 frozen default (was fcs_v1)
     # Conservative/method/coverage/class saved with result.
     assert res.funding_metrics["history_class"] == "FULL_90D"
     assert res.funding_metrics["available_max_score"] == 100.0

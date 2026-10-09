@@ -1,6 +1,8 @@
 """H03 Funding statistics + FCS scoring (pure, no network).
 
-Design: B6.1 / B8 / B14 / B40. Plan H03.1-H03.5.
+Design: B6.1 / B8 / B14 / B40. Plan H03.1-H03.5. R05 (D05/D03.3): unified
+``FundingContext`` + ``ReadinessBreakdown`` builders live here; Service/jobs
+wiring is untouched (pure helpers only).
 
 Pure functions only. No HTTP, no DB, no clock reads. Callers pass
 ``cutoff_ms`` (as_of) explicitly and frozen policy mappings.
@@ -12,7 +14,11 @@ import math
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
-from diveintocrypto_desktop.shortlab.hedge import FCS_VERSION
+from diveintocrypto_desktop.shortlab.hedge import (
+    FCS_VERSION,
+    FCS_VERSION_V2,
+    FCS_VERSIONS_LEGACY,
+)
 from diveintocrypto_desktop.shortlab.hedge.models import FCSResult, FundingMetrics
 
 DAY_MS = 86_400_000
@@ -30,6 +36,8 @@ __all__ = [
     "resolve_history_class",
     "score_fcs",
     "build_fcs_distribution_report",
+    "build_funding_context",
+    "build_funding_readiness_breakdown",
 ]
 
 
@@ -601,7 +609,13 @@ def compute_funding_metrics(
 # ---------------------------------------------------------------------------
 
 def _extract_funding_capture(policy: Any) -> tuple[Mapping[str, Any], Mapping[str, Any], Any, str]:
-    """Return (score_rules, statistics, reference_notional, fcs_version)."""
+    """Return (score_rules, statistics, reference_notional, fcs_version).
+
+    R00/D15: accepts ``fcs_v1``/``fcs_v2``; old ``fcs_v1`` input still
+    decodes (legacy bucket) while new calculations use ``fcs_v2``. Bins are
+    identical across versions (weights never reallocated); only the emitted
+    ``fcs_version`` stamp differs.
+    """
     if hasattr(policy, "funding_capture"):
         fc = policy.funding_capture  # ShortLabConfig
         return (
@@ -617,7 +631,7 @@ def _extract_funding_capture(policy: Any) -> tuple[Mapping[str, Any], Mapping[st
             dict(fc2.score_rules),
             stats,
             getattr(fc2, "reference_notional_usd", 10000),
-            getattr(fc2, "fcs_version", FCS_VERSION),
+            getattr(fc2, "fcs_version", FCS_VERSION_V2),
         )
     if isinstance(policy, Mapping):
         node: Any = policy
@@ -626,7 +640,7 @@ def _extract_funding_capture(policy: Any) -> tuple[Mapping[str, Any], Mapping[st
         rules = node.get("score_rules", {})
         stats = node.get("statistics", {})
         ref = node.get("reference_notional_usd", 10000)
-        ver = node.get("fcs_version", FCS_VERSION)
+        ver = node.get("fcs_version", FCS_VERSION_V2)
         return dict(rules), dict(stats), ref, str(ver)
     raise ValueError("policy must carry funding_capture score_rules")
 
@@ -699,11 +713,16 @@ def score_fcs(
 
     Bins are read逐项from the default policy (B40); weights are never
     reallocated. Reliable young ages keep 90D as N/A (0, cap 90, fixed
-    0..100 axis); ordinary missing history yields null.
+    0..100 axis); ordinary missing history yields null. R00/D15: both
+    ``fcs_v1`` and ``fcs_v2`` policies are accepted with identical bins;
+    the emitted ``fcs_version`` follows the policy version.
     """
     rules, _stats, policy_ref, policy_ver = _extract_funding_capture(policy)
-    if policy_ver != FCS_VERSION:
-        raise ValueError(f"policy fcs_version must be {FCS_VERSION!r}, got {policy_ver!r}")
+    if policy_ver not in FCS_VERSIONS_LEGACY:
+        raise ValueError(
+            f"policy fcs_version must be one of {sorted(FCS_VERSIONS_LEGACY)}, "
+            f"got {policy_ver!r}"
+        )
 
     # History context: explicit history_class wins; else conservative/history_context.
     hist = history_class
@@ -1022,7 +1041,7 @@ def score_fcs(
         symbol=str(sym_out),
         canonical_id=str(canon),
         as_of_ms=cutoff_out,
-        fcs_version=FCS_VERSION,
+        fcs_version=str(policy_ver),
         fcs_config_hash=str(fcs_config_hash or ""),
         reference_notional_usd=str(ref_str),
         fcs=fcs_value,
@@ -1038,6 +1057,113 @@ def score_fcs(
 
 
 # ---------------------------------------------------------------------------
+# R05 unified FundingContext + ReadinessBreakdown builders (D05/D03.3)
+# ---------------------------------------------------------------------------
+
+def build_funding_context(
+    metrics: FundingMetrics,
+    coverage_7d: Any,
+    coverage_30d: Any,
+    coverage_90d: Any,
+    *,
+    history_class: str,
+    listing_age_days: int | None,
+    conservative_apr: str | None,
+    conservative_method: str,
+    current_observation: Any,
+    last_settled_observation: Any | None,
+    schedule_refs: Sequence[str] = (),
+    input_refs: Mapping[str, str] | None = None,
+) -> Any:
+    """Assemble a frozen :class:`FundingContext` from already-computed parts.
+
+    Pure assembler (no recomputation, no network): ``metrics`` comes from
+    :func:`compute_funding_metrics`, coverages from
+    ``funding_schedule.compute_schedule_coverage``. History class follows
+    D05.2 (``FULL_90D``/``PARTIAL_90D``/``INSUFFICIENT``/
+    ``HISTORY_CLASS_UNKNOWN``); unknown listing never borrows ``first_seen``.
+    Missing ``mark`` never blocks this assembler -- it only lowers the
+    separate USD-carry ``priced_event_coverage`` (see
+    ``funding_schedule.compute_priced_event_coverage``).
+    """
+    from diveintocrypto_desktop.shortlab.repair_contracts import FundingContext
+
+    if history_class not in ("FULL_90D", "PARTIAL_90D", "INSUFFICIENT", "HISTORY_CLASS_UNKNOWN"):
+        raise ValueError(f"history_class={history_class!r} unknown")
+    return FundingContext(
+        metrics=metrics,
+        coverage_7d=coverage_7d,
+        coverage_30d=coverage_30d,
+        coverage_90d=coverage_90d,
+        history_class=history_class,
+        listing_age_days=listing_age_days,
+        conservative_apr=conservative_apr,
+        conservative_method=conservative_method,
+        current_observation=current_observation,
+        last_settled_observation=last_settled_observation,
+        schedule_refs=tuple(schedule_refs),
+        input_refs=dict(input_refs) if input_refs is not None else {},
+    )
+
+
+def build_funding_readiness_breakdown(
+    funding_gate: Any,
+    *,
+    execution_gate: Any | None = None,
+    economic_gate: Any | None = None,
+    protection_status: str = "UNKNOWN",
+    data_complete: bool | None = None,
+) -> Any:
+    """Assemble a frozen :class:`ReadinessBreakdown` (D03.3) around a funding gate.
+
+    Pure: ``funding_gate`` comes from
+    ``hedge.entry_gate.evaluate_funding_entry_gate``. Missing execution /
+    economic gates default to ``UNKNOWN`` (never PASS by default, never
+    0-fill). ``readiness`` is ``READY`` only when all three gates PASS;
+    otherwise ``NOT_READY`` (funding alone never grants ``BLOCKED``; BLOCKED
+    is reserved for delisted/identity states owned elsewhere). FCS scores
+    never override this gate (thresholds stay independent).
+    """
+    from diveintocrypto_desktop.shortlab.repair_contracts import (
+        GateResult,
+        ReadinessBreakdown,
+    )
+
+    if not isinstance(funding_gate, GateResult):
+        raise ValueError("funding_gate must be GateResult")
+    checked = int(funding_gate.checked_at_ms)
+    if execution_gate is None:
+        execution_gate = GateResult("UNKNOWN", ("EXECUTION_GATE_NOT_EVALUATED",), checked, {})
+    if economic_gate is None:
+        economic_gate = GateResult("UNKNOWN", ("ECONOMIC_GATE_NOT_EVALUATED",), checked, {})
+    if not isinstance(execution_gate, GateResult) or not isinstance(economic_gate, GateResult):
+        raise ValueError("execution_gate/economic_gate must be GateResult or None")
+    if data_complete is None:
+        data_complete = (
+            funding_gate.status != "UNKNOWN"
+            and execution_gate.status != "UNKNOWN"
+            and economic_gate.status != "UNKNOWN"
+        )
+    readiness = (
+        "READY"
+        if (
+            funding_gate.status == "PASS"
+            and execution_gate.status == "PASS"
+            and economic_gate.status == "PASS"
+        )
+        else "NOT_READY"
+    )
+    return ReadinessBreakdown(
+        data_complete=bool(data_complete),
+        funding_gate=funding_gate,
+        execution_gate=execution_gate,
+        economic_gate=economic_gate,
+        protection_status=protection_status,
+        readiness=readiness,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Distribution report (B8.4 evidence, offline fixture only)
 # ---------------------------------------------------------------------------
 
@@ -1046,7 +1172,7 @@ def build_fcs_distribution_report(
     *,
     source: str,
     dump_sha256: str,
-    fcs_version: str = FCS_VERSION,
+    fcs_version: str = FCS_VERSION_V2,
 ) -> dict[str, Any]:
     """Offline B8.4 distribution evidence (no network, no yield optimisation).
 
