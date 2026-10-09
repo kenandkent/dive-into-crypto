@@ -1,0 +1,129 @@
+{
+  "description": "R00 frozen service call points (D19.1/D18.1). Producers bind these via RepairPorts in R10b; unbound returns IMPLEMENTATION_UNAVAILABLE/UNKNOWN, never PASS. Test fakes live only in desktop/backend/tests/repair_fixtures.py with binding_kind=TEST_FAKE.",
+  "schema_version": "repair-contract-v1",
+  "repair_ports": [
+    {
+      "key": "compute_schedule_coverage",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/funding_schedule.py",
+      "producer_function": "compute_schedule_coverage",
+      "signature": "compute_schedule_coverage(events: Sequence[Mapping], schedules: Sequence[FundingScheduleSegment], start_ms: int, end_ms: int, known_by_ms: int) -> FundingCoverage",
+      "returns": "FundingCoverage",
+      "availability": "IMPLEMENTATION_UNAVAILABLE when unbound",
+      "timeout_ms": 5000,
+      "reason_codes": ["FUNDING_SCHEDULE_UNKNOWN"],
+      "source_refs": ["sl_funding_event", "sl_funding_schedule"],
+      "default_enabled": false
+    },
+    {
+      "key": "evaluate_funding_entry_gate",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/entry_gate.py",
+      "producer_function": "evaluate_funding_entry_gate",
+      "signature": "evaluate_funding_entry_gate(context: FundingContext, policy: Mapping, as_of_ms: int) -> GateResult",
+      "returns": "GateResult",
+      "availability": "UNKNOWN when inputs unverifiable",
+      "timeout_ms": 5000,
+      "reason_codes": ["FUNDING_CURRENT_NON_POSITIVE", "FUNDING_LAST_NON_POSITIVE", "FUNDING_CURRENT_STALE", "FUNDING_HISTORY_BELOW_MIN", "FUNDING_POSITIVE_RATIO_LOW", "FUNDING_COVERAGE_LOW", "FUNDING_SCHEDULE_UNKNOWN", "HISTORY_CLASS_UNKNOWN"],
+      "source_refs": ["funding_context", "entry_gate policy"],
+      "default_enabled": false
+    },
+    {
+      "key": "build_ratio_proposal",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/economics.py",
+      "producer_function": "build_ratio_proposal",
+      "signature": "build_ratio_proposal(request: DecisionRequest, context: DecisionContext, target_ratio: str, policy: Mapping, *, ports: RepairPorts | None = None) -> RatioProposal",
+      "returns": "RatioProposal",
+      "availability": "IMPLEMENTATION_UNAVAILABLE when unbound",
+      "timeout_ms": 5000,
+      "reason_codes": ["UNKNOWN_COST", "UNKNOWN_FX", "INSUFFICIENT_CAPITAL"],
+      "source_refs": ["futures_quote", "spot_quote", "funding_context"],
+      "default_enabled": false
+    },
+    {
+      "key": "compute_ledger_pnl",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/pnl.py",
+      "producer_function": "compute_ledger_pnl",
+      "signature": "compute_ledger_pnl(events: Sequence[Mapping], identity: AssetIdentity, event_fx: Mapping[str, Mapping], market_context: Mapping) -> LedgerPnl",
+      "returns": "LedgerPnl",
+      "availability": "Partial/null when inputs unknown, never 0-fill",
+      "timeout_ms": 5000,
+      "reason_codes": ["UNKNOWN_FEE", "UNKNOWN_FX", "PARTIAL_COVERAGE"],
+      "source_refs": ["sl_hedge_event", "sl_fx_observation"],
+      "default_enabled": false
+    },
+    {
+      "key": "build_pair_exit_guidance",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/exit_guidance.py",
+      "producer_function": "build_pair_exit_guidance",
+      "signature": "build_pair_exit_guidance(plan: Mapping, positions: Sequence[Mapping], market_context: Mapping, rules: Mapping, now_ms: int) -> PairExitGuidance",
+      "returns": "PairExitGuidance",
+      "availability": "UNKNOWN guidance when quotes missing (legs still listed)",
+      "timeout_ms": 5000,
+      "reason_codes": ["UNKNOWN_QUOTE", "DUST_UNEXECUTABLE", "POSSIBLE_LIQUIDATION_UNCONFIRMED"],
+      "source_refs": ["plan", "positions", "market_context"],
+      "default_enabled": false
+    },
+    {
+      "key": "project_opportunity",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/projection.py",
+      "producer_function": "project_opportunity",
+      "signature": "project_opportunity(snapshot: Mapping, as_of_ms: int) -> Mapping",
+      "returns": "risk_json.projection_v2 (snake_case Mapping)",
+      "availability": "LEGACY/NOT_READY when v2 missing",
+      "timeout_ms": 5000,
+      "reason_codes": ["LEGACY_NO_V2", "STALE_EXPIRED"],
+      "source_refs": ["sl_funding_capture_snapshot"],
+      "default_enabled": false
+    },
+    {
+      "key": "capture_strategy_entries",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/evidence/capture.py",
+      "producer_function": "capture_strategy_entries",
+      "signature": "async capture_strategy_entries(context: CaptureContext, repository: RepositoryPort, market: MarketPort, request_context: RequestContext) -> CaptureResult",
+      "returns": "CaptureResult",
+      "availability": "async; budget DEFERRED retained, never scaled fabrication",
+      "timeout_ms": 8000,
+      "reason_codes": ["BUDGET_DEFERRED", "UNAVAILABLE_NO_QUOTE", "GROUP_SKEW_EXCEEDED"],
+      "source_refs": ["strategy_entry", "quote_task"],
+      "default_enabled": false
+    },
+    {
+      "key": "collect_due_quotes",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/evidence/capture.py",
+      "producer_function": "collect_due_quotes",
+      "signature": "async collect_due_quotes(repository: RepositoryPort, market: MarketPort, as_of_ms: int, request_context: RequestContext) -> QuoteCollectionResult",
+      "returns": "QuoteCollectionResult",
+      "availability": "async; claimed=complete+deferred+unavailable",
+      "timeout_ms": 8000,
+      "reason_codes": ["BUDGET_DEFERRED", "TASK_DEADLINE_EXCEEDED"],
+      "source_refs": ["sl_strategy_quote_task"],
+      "default_enabled": false
+    },
+    {
+      "key": "simulate_hedge",
+      "producer_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/simulator.py",
+      "producer_function": "simulate_hedge",
+      "signature": "simulate_hedge(request: HedgeSimulationRequest, *, futures_mark: Any, spot_quote: SpotVenueQuote | Mapping, futures_rules=None, spot_rules=None, funding=None, identity=None, policy=None, now_ms: int, futures_quote: FuturesExecutionQuote | None = None, ports: RepairPorts | None = None) -> HedgeSimulationResult",
+      "returns": "HedgeSimulationResult",
+      "availability": "Old research calc without ports grants no new READY",
+      "timeout_ms": 5000,
+      "reason_codes": ["UNKNOWN_QUOTE", "UNKNOWN_PROTECTION", "STALE_MARK"],
+      "source_refs": ["futures_mark", "spot_quote", "funding_context"],
+      "default_enabled": false
+    }
+  ],
+  "repository_port": {
+    "protocol_file": "desktop/backend/src/diveintocrypto_desktop/shortlab/repair_ports.py",
+    "protocol": "RepositoryPort",
+    "methods": ["save_market_observation", "get_market_observation", "list_market_observations", "list_funding_observations", "save_funding_schedule", "list_funding_schedules", "save_fx_observation", "get_fx_at", "save_hedge_decision", "get_hedge_decision", "save_protection_confirmation", "get_protection_confirmation", "reserve_provider_request", "finish_provider_request", "list_current_funding_opportunities", "save_strategy_entry", "list_strategy_entries", "save_strategy_quote_task", "claim_due_quote_tasks", "finish_quote_task"],
+    "method_count": 20,
+    "note": "Includes 2 month-budget methods (reserve/finish_provider_request). All async; reuse public Repository reads, never private _run."
+  },
+  "market_port": {
+    "protocol": "MarketPort",
+    "methods": ["collect_futures(symbol,contract_qty,request_context)", "collect_spot(identity,venue,canonical_qty,request_context)", "collect_funding(symbol,as_of_ms,request_context)"],
+    "note": "Unavailable data returns Observed/UNKNOWN with reasons; budget refusal may raise BudgetExhausted."
+  },
+  "ui_contract": {
+    "note": "R12/R13a consumers bind fixed HTTP contracts offline; production builds forbid test aliases (D19.6). Component props/callback schemas ship with R00 fixtures under desktop/backend/tests/fixtures/repair/ports/ (binding_kind=TEST_FAKE)."
+  }
+}

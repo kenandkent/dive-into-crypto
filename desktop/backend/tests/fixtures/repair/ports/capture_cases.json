@@ -1,0 +1,12 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE strategy capture entries.",
+  "cases": [
+    {
+      "source_snapshot_id": "dec-MEME_FULL_VALID",
+      "strategies": ["ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25", "UNHEDGED_0", "SYSTEM_POLICY"],
+      "entry_ids": ["entry-ABSOLUTE_100", "entry-RELATIVE_75", "entry-RELATIVE_50", "entry-RELATIVE_25", "entry-UNHEDGED_0", "entry-SYSTEM_POLICY"],
+      "status": "COMPLETE"
+    }
+  ]
+}

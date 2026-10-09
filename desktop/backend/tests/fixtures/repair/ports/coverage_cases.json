@@ -1,0 +1,39 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE schedule coverage windows (D19.6).",
+  "cases": [
+    {
+      "case_id": "MEME_FULL_VALID_90D",
+      "window_start_ms": 1789000000000,
+      "window_end_ms": 1791417600000,
+      "expected_count": 270,
+      "received_count": 270,
+      "coverage_fraction": "1",
+      "schedule_coverage_fraction": "1",
+      "missing_slots": [],
+      "reasons": []
+    },
+    {
+      "case_id": "MISSING_HEAD_TAIL",
+      "window_start_ms": 1789000000000,
+      "window_end_ms": 1791417600000,
+      "expected_count": 270,
+      "received_count": 268,
+      "coverage_fraction": "0.99259259",
+      "schedule_coverage_fraction": "1",
+      "missing_slots": [1789000000000, 1791417600000],
+      "reasons": ["COVERAGE_GAP"]
+    },
+    {
+      "case_id": "UNKNOWN_SCHEDULE",
+      "window_start_ms": 1789000000000,
+      "window_end_ms": 1791417600000,
+      "expected_count": null,
+      "received_count": 0,
+      "coverage_fraction": null,
+      "schedule_coverage_fraction": "0",
+      "missing_slots": [],
+      "reasons": ["FUNDING_SCHEDULE_UNKNOWN"]
+    }
+  ]
+}

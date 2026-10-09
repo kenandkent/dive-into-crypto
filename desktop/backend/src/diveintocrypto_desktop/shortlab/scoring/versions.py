@@ -18,3 +18,11 @@ FEATURE_VERSION = "features-v2"
 SCORE_VERSION_LITE = "ltss-lite-v1"
 SCORE_VERSION_FULL = "ltss-full-v1"
 ENTRY_VERSION = "entry-v2"
+
+#: R00 repair freeze (D15): new buckets. Old values above stay frozen for
+#: legacy decode; new code references the V3 constants below.
+FEATURE_VERSION_V3 = "features-v3"
+ENTRY_VERSION_V3 = "entry-v3"
+#: Current repair versions (alias to the newest bucket, old names untouched).
+FEATURE_VERSION_CURRENT = FEATURE_VERSION_V3
+ENTRY_VERSION_CURRENT = ENTRY_VERSION_V3

@@ -1,0 +1,59 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE ratio proposals for MEME_FULL_VALID (h1 legal, net Carry positive, UP_100 below liquidation).",
+  "case_id": "MEME_FULL_VALID",
+  "symbol": "1000PEPEUSDT",
+  "actual_notional_usd": "10000",
+  "ratios": [
+    {
+      "target_ratio": "0",
+      "actual_ratio": "0",
+      "futures_contract_qty": "100",
+      "canonical_futures_qty": "100000",
+      "spot_net_qty": "0",
+      "spot_venue": null,
+      "net_carry_usd": null,
+      "up100_status": "VALID"
+    },
+    {
+      "target_ratio": "0.25",
+      "actual_ratio": "0.25",
+      "futures_contract_qty": "100",
+      "canonical_futures_qty": "100000",
+      "spot_net_qty": "25000",
+      "spot_venue": "BINANCE_SPOT",
+      "net_carry_usd": "120.5",
+      "up100_status": "VALID"
+    },
+    {
+      "target_ratio": "0.5",
+      "actual_ratio": "0.5",
+      "futures_contract_qty": "100",
+      "canonical_futures_qty": "100000",
+      "spot_net_qty": "50000",
+      "spot_venue": "BINANCE_SPOT",
+      "net_carry_usd": "241.0",
+      "up100_status": "VALID"
+    },
+    {
+      "target_ratio": "0.75",
+      "actual_ratio": "0.75",
+      "futures_contract_qty": "100",
+      "canonical_futures_qty": "100000",
+      "spot_net_qty": "75000",
+      "spot_venue": "BINANCE_SPOT",
+      "net_carry_usd": "361.5",
+      "up100_status": "VALID"
+    },
+    {
+      "target_ratio": "1",
+      "actual_ratio": "1",
+      "futures_contract_qty": "100",
+      "canonical_futures_qty": "100000",
+      "spot_net_qty": "100000",
+      "spot_venue": "BINANCE_SPOT",
+      "net_carry_usd": "482.0",
+      "up100_status": "VALID"
+    }
+  ]
+}

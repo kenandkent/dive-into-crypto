@@ -1,0 +1,30 @@
+{
+  "description": "R00 repair manifest template (P02.3). Copy to desktop/backend/runtime/verification/repair/<task>/<source-sha>/manifest.json per task. runtime/ files never enter Git; PR pastes manifest summary + artifact SHA.",
+  "task_id": "R00",
+  "source_commit": "<40-hex HEAD at task completion>",
+  "baseline_sha": "<40-hex base the task started from>",
+  "merge_prerequisites": [],
+  "interface_dependencies": [],
+  "contract_sha": "<40-hex docs/contracts freeze or HEAD>",
+  "prerequisite_shas": [],
+  "design_sections": ["D03", "D13", "D15", "D18", "D19"],
+  "tests": [
+    {
+      "command": "TMPDIR=\"$PWD/runtime/repair_tmp\" UV_CACHE_DIR=\"$PWD/runtime/uv-cache\" .venv/bin/python -m pytest tests/test_shortlab_repair_contracts.py -q",
+      "workdir": "desktop/backend",
+      "exit_code": 0,
+      "passed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "log_path": "desktop/backend/runtime/verification/repair/R00/<sha>/test.log"
+    }
+  ],
+  "artifacts": [
+    {
+      "relative_path": "desktop/backend/tests/fixtures/repair/contract-fixtures.json",
+      "sha256": "<sha256>"
+    }
+  ],
+  "limitations": [],
+  "ci_run_url": null
+}

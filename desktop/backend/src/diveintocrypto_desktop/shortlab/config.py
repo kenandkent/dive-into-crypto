@@ -194,15 +194,36 @@ class FundingCaptureConfig:
 
     Strict keys only; ``score_rules`` keeps the frozen FCS bins verbatim
     (thresholds preserve int-vs-float for the F.1 golden hash).
+
+    R00 (D15): adds ``reference_hold_days`` (default 30); ``fcs_version``
+    accepts ``fcs_v1``/``fcs_v2`` with old ``fcs_v1`` normalized to the
+    current ``fcs_v2`` for new calculations (old JSON still decodes by bucket).
     """
 
     enabled: bool
     fcs_version: str
     reference_notional_usd: int | float
+    reference_hold_days: int
     entry_gate: Mapping[str, Any]
     exit: Mapping[str, Any]
     statistics: Mapping[str, Any]
     score_rules: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    """R00 repair freeze (D15): optimization subtree.
+
+    Strict keys only; unknown keys rejected. Decimal-looking ratios and
+    fractions stay as validated strings/numbers per D03 (no float ledger).
+    """
+
+    schema_version: str
+    funding_schedule: Mapping[str, Any]
+    decision: Mapping[str, Any]
+    protection: Mapping[str, Any]
+    evidence: Mapping[str, Any]
+    providers: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -251,6 +272,7 @@ class ShortLabConfig:
     maintenance: MaintenanceConfig
     funding_capture: FundingCaptureConfig
     hedge: HedgeConfig
+    optimization: OptimizationConfig
 
     def to_dict(self) -> dict[str, Any]:
         """Full config as plain dicts (still holds provider env var *names*)."""
@@ -363,6 +385,7 @@ class ShortLabConfig:
                 "enabled": self.funding_capture.enabled,
                 "fcs_version": self.funding_capture.fcs_version,
                 "reference_notional_usd": self.funding_capture.reference_notional_usd,
+                "reference_hold_days": self.funding_capture.reference_hold_days,
                 "entry_gate": dict(self.funding_capture.entry_gate),
                 "exit": dict(self.funding_capture.exit),
                 "statistics": dict(self.funding_capture.statistics),
@@ -370,6 +393,14 @@ class ShortLabConfig:
                     k: (dict(v) if isinstance(v, Mapping) else v)
                     for k, v in self.funding_capture.score_rules.items()
                 },
+            },
+            "optimization": {
+                "schema_version": self.optimization.schema_version,
+                "funding_schedule": _plain(self.optimization.funding_schedule),
+                "decision": _plain(self.optimization.decision),
+                "protection": _plain(self.optimization.protection),
+                "evidence": _plain(self.optimization.evidence),
+                "providers": _plain(self.optimization.providers),
             },
             "hedge": {
                 "enabled": self.hedge.enabled,
@@ -420,13 +451,41 @@ class ShortLabConfig:
 # ---------------------------------------------------------------------------
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """YAML loader that rejects duplicate keys (R00 D03.1)."""
+
+
+def _strict_construct_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if key in mapping:
+            raise ShortLabConfigError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=True)
+    return mapping
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_construct_mapping
+)
+
+
+def _yaml_load_strict(text: str) -> Any:
+    try:
+        return yaml.load(text, Loader=_StrictLoader)
+    except ShortLabConfigError:
+        raise
+    except yaml.YAMLError as exc:
+        raise ShortLabConfigError(f"invalid YAML: {exc}") from exc
+
+
 def _read_yaml(path: Path) -> Any:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ShortLabConfigError(f"cannot read Short-Lab config {path}: {exc}") from exc
     try:
-        return yaml.safe_load(text)
+        return _yaml_load_strict(text)
     except yaml.YAMLError as exc:
         raise ShortLabConfigError(f"invalid YAML in Short-Lab config {path}: {exc}") from exc
 
@@ -446,7 +505,7 @@ def _read_default_doc() -> Any:
             f"cannot read Short-Lab config {DEFAULT_CONFIG_PATH}: {exc}"
         ) from exc
     try:
-        return yaml.safe_load(text)
+        return _yaml_load_strict(text)
     except yaml.YAMLError as exc:
         raise ShortLabConfigError(
             f"invalid YAML in Short-Lab config {DEFAULT_CONFIG_PATH}: {exc}"
@@ -974,25 +1033,37 @@ def _as_bin_pairs(name: str, value: Any, *, threshold_kind: str) -> list[list[An
 
 
 def _build_funding_capture(value: Any) -> FundingCaptureConfig:
-    """Validate the B40 ``funding_capture`` subtree (H01, strict keys)."""
+    """Validate the B40 ``funding_capture`` subtree (H01, strict keys).
+
+    R00 (D15): accepts ``fcs_v1``/``fcs_v2``; old ``fcs_v1`` input is
+    normalized to the current ``fcs_v2`` for new calculations. Adds
+    ``reference_hold_days`` (1..365, default filled via deep-merge).
+    """
     _require_mapping("funding_capture", value)
     _check_no_unknown(
         "funding_capture", value,
-        {"enabled", "fcs_version", "reference_notional_usd", "entry_gate",
-         "exit", "statistics", "score_rules"},
+        {"enabled", "fcs_version", "reference_notional_usd", "reference_hold_days",
+         "entry_gate", "exit", "statistics", "score_rules"},
     )
     enabled = _as_bool("funding_capture.enabled", value.get("enabled"))
-    fcs_version = _as_str("funding_capture.fcs_version", value.get("fcs_version"))
-    if fcs_version != "fcs_v1":
+    fcs_version_raw = _as_str("funding_capture.fcs_version", value.get("fcs_version"))
+    if fcs_version_raw not in ("fcs_v1", "fcs_v2"):
         raise ShortLabConfigError(
-            f"funding_capture.fcs_version must be 'fcs_v1', got {fcs_version!r}"
+            "funding_capture.fcs_version must be 'fcs_v1' or 'fcs_v2', "
+            f"got {fcs_version_raw!r}"
         )
+    # Old user files stay loadable; current computation uses fcs_v2.
+    fcs_version = "fcs_v2"
     reference_notional = _as_number(
         "funding_capture.reference_notional_usd",
         value.get("reference_notional_usd"), lo=0,
     )
     if not reference_notional > 0:
         raise ShortLabConfigError("funding_capture.reference_notional_usd must be > 0")
+    reference_hold_days = _as_int(
+        "funding_capture.reference_hold_days",
+        value.get("reference_hold_days"), lo=1, hi=365,
+    )
     # -- entry_gate (8 keys) --
     gate = _require_mapping("funding_capture.entry_gate", value.get("entry_gate"))
     _check_no_unknown(
@@ -1250,10 +1321,314 @@ def _build_funding_capture(value: Any) -> FundingCaptureConfig:
         enabled=enabled,
         fcs_version=fcs_version,
         reference_notional_usd=reference_notional,
+        reference_hold_days=reference_hold_days,
         entry_gate=_MPT(entry_gate),
         exit=_MPT(exit_map),
         statistics=_MPT(statistics),
         score_rules=_MPT(score_rules),
+    )
+
+
+def _as_decimal_str(name: str, value: Any) -> str:
+    """Decimal string that stays fixed-point (no exponent, no float)."""
+    from decimal import Decimal, InvalidOperation
+
+    if not isinstance(value, str) or not value.strip():
+        raise ShortLabConfigError(f"{name} must be a decimal string, got {value!r}")
+    text = value.strip()
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, ValueError, ArithmeticError) as exc:
+        raise ShortLabConfigError(f"{name} is not a decimal string: {value!r}") from exc
+    if not parsed.is_finite():
+        raise ShortLabConfigError(f"{name} must be finite, got {value!r}")
+    if isinstance(value, bool):
+        raise ShortLabConfigError(f"{name} must be a decimal string, got {value!r}")
+    return text
+
+
+def _build_optimization(value: Any) -> OptimizationConfig:
+    """Validate the R00 ``optimization`` subtree (D15, strict keys).
+
+    Unknown keys, ratio out of range, illegal horizons/capital rejected.
+    """
+    from decimal import Decimal
+    from types import MappingProxyType as _MPT
+
+    _require_mapping("optimization", value)
+    _check_no_unknown(
+        "optimization", value,
+        {"schema_version", "funding_schedule", "decision", "protection",
+         "evidence", "providers"},
+    )
+    schema_version = _as_str("optimization.schema_version", value.get("schema_version"))
+    if schema_version != "repair-contract-v1":
+        raise ShortLabConfigError(
+            "optimization.schema_version must be 'repair-contract-v1', "
+            f"got {schema_version!r}"
+        )
+    # -- funding_schedule --
+    fs = _require_mapping("optimization.funding_schedule", value.get("funding_schedule"))
+    _check_no_unknown(
+        "optimization.funding_schedule", fs, {"event_match_tolerance_sec"}
+    )
+    funding_schedule = {
+        "event_match_tolerance_sec": _as_int(
+            "optimization.funding_schedule.event_match_tolerance_sec",
+            fs.get("event_match_tolerance_sec"), lo=1,
+        ),
+    }
+    # -- decision --
+    dec = _require_mapping("optimization.decision", value.get("decision"))
+    _check_no_unknown(
+        "optimization.decision", dec,
+        {"enabled", "version", "validation_level", "ratios", "ratio_tolerance",
+         "min_net_carry_usd", "quote_valid_sec", "exit_stress_bps",
+         "capital_reserve_fraction", "scenarios"},
+    )
+    enabled = _as_bool("optimization.decision.enabled", dec.get("enabled"))
+    version = _as_str("optimization.decision.version", dec.get("version"))
+    if version != "hedge-decision-v1":
+        raise ShortLabConfigError(
+            "optimization.decision.version must be 'hedge-decision-v1', "
+            f"got {version!r}"
+        )
+    validation_level = _as_str(
+        "optimization.decision.validation_level", dec.get("validation_level")
+    )
+    if validation_level != "RULE_BASED_UNVALIDATED":
+        raise ShortLabConfigError(
+            "optimization.decision.validation_level must be "
+            f"'RULE_BASED_UNVALIDATED', got {validation_level!r}"
+        )
+    raw_ratios = dec.get("ratios")
+    if isinstance(raw_ratios, str) or not isinstance(raw_ratios, (list, tuple)):
+        raise ShortLabConfigError("optimization.decision.ratios must be a list")
+    ratios: list[str] = []
+    for i, item in enumerate(raw_ratios):
+        text = _as_decimal_str(f"optimization.decision.ratios[{i}]", item)
+        try:
+            parsed = Decimal(text)
+        except Exception as exc:
+            raise ShortLabConfigError(
+                f"optimization.decision.ratios[{i}] is not decimal: {item!r}"
+            ) from exc
+        if not (Decimal("0") <= parsed <= Decimal("1")):
+            raise ShortLabConfigError(
+                f"optimization.decision.ratios[{i}] must be in 0..1, got {item!r}"
+            )
+        ratios.append(text)
+    if not ratios or "1" not in {str(Decimal(r).normalize()) if "e" not in str(Decimal(r)).lower() else r for r in ratios}:
+        # Require full-hedge ratio present (canonical '1' variants allowed).
+        normalized = set()
+        for r in ratios:
+            try:
+                d = Decimal(r)
+                # Canonical: strip trailing zeros for comparison.
+                s = format(d.normalize(), "f") if d != 0 else "0"
+                normalized.add(s)
+            except Exception:
+                pass
+        if "1" not in normalized:
+            raise ShortLabConfigError(
+                "optimization.decision.ratios must include '1' (full hedge)"
+            )
+    ratio_tolerance = _as_decimal_str(
+        "optimization.decision.ratio_tolerance", dec.get("ratio_tolerance")
+    )
+    try:
+        tol = Decimal(ratio_tolerance)
+    except Exception as exc:
+        raise ShortLabConfigError("optimization.decision.ratio_tolerance invalid") from exc
+    if not (Decimal("0") <= tol <= Decimal("1")):
+        raise ShortLabConfigError(
+            "optimization.decision.ratio_tolerance must be in 0..1"
+        )
+    min_net_carry = _as_decimal_str(
+        "optimization.decision.min_net_carry_usd", dec.get("min_net_carry_usd")
+    )
+    try:
+        if Decimal(min_net_carry) < 0:
+            raise ShortLabConfigError(
+                "optimization.decision.min_net_carry_usd must be >= 0"
+            )
+    except ShortLabConfigError:
+        raise
+    except Exception as exc:
+        raise ShortLabConfigError("optimization.decision.min_net_carry_usd invalid") from exc
+    quote_valid_sec = _as_int(
+        "optimization.decision.quote_valid_sec", dec.get("quote_valid_sec"), lo=1
+    )
+    exit_stress_bps = _as_int(
+        "optimization.decision.exit_stress_bps", dec.get("exit_stress_bps"), lo=0
+    )
+    capital_reserve = _as_decimal_str(
+        "optimization.decision.capital_reserve_fraction",
+        dec.get("capital_reserve_fraction"),
+    )
+    try:
+        cr = Decimal(capital_reserve)
+    except Exception as exc:
+        raise ShortLabConfigError(
+            "optimization.decision.capital_reserve_fraction invalid"
+        ) from exc
+    if not (Decimal("0") <= cr <= Decimal("1")):
+        raise ShortLabConfigError(
+            "optimization.decision.capital_reserve_fraction must be in 0..1"
+        )
+    scenarios_raw = _require_mapping(
+        "optimization.decision.scenarios", dec.get("scenarios")
+    )
+    expected_scenarios = {"UP_50", "UP_100", "DOWN_50", "BASIS_UP", "BASIS_DOWN", "FX_DOWN"}
+    if set(scenarios_raw) != expected_scenarios:
+        raise ShortLabConfigError(
+            "optimization.decision.scenarios must hold exactly "
+            f"{sorted(expected_scenarios)}, got {sorted(scenarios_raw)}"
+        )
+    scenarios: dict[str, Any] = {}
+    for name, leg in scenarios_raw.items():
+        block = _require_mapping(
+            f"optimization.decision.scenarios.{name}", leg
+        )
+        _check_no_unknown(
+            f"optimization.decision.scenarios.{name}", block,
+            {"futures_move", "spot_move", "fx_shock"},
+        )
+        scenarios[name] = {
+            "futures_move": _as_decimal_str(
+                f"optimization.decision.scenarios.{name}.futures_move",
+                block.get("futures_move"),
+            ),
+            "spot_move": _as_decimal_str(
+                f"optimization.decision.scenarios.{name}.spot_move",
+                block.get("spot_move"),
+            ),
+            "fx_shock": _as_decimal_str(
+                f"optimization.decision.scenarios.{name}.fx_shock",
+                block.get("fx_shock"),
+            ),
+        }
+    decision = {
+        "enabled": enabled,
+        "version": version,
+        "validation_level": validation_level,
+        "ratios": ratios,
+        "ratio_tolerance": ratio_tolerance,
+        "min_net_carry_usd": min_net_carry,
+        "quote_valid_sec": quote_valid_sec,
+        "exit_stress_bps": exit_stress_bps,
+        "capital_reserve_fraction": capital_reserve,
+        "scenarios": scenarios,
+    }
+    # -- protection --
+    prot = _require_mapping("optimization.protection", value.get("protection"))
+    _check_no_unknown("optimization.protection", prot, {"confirmation_ttl_sec"})
+    protection = {
+        "confirmation_ttl_sec": _as_int(
+            "optimization.protection.confirmation_ttl_sec",
+            prot.get("confirmation_ttl_sec"), lo=1,
+        ),
+    }
+    # -- evidence --
+    ev = _require_mapping("optimization.evidence", value.get("evidence"))
+    _check_no_unknown(
+        "optimization.evidence", ev,
+        {"version", "horizons_days", "quote_group_skew_sec", "exit_delay_sec",
+         "quote_task_batch", "retention_days", "bootstrap_samples",
+         "bootstrap_seed", "min_assets", "min_comparable_samples"},
+    )
+    ev_version = _as_str("optimization.evidence.version", ev.get("version"))
+    if ev_version != "hedge_evidence_v3":
+        raise ShortLabConfigError(
+            "optimization.evidence.version must be 'hedge_evidence_v3', "
+            f"got {ev_version!r}"
+        )
+    raw_horizons = ev.get("horizons_days")
+    if not isinstance(raw_horizons, (list, tuple)) or list(raw_horizons) != [7, 30, 90]:
+        raise ShortLabConfigError(
+            "optimization.evidence.horizons_days must be [7, 30, 90], "
+            f"got {raw_horizons!r}"
+        )
+    evidence = {
+        "version": ev_version,
+        "horizons_days": [7, 30, 90],
+        "quote_group_skew_sec": _as_int(
+            "optimization.evidence.quote_group_skew_sec",
+            ev.get("quote_group_skew_sec"), lo=1,
+        ),
+        "exit_delay_sec": _as_int(
+            "optimization.evidence.exit_delay_sec", ev.get("exit_delay_sec"), lo=0
+        ),
+        "quote_task_batch": _as_int(
+            "optimization.evidence.quote_task_batch",
+            ev.get("quote_task_batch"), lo=1,
+        ),
+        "retention_days": _as_int(
+            "optimization.evidence.retention_days", ev.get("retention_days"), lo=1
+        ),
+        "bootstrap_samples": _as_int(
+            "optimization.evidence.bootstrap_samples",
+            ev.get("bootstrap_samples"), lo=1,
+        ),
+        "bootstrap_seed": _as_int(
+            "optimization.evidence.bootstrap_seed", ev.get("bootstrap_seed")
+        ),
+        "min_assets": _as_int(
+            "optimization.evidence.min_assets", ev.get("min_assets"), lo=1
+        ),
+        "min_comparable_samples": _as_int(
+            "optimization.evidence.min_comparable_samples",
+            ev.get("min_comparable_samples"), lo=1,
+        ),
+    }
+    if evidence["bootstrap_seed"] != 20261008:
+        raise ShortLabConfigError(
+            "optimization.evidence.bootstrap_seed must be 20261008"
+        )
+    # -- providers.coingecko --
+    prov = _require_mapping("optimization.providers", value.get("providers"))
+    _check_no_unknown("optimization.providers", prov, {"coingecko"})
+    cg = _require_mapping("optimization.providers.coingecko", prov.get("coingecko"))
+    _check_no_unknown(
+        "optimization.providers.coingecko", cg,
+        {"account_monthly_limit", "local_requests_per_minute", "reserve_fraction"},
+    )
+    cg_limit = _as_int(
+        "optimization.providers.coingecko.account_monthly_limit",
+        cg.get("account_monthly_limit"), lo=1,
+    )
+    cg_rpm = _as_int(
+        "optimization.providers.coingecko.local_requests_per_minute",
+        cg.get("local_requests_per_minute"), lo=1,
+    )
+    cg_reserve = _as_decimal_str(
+        "optimization.providers.coingecko.reserve_fraction",
+        cg.get("reserve_fraction"),
+    )
+    try:
+        rf = Decimal(cg_reserve)
+    except Exception as exc:
+        raise ShortLabConfigError(
+            "optimization.providers.coingecko.reserve_fraction invalid"
+        ) from exc
+    if not (Decimal("0") <= rf < Decimal("1")):
+        raise ShortLabConfigError(
+            "optimization.providers.coingecko.reserve_fraction must be in 0..1 (exclusive 1)"
+        )
+    providers = {
+        "coingecko": {
+            "account_monthly_limit": cg_limit,
+            "local_requests_per_minute": cg_rpm,
+            "reserve_fraction": cg_reserve,
+        },
+    }
+    return OptimizationConfig(
+        schema_version=schema_version,
+        funding_schedule=_MPT(funding_schedule),
+        decision=_MPT({k: (_MPT(v) if isinstance(v, dict) else v) for k, v in decision.items()}),
+        protection=_MPT(protection),
+        evidence=_MPT(evidence),
+        providers=_MPT(providers),
     )
 
 
@@ -1568,6 +1943,7 @@ def _build_config(merged: Mapping[str, Any]) -> ShortLabConfig:
         "maintenance",
         "funding_capture",
         "hedge",
+        "optimization",
     )
     missing = [key for key in required if key not in merged]
     if missing:
@@ -1602,6 +1978,7 @@ def _build_config(merged: Mapping[str, Any]) -> ShortLabConfig:
         maintenance=_build_maintenance(merged["maintenance"]),
         funding_capture=_build_funding_capture(merged["funding_capture"]),
         hedge=_build_hedge(merged["hedge"]),
+        optimization=_build_optimization(merged["optimization"]),
     )
 
 
@@ -1907,3 +2284,126 @@ def hedge_policy_hash(config: ShortLabConfig) -> str:
     """SHA256 hex of the Hedge policy projection (B附录F.3 golden)."""
     return hashlib.sha256(
         hedge_policy_canonical_json(config).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# R00 decision policy hash (D15, repair freeze)
+# ---------------------------------------------------------------------------
+
+#: Version stamp for the R00 decision policy bundle (separate from POLICY_VERSION).
+DECISION_POLICY_VERSION = "decision-policy-v1"
+
+
+def _decision_policy_subtree(config: ShortLabConfig) -> dict[str, Any]:
+    """Execution-relevant decision bundle (excludes providers/refresh/paths).
+
+    Covers decision strategy + candidate direction thresholds + funding
+    entry_gate + hedge cost/quantity/liquidation capability + related repair
+    versions. Providers/refresh/paths/secrets/runtime budget never enter.
+    Version imports reference R00 current constants (never legacy H01 aliases
+    for new computation).
+    """
+    from diveintocrypto_desktop.shortlab.hedge import (
+        COST_FORMULA_VERSION_V2,
+        FCS_VERSION_V2,
+        HEDGE_EVIDENCE_VERSION_V3,
+        HEDGE_FORMULA_VERSION_V2,
+        PLAN_SAFETY_RULES_VERSION_V2,
+        VENUE_SELECTION_VERSION_V2,
+    )
+    from diveintocrypto_desktop.shortlab.scoring.versions import (
+        ENTRY_VERSION_V3,
+        FEATURE_VERSION_V3,
+    )
+
+    candidate = config.candidate
+    fc = config.funding_capture
+    hedge = config.hedge
+    opt = config.optimization
+    return {
+        "candidate": {
+            "candidate_ltss": candidate.candidate_ltss,
+            "entry_required_blocks": list(candidate.entry_required_blocks),
+            "ready_data_quality": candidate.ready_data_quality,
+            "ready_entry": candidate.ready_entry,
+            "ready_ltss": candidate.ready_ltss,
+            "ready_tradeability_score": candidate.ready_tradeability_score,
+            "watch_ltss": candidate.watch_ltss,
+        },
+        "decision": _plain(opt.decision),
+        "decision_policy_version": DECISION_POLICY_VERSION,
+        "funding_entry_gate": _plain(fc.entry_gate),
+        "funding_capture": {
+            "fcs_version": FCS_VERSION_V2,
+            "reference_hold_days": fc.reference_hold_days,
+            "reference_notional_usd": fc.reference_notional_usd,
+        },
+        "hedge": {
+            "basis": _plain(hedge.basis),
+            "costs": _plain(hedge.costs),
+            "execution": _plain(hedge.execution),
+            "fx": _plain(hedge.fx),
+            "liquidation": _plain(hedge.liquidation),
+            "liquidity_monitor": _plain(hedge.liquidity_monitor),
+            "quality": _plain(hedge.quality),
+            "ratio": _plain(hedge.ratio),
+        },
+        "optimization_evidence": _plain(opt.evidence),
+        "optimization_funding_schedule": _plain(opt.funding_schedule),
+        "optimization_protection": _plain(opt.protection),
+        "repair_schema_version": "repair-contract-v1",
+        "versions": {
+            "cost": COST_FORMULA_VERSION_V2,
+            "decision": "hedge-decision-v1",
+            "entry": ENTRY_VERSION_V3,
+            "evidence": HEDGE_EVIDENCE_VERSION_V3,
+            "fcs": FCS_VERSION_V2,
+            "features": FEATURE_VERSION_V3,
+            "hedge": HEDGE_FORMULA_VERSION_V2,
+            "safety": PLAN_SAFETY_RULES_VERSION_V2,
+            "venue": VENUE_SELECTION_VERSION_V2,
+        },
+    }
+
+
+def decision_policy_canonical_json(config: ShortLabConfig | Mapping[str, Any]) -> str:
+    """Canonical JSON feeding ``decision_policy_hash`` (no trailing newline)."""
+    cfg = _coerce_to_config(config)
+    return json.dumps(
+        _decision_policy_subtree(cfg),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def decision_policy_hash(config: ShortLabConfig | Mapping[str, Any]) -> str:
+    """SHA256 hex of the R00 decision policy bundle (UTF-8, no newline).
+
+    Accepts a built :class:`ShortLabConfig` or a raw mapping (normalized via
+    the standard merge+build path). Providers/refresh/paths/secrets never
+    enter the hash.
+    """
+    return hashlib.sha256(
+        decision_policy_canonical_json(config).encode("utf-8")
+    ).hexdigest()
+
+
+def _coerce_to_config(config: ShortLabConfig | Mapping[str, Any]) -> ShortLabConfig:
+    if isinstance(config, ShortLabConfig):
+        return config
+    if isinstance(config, Mapping):
+        defaults = _section(_read_default_doc(), where=str(DEFAULT_CONFIG_PATH))
+        # Allow both {shortlab: {...}} and bare {...} shapes.
+        if "shortlab" in config and isinstance(config["shortlab"], Mapping):
+            user_section = config["shortlab"]
+        else:
+            # Heuristic: if mapping looks like a full shortlab section (has
+            # 'candidate' etc.), treat it as the section; else treat as override.
+            user_section = config
+        merged = _deep_merge(dict(defaults), dict(user_section), "shortlab")
+        return _build_config(merged)
+    raise ShortLabConfigError(
+        f"decision_policy_hash requires ShortLabConfig or Mapping, got {type(config).__name__}"
+    )

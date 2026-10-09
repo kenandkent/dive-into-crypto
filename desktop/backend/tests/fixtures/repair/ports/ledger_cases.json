@@ -1,0 +1,23 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE ledger PnL for partial_close (futures/spot realized 40 each).",
+  "cases": [
+    {
+      "case_id": "partial_close",
+      "realized_futures_usd": "40",
+      "realized_spot_usd": "40",
+      "unrealized_futures_usd": "60",
+      "unrealized_spot_usd": "60",
+      "actual_funding_usd": "5",
+      "estimated_unconfirmed_funding_usd": null,
+      "known_cost_usd": "2",
+      "estimated_exit_cost_usd": "1",
+      "known_net_subtotal_usd": "83",
+      "net_before_exit_usd": "83",
+      "net_after_exit_usd": "82",
+      "unknown_components": [],
+      "coverage": {"priced_events": 4, "total_events": 4, "status": "COMPLETE"},
+      "funding_basis": "ACTUAL_RECEIPTS_ONLY"
+    }
+  ]
+}

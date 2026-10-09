@@ -1,0 +1,17 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE pair exit guidance.",
+  "cases": [
+    {
+      "case_id": "partial_close",
+      "plan_id": "plan-MEME_FULL_VALID",
+      "plan_version": 2,
+      "legs": [
+        {"leg_type": "FUTURES_SHORT", "venue": "BINANCE_SPOT", "side": "BUY", "native_qty": "6", "reduce_only": true, "capability": "CONFIRMED"},
+        {"leg_type": "SPOT_LONG", "venue": "BINANCE_SPOT", "side": "SELL", "native_qty": "6", "reduce_only": false, "capability": "CONFIRMED"}
+      ],
+      "unexecutable_dust": {},
+      "confirmation_required": true
+    }
+  ]
+}

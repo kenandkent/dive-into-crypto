@@ -1,0 +1,14 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE due quote collection.",
+  "cases": [
+    {
+      "case_id": "due-now",
+      "claimed": 2,
+      "complete": 2,
+      "deferred": 0,
+      "unavailable": 0,
+      "task_ids": ["task-1", "task-2"]
+    }
+  ]
+}

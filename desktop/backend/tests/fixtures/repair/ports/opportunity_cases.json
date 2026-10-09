@@ -1,0 +1,24 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE opportunity projections (snake_case internal).",
+  "cases": [
+    {
+      "snapshot_id": "fcs-MEME_FULL_VALID",
+      "symbol": "1000PEPEUSDT",
+      "canonical_id": "pepe",
+      "as_of_ms": 1791417600000,
+      "expires_at_ms": 1791419400000,
+      "stale": false,
+      "fcs": 82.5,
+      "fcs_config_hash": "placeholder-computed-in-fixture-helper",
+      "funding_7d": "0.004",
+      "funding_30d": "0.018",
+      "positive_ratio_30d": "0.85",
+      "history_class": "FULL_90D",
+      "best_venue": "BINANCE_SPOT",
+      "break_even_days": "12.5",
+      "conservative_apr": "0.25",
+      "readiness": "READY"
+    }
+  ]
+}

@@ -27,11 +27,20 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 from diveintocrypto_desktop.shortlab.hedge import (
     COST_FORMULA_VERSION,
+    COST_FORMULA_VERSION_V2,
     FCS_VERSION,
+    FCS_VERSION_V2,
+    FCS_VERSIONS_LEGACY,
     HEDGE_EVIDENCE_VERSION,
+    HEDGE_EVIDENCE_VERSION_V3,
+    HEDGE_EVIDENCE_VERSIONS_ALL,
     HEDGE_FORMULA_VERSION,
+    HEDGE_FORMULA_VERSION_V2,
+    HEDGE_FORMULA_VERSIONS_ALL,
     PLAN_SAFETY_RULES_VERSION,
+    PLAN_SAFETY_RULES_VERSION_V2,
     VENUE_SELECTION_VERSION,
+    VENUE_SELECTION_VERSION_V2,
 )
 
 __all__ = [
@@ -41,6 +50,17 @@ __all__ = [
     "COST_FORMULA_VERSION",
     "PLAN_SAFETY_RULES_VERSION",
     "VENUE_SELECTION_VERSION",
+    "FCS_VERSION_V2",
+    "HEDGE_FORMULA_VERSION_V2",
+    "HEDGE_EVIDENCE_VERSION_V3",
+    "COST_FORMULA_VERSION_V2",
+    "PLAN_SAFETY_RULES_VERSION_V2",
+    "VENUE_SELECTION_VERSION_V2",
+    "FCS_VERSIONS_LEGACY",
+    "HEDGE_FORMULA_VERSIONS_ALL",
+    "HEDGE_EVIDENCE_VERSIONS_ALL",
+    "ALLOWED_GOALS",
+    "ALLOWED_PRICE_BASIS",
     "HEDGE_EVENT_SCHEMA_VERSION",
     "HEDGE_SOURCE_SCHEMA_VERSION",
     "ALLOWED_VENUES",
@@ -95,8 +115,19 @@ ALLOWED_VENUES = frozenset({"BINANCE_SPOT", "BINANCE_ALPHA", "ONCHAIN_DEX"})
 ALLOWED_EXIT_FEASIBILITY = frozenset({"CONFIRMED", "PARTIAL", "UNKNOWN", "NO"})
 ALLOWED_IDENTITY_CONFIDENCE = frozenset({"VERIFIED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"})
 ALLOWED_MODES = frozenset({"ABSOLUTE", "RELATIVE"})
+ALLOWED_GOALS = frozenset({"CARRY_CAPTURE", "DIRECTIONAL_SHORT", "BALANCED"})
+ALLOWED_PRICE_BASIS = frozenset({"TRADE", "MARK"})
 ALLOWED_PLAN_STATUS = frozenset(
-    {"DRAFT", "READY", "PARTIALLY_FILLED", "ACTIVE", "CLOSING", "CLOSED", "INVALID"}
+    {
+        "DRAFT",
+        "READY",
+        "PARTIALLY_FILLED",
+        "FUNDED_PENDING_ACTIVATION",
+        "ACTIVE",
+        "CLOSING",
+        "CLOSED",
+        "INVALID",
+    }
 )
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -116,7 +147,20 @@ ALLOWED_ALERT_STATE = frozenset({"OPEN", "ACKNOWLEDGED", "RESOLVED"})
 ALLOWED_READINESS = frozenset({"READY", "NOT_READY", "BLOCKED"})
 ALLOWED_RISK_VALIDATION = frozenset({"VERIFIED", "LIMITED", "UNKNOWN"})
 ALLOWED_OUTCOME_STATUS = frozenset({"PENDING", "COMPLETE", "CENSORED", "UNAVAILABLE"})
-ALLOWED_STRATEGIES = frozenset({"ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25"})
+# R00 (D14.1): extended strategy enum, old four stay valid for legacy decode.
+ALLOWED_STRATEGIES = frozenset(
+    {
+        "UNHEDGED_0",
+        "ABSOLUTE_100",
+        "RELATIVE_75",
+        "RELATIVE_50",
+        "RELATIVE_25",
+        "SYSTEM_POLICY",
+    }
+)
+ALLOWED_STRATEGIES_LEGACY = frozenset(
+    {"ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25"}
+)
 ALLOWED_HORIZON_DAYS = frozenset({7, 30, 90})
 ALLOWED_SNAPSHOT_REF_TYPES = frozenset(
     {
@@ -130,6 +174,11 @@ ALLOWED_SNAPSHOT_REF_TYPES = frozenset(
         "VENUE_MAPPING",
         "CONTRACT_RULES",
         "FUNDING_OBSERVATION",
+        "DECISION",
+        "STRATEGY_ENTRY",
+        "MARKET_OBSERVATION",
+        "FX",
+        "PROTECTION",
     }
 )
 
@@ -267,11 +316,15 @@ class SpotVenueQuote:
     identity_confidence: str = "UNRESOLVED"
     status: str = "UNAVAILABLE"
     reason_code: str | None = None
+    # R00 (D06.2): explicit fee-inclusion flag; old JSON缺字段解析为None(LEGACY).
+    fees_included: bool | None = None
 
     def __post_init__(self) -> None:
         _check_enum("venue", self.venue, ALLOWED_VENUES)
         _check_enum("exit_feasibility", self.exit_feasibility, ALLOWED_EXIT_FEASIBILITY)
         _check_enum("identity_confidence", self.identity_confidence, ALLOWED_IDENTITY_CONFIDENCE)
+        if self.fees_included is not None and not isinstance(self.fees_included, bool):
+            raise ValueError("fees_included must be bool or None")
         object.__setattr__(self, "reference_notional_usd",
                             require_decimal_str("reference_notional_usd", self.reference_notional_usd))
         object.__setattr__(self, "mid_price",
@@ -328,9 +381,21 @@ class TradingRulesSnapshot:
     price_rules: Mapping[str, Any] = field(default_factory=dict)
     lot_rules: Mapping[str, Any] = field(default_factory=dict)
     notional_rules: Mapping[str, Any] = field(default_factory=dict)
+    # R00 (D15): explicit stop-order capability; old JSON缺字段为None(LEGACY).
+    stop_orders_supported: bool | None = None
+    conditional_orders_source_ref: str | None = None
 
     def __post_init__(self) -> None:
         _check_enum("venue", self.venue, ALLOWED_VENUES)
+        if self.stop_orders_supported is not None and not isinstance(
+            self.stop_orders_supported, bool
+        ):
+            raise ValueError("stop_orders_supported must be bool or None")
+        if self.conditional_orders_source_ref is not None and (
+            not isinstance(self.conditional_orders_source_ref, str)
+            or not self.conditional_orders_source_ref
+        ):
+            raise ValueError("conditional_orders_source_ref must be non-empty str or None")
         if not self.instrument_id or not isinstance(self.instrument_id, str):
             raise ValueError("instrument_id must be a non-empty str")
         if not self.rule_version or not isinstance(self.rule_version, str):
@@ -396,8 +461,12 @@ class OnchainQuote:
     fetched_at_ms: int = 0
     status: str = "UNAVAILABLE"
     reason_code: str | None = None
+    # R00 (D06.2): explicit fee-inclusion flag; old JSON缺字段为None(LEGACY).
+    fees_included: bool | None = None
 
     def __post_init__(self) -> None:
+        if self.fees_included is not None and not isinstance(self.fees_included, bool):
+            raise ValueError("fees_included must be bool or None")
         if self.venue != "ONCHAIN_DEX":
             raise ValueError("OnchainQuote.venue must be ONCHAIN_DEX")
         if self.quote_kind != "INDICATIVE":
@@ -470,9 +539,20 @@ class HedgeSimulationRequest:
     maximum_pair_loss_usd: str | None = None
     planned_hold_days: int | None = None
     fee_overrides: Mapping[str, Any] | None = None
+    # R00 (D15/D03.3): optional goal + decision link; old JSON缺字段为None(LEGACY).
+    goal: str | None = None
+    decision_id: str | None = None
 
     def __post_init__(self) -> None:
         _check_enum("mode", self.mode, ALLOWED_MODES)
+        if self.goal is not None:
+            _check_enum("goal", self.goal, ALLOWED_GOALS)
+            if self.mode == "ABSOLUTE" and self.goal != "CARRY_CAPTURE":
+                raise ValueError("ABSOLUTE mode only supports goal=CARRY_CAPTURE")
+        if self.decision_id is not None and (
+            not isinstance(self.decision_id, str) or not self.decision_id
+        ):
+            raise ValueError("decision_id must be a non-empty str or None")
         object.__setattr__(self, "futures_notional_usd",
                             require_decimal_str("futures_notional_usd", self.futures_notional_usd))
         if Decimal(self.futures_notional_usd) <= 0:
@@ -552,11 +632,22 @@ class HedgeSimulationResult:
     risks: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     readiness: str = "NOT_READY"
+    # R00 (D15): nested readiness + economics; old JSON缺字段为None/{} (LEGACY).
+    readiness_breakdown: Mapping[str, Any] | None = None
+    economics: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _check_enum("mode", self.mode, ALLOWED_MODES)
         _check_enum("readiness", self.readiness, ALLOWED_READINESS)
         _check_enum("risk_validation", self.risk_validation, ALLOWED_RISK_VALIDATION)
+        if self.readiness_breakdown is not None:
+            object.__setattr__(
+                self,
+                "readiness_breakdown",
+                _coerce_dict("readiness_breakdown", self.readiness_breakdown),
+            )
+        if self.economics is not None:
+            object.__setattr__(self, "economics", _coerce_dict("economics", self.economics))
         for name in ("futures_price", "canonical_futures_price_usd", "futures_notional_usd",
                      "futures_contract_qty", "canonical_futures_qty", "target_hedge_ratio"):
             require_decimal_str(name, getattr(self, name))
@@ -863,8 +954,10 @@ class FCSResult:
 
     def __post_init__(self) -> None:
         _check_enum("readiness", self.readiness, ALLOWED_READINESS)
-        if self.fcs_version != FCS_VERSION:
-            raise ValueError(f"fcs_version must be {FCS_VERSION!r}")
+        if self.fcs_version not in FCS_VERSIONS_LEGACY:
+            raise ValueError(
+                f"fcs_version must be one of {sorted(FCS_VERSIONS_LEGACY)}, got {self.fcs_version!r}"
+            )
         require_decimal_str("reference_notional_usd", self.reference_notional_usd)
         object.__setattr__(self, "module_scores", _coerce_dict("module_scores", self.module_scores))
         object.__setattr__(self, "funding_metrics", _coerce_dict("funding_metrics", self.funding_metrics))
@@ -973,8 +1066,11 @@ class HedgeOutcome:
         if self.horizon_days not in ALLOWED_HORIZON_DAYS:
             raise ValueError("horizon_days must be 7, 30 or 90")
         _check_enum("outcome_status", self.outcome_status, ALLOWED_OUTCOME_STATUS)
-        if self.evidence_version != HEDGE_EVIDENCE_VERSION:
-            raise ValueError(f"evidence_version must be {HEDGE_EVIDENCE_VERSION!r}")
+        if self.evidence_version not in HEDGE_EVIDENCE_VERSIONS_ALL:
+            raise ValueError(
+                f"evidence_version must be one of {sorted(HEDGE_EVIDENCE_VERSIONS_ALL)}, "
+                f"got {self.evidence_version!r}"
+            )
         object.__setattr__(self, "outcome_json", _coerce_dict("outcome_json", self.outcome_json))
 
 
@@ -996,6 +1092,11 @@ class HedgeEvidenceSummary:
 
     def __post_init__(self) -> None:
         _check_enum("strategy", self.strategy, ALLOWED_STRATEGIES)
+        if self.evidence_version not in HEDGE_EVIDENCE_VERSIONS_ALL:
+            raise ValueError(
+                f"evidence_version must be one of {sorted(HEDGE_EVIDENCE_VERSIONS_ALL)}, "
+                f"got {self.evidence_version!r}"
+            )
         if self.horizon_days not in ALLOWED_HORIZON_DAYS:
             raise ValueError("horizon_days must be 7, 30 or 90")
         for name in ("sample_count", "complete_count", "censored_count"):
@@ -1015,6 +1116,9 @@ class HedgeEvidenceSummary:
 class HistoricalPriceBar:
     """Frozen price bar (B39.1.1). OHLC are native decimal strings with the
     contemporaneous FX and source/known_at provenance.
+
+    R00 (D18.1): ``price_basis`` defaults to TRADE for legacy bars; MARK bars
+    carry explicit MARK provenance and only MARK bars feed liquidation paths.
     """
 
     symbol: str
@@ -1028,11 +1132,13 @@ class HistoricalPriceBar:
     fx_to_usd: str | None = None
     source: str = ""
     known_at_ms: int = 0
+    price_basis: str = "TRADE"
 
     def __post_init__(self) -> None:
         for name in ("native_open", "native_high", "native_low", "native_close"):
             require_decimal_str(name, getattr(self, name))
         require_optional_decimal_str("fx_to_usd", self.fx_to_usd)
+        _check_enum("price_basis", self.price_basis, ALLOWED_PRICE_BASIS)
         if self.close_ms <= self.open_ms:
             raise ValueError("close_ms must be > open_ms")
 
@@ -1097,6 +1203,9 @@ class HistoricalMarketProvider(Protocol):
         max_skew_ms: int = 5000,
     ) -> SpotVenueQuote | None: ...
     async def read_price_bars(
+        self, symbol: str, start_ms: int, end_ms: int, request_context: Any
+    ) -> tuple[HistoricalPriceBar, ...]: ...
+    async def read_mark_price_bars(
         self, symbol: str, start_ms: int, end_ms: int, request_context: Any
     ) -> tuple[HistoricalPriceBar, ...]: ...
     async def read_settled_funding(

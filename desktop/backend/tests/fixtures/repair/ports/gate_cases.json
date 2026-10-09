@@ -1,0 +1,34 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE funding gate matrix rows (D19.6).",
+  "cases": [
+    {
+      "case_id": "POSITIVE_PASS",
+      "status": "PASS",
+      "reasons": [],
+      "checked_at_ms": 1791417600000,
+      "input_refs": {"funding": "fcs-MEME_FULL_VALID"}
+    },
+    {
+      "case_id": "ZERO_FAIL",
+      "status": "FAIL",
+      "reasons": ["FUNDING_CURRENT_NON_POSITIVE"],
+      "checked_at_ms": 1791417600000,
+      "input_refs": {"funding": "fcs-zero"}
+    },
+    {
+      "case_id": "NEGATIVE_FAIL",
+      "status": "FAIL",
+      "reasons": ["FUNDING_CURRENT_NON_POSITIVE", "FUNDING_LAST_NON_POSITIVE"],
+      "checked_at_ms": 1791417600000,
+      "input_refs": {"funding": "fcs-negative"}
+    },
+    {
+      "case_id": "UNKNOWN_SCHEDULE",
+      "status": "UNKNOWN",
+      "reasons": ["FUNDING_SCHEDULE_UNKNOWN"],
+      "checked_at_ms": 1791417600000,
+      "input_refs": {"funding": "fcs-unknown"}
+    }
+  ]
+}

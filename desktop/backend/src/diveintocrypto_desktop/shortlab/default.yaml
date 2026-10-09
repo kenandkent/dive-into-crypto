@@ -83,12 +83,15 @@ shortlab:
     unlock:
       enabled: false
       api_key_env: DIVE_TOKENOMIST_API_KEY
+      api_plan: null
     social:
       enabled: false
       api_key_env: DIVE_LUNARCRUSH_API_KEY
+      api_plan: null
     catalyst:
       enabled: false
       api_key_env: null
+      api_plan: null
 
   identity:
     catalog_ttl_sec: 86400
@@ -122,8 +125,9 @@ shortlab:
 
   funding_capture:
     enabled: false
-    fcs_version: fcs_v1
+    fcs_version: fcs_v2
     reference_notional_usd: 10000
+    reference_hold_days: 30
     entry_gate:
       require_current_positive: true
       require_last_settled_positive: true
@@ -376,3 +380,42 @@ shortlab:
           source_time: 10
           time_alignment: 20
           heartbeat: 20
+  optimization:
+    schema_version: repair-contract-v1
+    funding_schedule:
+      event_match_tolerance_sec: 60
+    decision:
+      enabled: true
+      version: hedge-decision-v1
+      validation_level: RULE_BASED_UNVALIDATED
+      ratios: ['0', '0.25', '0.5', '0.75', '1']
+      ratio_tolerance: '0.02'
+      min_net_carry_usd: '0'
+      quote_valid_sec: 20
+      exit_stress_bps: 100
+      capital_reserve_fraction: '0.05'
+      scenarios:
+        UP_50: {futures_move: '0.50', spot_move: '0.50', fx_shock: '0'}
+        UP_100: {futures_move: '1', spot_move: '1', fx_shock: '0'}
+        DOWN_50: {futures_move: '-0.50', spot_move: '-0.50', fx_shock: '0'}
+        BASIS_UP: {futures_move: '0.20', spot_move: '0.10', fx_shock: '0'}
+        BASIS_DOWN: {futures_move: '-0.10', spot_move: '-0.20', fx_shock: '0'}
+        FX_DOWN: {futures_move: '0', spot_move: '0', fx_shock: '-0.03'}
+    protection:
+      confirmation_ttl_sec: 86400
+    evidence:
+      version: hedge_evidence_v3
+      horizons_days: [7, 30, 90]
+      quote_group_skew_sec: 5
+      exit_delay_sec: 300
+      quote_task_batch: 20
+      retention_days: 365
+      bootstrap_samples: 1000
+      bootstrap_seed: 20261008
+      min_assets: 30
+      min_comparable_samples: 100
+    providers:
+      coingecko:
+        account_monthly_limit: 10000
+        local_requests_per_minute: 30
+        reserve_fraction: '0.1'

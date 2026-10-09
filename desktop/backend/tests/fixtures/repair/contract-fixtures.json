@@ -1,0 +1,49 @@
+{
+  "description": "R00 contract fixtures manifest (repair TEST_FAKE + reused shortlab sources)",
+  "fixtures": [
+    {
+      "relative_path": "tests/fixtures/repair/ports/capture_cases.json",
+      "sha256": "7bb60c0e8f36cf58f010d12125e3a28411b8ad7232056d8c6d7aa59b5d7b9f15"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/coverage_cases.json",
+      "sha256": "75277ae754e8a10783ce71ac56fd167a54e18110e1af86bf6fd899e8bb198087"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/due_quote_cases.json",
+      "sha256": "b7adc40e72eece5406a9f328ad4e85af98e4c8be35f1cfa7221de5ea972d6ecf"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/exit_cases.json",
+      "sha256": "53d693a632e0c48e54ced10b8b36b17bd2d496a9b118eeea150d4f2d46cea459"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/gate_cases.json",
+      "sha256": "57af191c0901f46a55668f96d2af938d3baaa1873f3cd0c812c978170251a489"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/ledger_cases.json",
+      "sha256": "ddbb1c4844559559cd8af509d96324c96d5819cc4284ab7ca106fe88e67149e2"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/opportunity_cases.json",
+      "sha256": "fbdc9bfdd53ad180e704c414468cd98ada95f545a05f2281916a889fdca1563b"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/ratio_cases.json",
+      "sha256": "b2420f4c2684a169e89e0d82c7eebb08e7afd48f8b0cb1c9dbc5bd34ee5d3795"
+    },
+    {
+      "relative_path": "tests/fixtures/repair/ports/simulation_cases.json",
+      "sha256": "3679d3998edf2336f1fb991348a7a939c073c4dae01a4e6a4738e348ca43a59c"
+    },
+    {
+      "relative_path": "tests/fixtures/shortlab/funding_page.json",
+      "sha256": "3717702cdf313ef60b911d14d77457e58fbcf75a4e26b6116102b5f01365df45"
+    },
+    {
+      "relative_path": "tests/fixtures/shortlab/futures_1d_kline.json",
+      "sha256": "282c8d35bcfb3705590bbfff3160cb7454c766dd2f960fe33b6cb5e28aca0a2a"
+    }
+  ]
+}

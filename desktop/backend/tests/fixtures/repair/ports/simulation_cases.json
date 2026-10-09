@@ -1,0 +1,18 @@
+{
+  "binding_kind": "TEST_FAKE",
+  "description": "R00 TEST_FAKE hedge simulations.",
+  "cases": [
+    {
+      "case_id": "MEME_FULL_VALID",
+      "symbol": "1000PEPEUSDT",
+      "readiness": "READY",
+      "risk_validation": "VERIFIED"
+    },
+    {
+      "case_id": "UNKNOWN_CAPABILITY",
+      "symbol": "1000PEPEUSDT",
+      "readiness": "NOT_READY",
+      "risk_validation": "UNKNOWN"
+    }
+  ]
+}

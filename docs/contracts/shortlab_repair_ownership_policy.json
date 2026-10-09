@@ -1,0 +1,236 @@
+{
+  "version": 1,
+  "description": "R00 repair freeze: file ownership and stage order (D19.2/P04). Each entry lists exact path (or controlled glob for repair fixtures), ordered owner_sequence, prerequisite/stage_prerequisites handoffs. R00 is the gate for all later tasks; contract-only deps use interface_dependencies, merge deps use prerequisite_commits.",
+  "branch_pattern": "^codex/r(?:0[0-9]|1[0-6])(?:[ab])?-[a-z0-9][a-z0-9-]*$",
+  "tasks": ["R00", "R01", "R02a", "R02b", "R03", "R04", "R05", "R06a", "R06b", "R07", "R08a", "R08b", "R09", "R10a", "R10b", "R11a", "R11b", "R12", "R13a", "R13b", "R14a", "R14b", "R15a", "R15b", "R16"],
+  "paths": [
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/repair_contracts.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/repair_ports.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/config.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/default.yaml",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/models.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/hedge/__init__.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/scoring/versions.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/request_budget.py",
+      "owner_sequence": ["R00", "R11a"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "scripts/check_shortlab_owner.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/shortlab_repair_ownership_policy.json",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/shortlab_repair_manifest_template.json",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "docs/contracts/shortlab_repair_service_calls.json",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/repair_fixtures.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/fixtures/repair/*",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repair_contracts.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repair_config.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repair_owner.py",
+      "owner_sequence": ["R00"],
+      "prerequisite": [],
+      "stage_prerequisites": [],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/repository.py",
+      "owner_sequence": ["R01"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/maintenance.py",
+      "owner_sequence": ["R01"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/migrations/006_optimization_repair.sql",
+      "owner_sequence": ["R01"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repair_repository.py",
+      "owner_sequence": ["R01"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/tests/test_shortlab_repair_migration.py",
+      "owner_sequence": ["R01"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/service.py",
+      "owner_sequence": ["R10a", "R10b"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/shortlab/runtime.py",
+      "owner_sequence": ["R10a", "R10b"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/api/app.py",
+      "owner_sequence": ["R10a", "R10b"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/api/shortlab.py",
+      "owner_sequence": ["R10a", "R10b"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/src/diveintocrypto_desktop/api/shortlab_repair.py",
+      "owner_sequence": ["R10a", "R10b"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/backend/short-lab.spec",
+      "owner_sequence": ["R01", "R16"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/ui/package.json",
+      "owner_sequence": ["R15a", "R16"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/ui/package-lock.json",
+      "owner_sequence": ["R15a", "R16"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "owner_sequence": ["R16"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00", "R15a"],
+      "handoff_required": false
+    },
+    {
+      "path": "desktop/ui/src/app/i18n.js",
+      "owner_sequence": ["R13a"],
+      "prerequisite": [],
+      "stage_prerequisites": ["R00"],
+      "handoff_required": false
+    }
+  ],
+  "default": {
+    "action": "review",
+    "message": "Unknown path: no policy entry covers it. Add an owner entry or request human review; the check fails closed."
+  }
+}

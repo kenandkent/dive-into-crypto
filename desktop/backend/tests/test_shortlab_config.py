@@ -235,13 +235,14 @@ def test_default_yaml_top_level_keys_match_design_section_24():
         "veto",
         "refresh",
         "providers",
-        # F05 A10 base keys + H01 Hedge subtrees.
+        # F05 A10 base keys + H01 Hedge subtrees + R00 optimization subtree.
         "identity",
         "ingestion",
         "evidence",
         "maintenance",
         "funding_capture",
         "hedge",
+        "optimization",
     }
 
 
