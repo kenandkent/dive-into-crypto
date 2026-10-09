@@ -430,6 +430,7 @@ const HEDGE_FUNDING_QUERY_MAP = {
   minFunding30d: "min_funding_30d", min_funding_30d: "min_funding_30d",
   minPositiveRatio30d: "min_positive_ratio_30d", min_positive_ratio_30d: "min_positive_ratio_30d",
   venue: "venue", readiness: "readiness",
+  includeStale: "include_stale", include_stale: "include_stale",
   sort: "sort", order: "order", limit: "limit", offset: "offset",
 };
 

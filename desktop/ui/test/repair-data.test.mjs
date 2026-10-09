@@ -265,3 +265,23 @@ test("R12: 503 never populates globals and signals pass through", async () => {
     globalThis.fetch = realFetch;
   }
 });
+
+test("R12 follow-up: fundingOpportunities forwards include_stale (R13b funding-view)", async () => {
+  const DIVE = await loadRealData();
+  const urls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    return ok({ items: [], total: 0, asOf: null });
+  };
+  try {
+    await DIVE.fundingOpportunities({ includeStale: true });
+    assert.match(urls[0], /include_stale=true/);
+    await DIVE.fundingOpportunities({ include_stale: true });
+    assert.match(urls[1], /include_stale=true/);
+    await DIVE.fundingOpportunities({});
+    assert.doesNotMatch(urls[2], /include_stale/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
