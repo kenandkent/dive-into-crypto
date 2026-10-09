@@ -71,7 +71,7 @@ function HedgePlannerDefaults() {
   };
 }
 
-function HedgePlanner({ initial }) {
+function HedgePlanner({ initial, onViewPlan, onGotoMonitor }) {
   const [form, setForm] = React.useState(HedgePlannerDefaults());
   const [venues, setVenues] = React.useState(initial && initial.venues ? initial.venues : null);
   const [venuesErr, setVenuesErr] = React.useState(initial && initial.venuesError ? initial.venuesError : null);
@@ -80,12 +80,28 @@ function HedgePlanner({ initial }) {
   const [plan, setPlan] = React.useState(initial && initial.plan ? initial.plan : null);
   const [planErr, setPlanErr] = React.useState(initial && initial.planError ? initial.planError : null);
   const [busy, setBusy] = React.useState(false);
+  /* R13a: freeze the inputs that produced the current sim; any later edit
+     makes the old sim STALE (D12.1). Initial fixtures have no fingerprint. */
+  const [simInputs, setSimInputs] = React.useState(null);
   const seqRef = React.useRef(0);
   const abortRef = React.useRef(null);
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
   const expired = sim ? window.HEDGE_FORMAT.isExpired(sim) : false;
+  const fingerprintForm = (f) => {
+    const o = f || {};
+    return JSON.stringify([
+      String(o.symbol || "").toUpperCase(), o.mode,
+      String(o.futuresNotionalUsd || ""), String(o.hedgeRatio || ""),
+      String(o.stressUpPct || ""), String(o.maxDirectionalLossUsd || ""),
+      o.preferredSpotVenue, String(o.futuresLeverage || ""), o.marginMode,
+      String(o.marginUsd || ""), String(o.liquidationPrice || ""),
+      o.liquidationPriceSource, o.stopPolicy, String(o.stopTriggerPrice || ""),
+      String(o.plannedHoldDays || ""),
+    ]);
+  };
+  const isSimStale = !!(sim && simInputs && fingerprintForm(form) !== fingerprintForm(simInputs));
 
   const doVenues = () => {
     if (initial && (initial.venues || initial.venuesError)) return;
@@ -118,10 +134,12 @@ function HedgePlanner({ initial }) {
     const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     abortRef.current = ctrl;
     setBusy(true); setSimErr(null); setPlanErr(null);
+    const frozen = { ...form };
     window.DIVE.hedgeSimulate(built.body, ctrl ? { signal: ctrl.signal } : {})
       .then((res) => {
         if (seq !== seqRef.current) return;
         setSim(normalizeHedgeSimulation(res)); setBusy(false); setPlan(null);
+        setSimInputs(frozen);
       })
       .catch((e) => {
         if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
@@ -270,6 +288,13 @@ function HedgePlanner({ initial }) {
                 <span className="v">{sim.breakEven ? JSON.stringify(sim.breakEven).slice(0, 160) : (sim.break_even ? JSON.stringify(sim.break_even).slice(0, 160) : "—")}</span></div>
             </div></div>
 
+          {isSimStale && (
+            <div className="provline" data-testid="hedge-sim-stale" role="alert">
+              <span className="tag hot">STALE</span>
+              <span>{L("repair_decision_stale_inputs")}</span>
+              <button className="chip" onClick={doSimulate}>{L("hedge_resimulate_btn")}</button>
+            </div>
+          )}
           {expired && (
             <div className="provline" data-testid="hedge-sim-expired" role="alert">
               <span className="tag hot">EXPIRED</span>
@@ -333,7 +358,7 @@ function HedgePlanner({ initial }) {
           )}
 
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <button className="cta" disabled={busy || expired} title={expired ? L("hedge_expired_body") : ""} onClick={doCreatePlan}>{L("hedge_create_plan_btn")}</button>
+            <button className="cta" disabled={busy || expired || isSimStale} title={expired ? L("hedge_expired_body") : (isSimStale ? L("repair_decision_stale_inputs") : "")} onClick={doCreatePlan}>{L("hedge_create_plan_btn")}</button>
           </div>
           {planErr && (
             <div className="state src-down" role="alert" data-testid="hedge-plan-error">
@@ -346,7 +371,18 @@ function HedgePlanner({ initial }) {
           {plan && (
             <div className="panel" data-testid="hedge-plan-created">
               <div className="ph"><span className="tick">▸</span>{L("hedge_plan_created")}<span className="rt">{plan.planId || plan.plan_id || ""}</span></div>
-              <div className="pb"><div className="reason">DRAFT · {L("hedge_draft_limited_note")}</div></div>
+              <div className="pb"><div className="reason">DRAFT · {L("hedge_draft_limited_note")}</div>
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button className="chip" data-testid="planner-view-plan" onClick={() => {
+                    if (typeof onViewPlan === "function") { try { onViewPlan(plan); } catch (e) {} return; }
+                    try { location.hash = "#/shortlab/plans"; } catch (e) {}
+                  }}>{L("repair_decision_view_plan")}</button>
+                  <button className="chip" data-testid="planner-goto-monitor" onClick={() => {
+                    if (typeof onGotoMonitor === "function") { try { onGotoMonitor(plan); } catch (e) {} return; }
+                    try { location.hash = "#/shortlab/monitor"; } catch (e) {}
+                  }}>{L("repair_decision_goto_monitor")}</button>
+                </div>
+              </div>
             </div>
           )}
         </div>

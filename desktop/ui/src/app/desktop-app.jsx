@@ -150,13 +150,18 @@ function shortlabBypassesNoData(view){ return view==="shortlab"; }
    typeof so bundles without the H09 files (e.g. legacy Task-15 tests) still
    render candidates. */
 const SHORTLAB_SUB_TABS = ["candidates", "funding", "planner", "monitor", "alerts", "evidence"];
+/* R13a repair tabs (D07/D12.1, pure display): decision + plans live inside the
+   SHORT LAB product, no new top-level product. SHORTLAB_SUB_TABS stays frozen
+   for H09 compatibility; repair tabs are additive via SHORTLAB_ALL_TABS. */
+const SHORTLAB_REPAIR_TABS = ["decision", "plans"];
+const SHORTLAB_ALL_TABS = [...SHORTLAB_SUB_TABS, ...SHORTLAB_REPAIR_TABS];
 function shortlabTabFromHash(){
   try{
     const h = (typeof location !== "undefined" && location.hash ? location.hash : "").replace(/^#\/?/, "");
     const parts = h.split("/");
     if (parts[0] !== "shortlab") return "candidates";
     const t = parts[1];
-    return SHORTLAB_SUB_TABS.includes(t) ? t : "candidates";
+    return SHORTLAB_ALL_TABS.includes(t) ? t : "candidates";
   }catch(e){ return "candidates"; }
 }
 function ShortLabShell({ initialTab }){
@@ -182,6 +187,8 @@ function ShortLabShell({ initialTab }){
   else if (tab === "monitor") page = (typeof HedgeMonitor !== "undefined") ? <HedgeMonitor/> : <div className="reason">Monitor · H09 bundle missing</div>;
   else if (tab === "alerts") page = (typeof HedgeAlerts !== "undefined") ? <HedgeAlerts/> : <div className="reason">Alerts · H09 bundle missing</div>;
   else if (tab === "evidence") page = (typeof ShortLabEvidence !== "undefined") ? <ShortLabEvidence/> : <div className="reason">Evidence · bundle missing</div>;
+  else if (tab === "decision") page = (typeof DecisionPanel !== "undefined") ? <DecisionPanel/> : <div className="reason">Decision · R13a bundle missing</div>;
+  else if (tab === "plans") page = (typeof PlansView !== "undefined") ? <PlansView/> : <div className="reason">Plans · R13a bundle missing</div>;
   else page = (typeof ShortLabView !== "undefined") ? <ShortLabView/> : <div className="reason">Candidates · bundle missing</div>;
   return (
     <div data-testid="shortlab-shell">
@@ -192,6 +199,8 @@ function ShortLabShell({ initialTab }){
         {tabBtn("monitor", "hedge_tab_monitor", "MONITOR")}
         {tabBtn("alerts", "hedge_tab_alerts", "ALERTS")}
         {tabBtn("evidence", "sl_tab_evidence", "EVIDENCE")}
+        {tabBtn("decision", "repair_tab_decision", "DECISION")}
+        {tabBtn("plans", "repair_tab_plans", "PLANS")}
       </div>
       <div data-testid={`shortlab-page-${tab}`}>{page}</div>
     </div>
@@ -2510,6 +2519,8 @@ globalThis.DIVE_APP = { App, DemoBanner, DemoMark, DataSourceDown, StaleBanner, 
   ShortLabEvidence: (typeof ShortLabEvidence !== "undefined" ? ShortLabEvidence : undefined),
   /* H09 hedge views (design B32/B34): guarded so legacy bundles still load */
   ShortLabShell, shortlabTabFromHash, SHORTLAB_SUB_TABS,
+  SHORTLAB_REPAIR_TABS: (typeof SHORTLAB_REPAIR_TABS !== "undefined" ? SHORTLAB_REPAIR_TABS : ["decision", "plans"]),
+  SHORTLAB_ALL_TABS: (typeof SHORTLAB_ALL_TABS !== "undefined" ? SHORTLAB_ALL_TABS : undefined),
   FundingView: (typeof FundingView !== "undefined" ? FundingView : undefined),
   HedgePlanner: (typeof HedgePlanner !== "undefined" ? HedgePlanner : undefined),
   buildHedgeSimulationBody: typeof buildHedgeSimulationBody !== "undefined" ? buildHedgeSimulationBody : undefined,
@@ -2517,6 +2528,13 @@ globalThis.DIVE_APP = { App, DemoBanner, DemoMark, DataSourceDown, StaleBanner, 
   normalizeHedgePlanResponse: typeof normalizeHedgePlanResponse !== "undefined" ? normalizeHedgePlanResponse : undefined,
   HedgeMonitor: (typeof HedgeMonitor !== "undefined" ? HedgeMonitor : undefined),
   HedgeAlerts: (typeof HedgeAlerts !== "undefined" ? HedgeAlerts : undefined),
+  /* R13a repair views (D07/D12.1, pure display): guarded so H09-only bundles still load */
+  DecisionPanel: (typeof DecisionPanel !== "undefined" ? DecisionPanel : undefined),
+  PlansView: (typeof PlansView !== "undefined" ? PlansView : undefined),
+  canSavePairedPlan: (typeof canSavePairedPlan !== "undefined" ? canSavePairedPlan : undefined),
+  isDecisionExpired: (typeof isDecisionExpired !== "undefined" ? isDecisionExpired : undefined),
+  isDecisionStaleForInputs: (typeof isDecisionStaleForInputs !== "undefined" ? isDecisionStaleForInputs : undefined),
+  getDecisionActualRatio: (typeof getDecisionActualRatio !== "undefined" ? getDecisionActualRatio : undefined),
   /* v0.3 surfaces + route map (hash-route registration is pinned by tests) */
   Panel, Compare, MapView, Portfolio, StructureView, PulseStrip, FngChip, DvolChip,
   CommandPalette, HitLabel, ReliabilityDiagram, ReplayPanel, TfMatrix, OpposingEvidence,

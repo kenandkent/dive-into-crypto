@@ -25,7 +25,7 @@ function HedgeFundingDefaults() {
   };
 }
 
-function FundingView({ filters, initial }) {
+function FundingView({ filters, initial, onAnalyze }) {
   const [local, setLocal] = React.useState(HedgeFundingDefaults());
   const [body, setBody] = React.useState(initial && initial.data ? initial.data : null);
   const [err, setErr] = React.useState(initial && initial.error ? initial.error : null);
@@ -56,6 +56,10 @@ function FundingView({ filters, initial }) {
     if (f.venue) q.venue = f.venue;
     if (f.readiness) q.readiness = f.readiness;
     if (f.sort) { q.sort = f.sort; q.order = f.order || "desc"; }
+    /* R13a D12.1: research list explicitly includes stale rows. R13b wires the
+       real HTTP param; here the intent is frozen for the adapter contract. */
+    q.includeStale = true;
+    q.include_stale = true;
     return { query: q };
   };
 
@@ -90,6 +94,15 @@ function FundingView({ filters, initial }) {
   React.useEffect(() => () => { if (abortRef.current) { try { abortRef.current.abort(); } catch (e) {} } }, []);
 
   const setF = (k, v) => setLocal((f) => ({ ...f, [k]: v }));
+
+  /* R13a D12.1: analyze carries symbol + snapshotId into Planner. Pure
+     callback; fallback sets the planner hash so no HTTP happens here. */
+  const handleAnalyze = (it) => {
+    const sym = (it && (it.symbol || it.Symbol)) || "";
+    const snap = (it && (it.snapshotId != null ? it.snapshotId : it.snapshot_id)) || (it && (it.fcsSnapshotId || it.fcs_snapshot_id)) || "";
+    if (typeof onAnalyze === "function") { try { onAnalyze({ symbol: sym, snapshotId: snap, item: it }); } catch (e) {} return; }
+    try { location.hash = "#/shortlab/planner/" + encodeURIComponent(sym) + "/" + encodeURIComponent(snap); } catch (e) {}
+  };
 
   if (loading) {
     return <div className="state" style={{ height: 160 }} data-testid="funding-loading">
@@ -173,9 +186,13 @@ function FundingView({ filters, initial }) {
                   const be = it.breakEvenDays != null ? it.breakEvenDays : it.break_even_days;
                   const readiness = it.readiness || "—";
                   const reasons = Array.isArray(it.reasons) ? it.reasons : [];
+                  const isStale = it.stale === true || it.STALE === true;
+                  const snapId = it.snapshotId != null ? it.snapshotId : it.snapshot_id;
                   return (
                     <tr key={sym + "|" + String(fcs)} data-testid={`funding-row-${sym}`}>
-                      <td><div className="sym">{sym}<small>{it.canonicalId || it.canonical_id || ""}</small></div></td>
+                      <td><div className="sym">{sym}<small>{it.canonicalId || it.canonical_id || ""}</small></div>
+                        {snapId != null && snapId !== "" && <div className="sl-reasons">{String(snapId)}</div>}
+                      </td>
                       <td className="r score">{slFmtScore(fcs)}</td>
                       <td className="r">{slFmtFundingDecimal(f7)}</td>
                       <td className="r">{slFmtFundingDecimal(f30)}</td>
@@ -188,7 +205,14 @@ function FundingView({ filters, initial }) {
                         <span className={"pill " + (readiness === "READY" ? "b" : readiness === "BLOCKED" ? "s" : "n")}>
                           <span className="g" />{readiness}
                         </span>
+                        {isStale && <span className="tag hot" data-testid={`funding-stale-${sym}`}>STALE</span>}
+                        {isStale && <div className="sl-reasons">{L("repair_funding_stale_reason")}</div>}
                         {reasons.length > 0 && <div className="sl-reasons">{reasons.join(" · ")}</div>}
+                        <div style={{ marginTop: 4 }}>
+                          <button className="chip" data-testid={`funding-analyze-${sym}`} onClick={() => handleAnalyze(it)}>
+                            {L("repair_funding_analyze_btn")}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
