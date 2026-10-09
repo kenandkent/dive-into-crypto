@@ -1,4 +1,4 @@
-"""Short-Lab in-process scheduler (Task 13, design sections 22-23).
+"""Short-Lab in-process scheduler (Task 13, design sections 22-23; R11a budget side).
 
 V1 uses plain asyncio periodic tasks -- no Celery / Redis / APScheduler
 server (design 22.2). One ``asyncio`` task per registered job; a per-job
@@ -13,6 +13,14 @@ triggers (:meth:`ShortLabScheduler.trigger_now`) skip jitter but take the
 same per-job lock, so they share mutual exclusion with the periodic path.
 The shared upstream rate limiters live in the data clients themselves, so
 both paths travel them; the scheduler never bypasses them.
+
+R11a budget side (D11/D19.3): scheduler job_types map to budget tiers via
+``request_budget.budget_class`` (monitor/scanner/background; unknown
+refuses). When a shared :class:`RequestBudget` is wired, each tick installs
+a frozen :class:`RequestContext` (job_type + job_id/deadline) as the ambient
+context so downstream ``data.http`` sends share the correct reserves; cache
+hits never reserve and background never eats monitor/scanner reserves.
+Market/Jobs fair-rotation stays R11b-owned and is not touched here.
 """
 
 from __future__ import annotations
@@ -149,6 +157,7 @@ class ShortLabScheduler:
         sleep: SleepFn | None = None,
         clock: ClockMs | None = None,
         default_jitter_max_sec: float = 300.0,
+        request_budget: Any | None = None,
     ) -> None:
         self._jitter_fn: JitterFn = jitter_fn or default_jitter_fn
         self._sleep: SleepFn = sleep or asyncio.sleep
@@ -159,6 +168,71 @@ class ShortLabScheduler:
         self._locks = _LoopLocks()
         self._shutdown = asyncio.Event()
         self._started = False
+        # R11a budget side: shared RequestBudget for ambient RequestContext
+        # wiring (None = legacy unwired path, behaviour unchanged).
+        self._request_budget = request_budget
+
+    # -- R11a budget side --------------------------------------------------
+    @property
+    def request_budget(self) -> Any | None:
+        """Shared :class:`RequestBudget` for ambient context wiring (or None)."""
+        return self._request_budget
+
+    def budget_tier_for(self, job_type: str) -> str:
+        """Budget tier for ``job_type`` via ``request_budget.budget_class``.
+
+        Returns ``MONITOR``/``SCANNER``/``BACKGROUND``; unknown scheduler or
+        budget job_types return ``JOB_TYPE_UNKNOWN`` (caller must refuse to
+        send, never silent background).
+        """
+        try:
+            from diveintocrypto_desktop.shortlab.request_budget import (
+                JOB_TYPE_UNKNOWN as _UNKNOWN,
+            )
+            from diveintocrypto_desktop.shortlab.request_budget import (
+                budget_class as _budget_class,
+            )
+        except Exception:
+            return "BACKGROUND"
+        try:
+            tier = _budget_class(job_type)
+        except Exception:
+            return _UNKNOWN
+        return tier
+
+    def context_for_job(
+        self,
+        job_type: str,
+        *,
+        trace_id: str | None = None,
+        job_id: str | None = None,
+        deadline_ms: int | None = None,
+        host: str = "fapi",
+    ) -> Any | None:
+        """Build the ambient :class:`RequestContext` for one scheduler tick.
+
+        Returns ``None`` when no budget is wired (legacy path). The context
+        carries the scheduler ``job_type`` (tier-checked), ``job_id`` and
+        ``deadline_ms`` for pre-transport checks; callers install it via
+        ``scoped_request_context`` for the duration of the tick.
+        """
+        if self._request_budget is None:
+            return None
+        try:
+            from diveintocrypto_desktop.shortlab.request_budget import (
+                make_request_context as _make_ctx,
+            )
+        except Exception:
+            return None
+        tid = trace_id or f"{job_type}-{int(self._clock())}"
+        return _make_ctx(
+            self._request_budget,
+            job_type=str(job_type),
+            host=str(host or "fapi"),
+            trace_id=tid,
+            job_id=job_id,
+            deadline_ms=deadline_ms,
+        )
 
     # -- registration ----------------------------------------------------
     def register(
@@ -251,7 +325,22 @@ class ShortLabScheduler:
 
     # -- internals -------------------------------------------------------------
     async def _run_once(self, job: PeriodicJob) -> Any:
-        out = await job.func()
+        # R11a budget side: install the ambient RequestContext for the tick
+        # when a budget is wired (correct tier + trace; no extra sends here).
+        # Unwired schedulers keep the exact legacy behaviour.
+        ctx = self.context_for_job(job.job_type)
+        if ctx is None:
+            out = await job.func()
+        else:
+            try:
+                from diveintocrypto_desktop.shortlab.request_budget import (
+                    scoped_request_context as _scope,
+                )
+            except Exception:
+                out = await job.func()
+            else:
+                with _scope(ctx):
+                    out = await job.func()
         job.runs += 1
         job.last_run_ms = int(self._clock())
         job.last_error = None

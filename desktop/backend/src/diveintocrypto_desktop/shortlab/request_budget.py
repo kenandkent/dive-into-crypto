@@ -47,6 +47,8 @@ __all__ = [
     "ENDPOINT_WEIGHTS",
     "UNBUDGETED_ENDPOINT",
     "BUDGET_EXHAUSTED",
+    "JOB_TYPE_UNKNOWN",
+    "DEADLINE_EXCEEDED",
     "MONITOR_RESERVE_FRAC",
     "SCANNER_RESERVE_FRAC",
     "FUNDING_MAX_SENDS",
@@ -65,16 +67,24 @@ __all__ = [
     "make_request_context",
     "endpoint_family_for_url",
     "endpoint_weight",
+    "budget_class",
+    "utc_month_key",
+    "monthly_effective_limit",
+    "is_deadline_exceeded",
     "get_current_request_context",
     "set_current_request_context",
     "scoped_request_context",
 ]
 
 #: Versioned endpoint-weight fixture. Bump when any weight changes.
-ENDPOINT_WEIGHTS_VERSION = "endpoint-weights-v1"
+ENDPOINT_WEIGHTS_VERSION = "endpoint-weights-v2"
 
 UNBUDGETED_ENDPOINT = "UNBUDGETED_ENDPOINT"
 BUDGET_EXHAUSTED = "REQUEST_BUDGET_EXHAUSTED"
+#: Unknown job_type rejection code (D19.3: not silent background).
+JOB_TYPE_UNKNOWN = "JOB_TYPE_UNKNOWN"
+#: Deadline exceeded before transport (R11a: send-time deadline check).
+DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
 
 MONITOR_RESERVE_FRAC = 0.20
 SCANNER_RESERVE_FRAC = 0.30
@@ -90,11 +100,92 @@ RATIO_WINDOW_MS = 60_000
 FUNDING_FAMILIES = frozenset({"fundingRate", "fundingInfo"})
 RATIO_FAMILIES = frozenset({"oi", "ratio"})
 
+#: D19.3 job_type -> budget tier (frozen). Old names retained.
+#: monitor/active_monitor/critical -> MONITOR (100%);
+#: scanner/user_scanner/interactive -> SCANNER (total - floor(total*0.2));
+#: opportunity/evidence/entry/backfill/funding_backfill/retention/background
+#:   -> BACKGROUND (total - floor(total*0.2) - floor(total*0.3));
+#: anything else -> JOB_TYPE_UNKNOWN (refuse to send, never silent background).
 BACKGROUND_JOB_TYPES = frozenset(
-    {"entry", "backfill", "funding_backfill", "retention", "background"}
+    {
+        "opportunity",
+        "evidence",
+        "entry",
+        "backfill",
+        "funding_backfill",
+        "retention",
+        "background",
+    }
 )
 MONITOR_JOB_TYPES = frozenset({"monitor", "active_monitor", "critical"})
-SCANNER_JOB_TYPES = frozenset({"scanner", "user_scanner"})
+SCANNER_JOB_TYPES = frozenset({"scanner", "user_scanner", "interactive"})
+
+#: R11a scheduler compatibility: legacy scheduler/service job_types map to
+#: the nearest D19.3 tier so existing periodic jobs keep working. Truly
+#: unknown values (not in D19.3 nor this map) still reject as UNKNOWN.
+_SCHEDULER_JOB_TIER_FALLBACK: dict[str, str] = {
+    "score_refresh": "SCANNER",
+    "contract_refresh": "SCANNER",
+    "metadata": "SCANNER",
+    "funding_capture_refresh": "SCANNER",
+    "hedge_venue_refresh": "SCANNER",
+    "hedge_monitor": "MONITOR",
+    "hedge_settlement_check": "MONITOR",
+    "grader": "BACKGROUND",
+    "maintenance": "BACKGROUND",
+}
+
+
+def budget_class(job_type: str | None) -> str:
+    """Map ``job_type`` to its D19.3 budget tier.
+
+    Returns ``"MONITOR"`` / ``"SCANNER"`` / ``"BACKGROUND"`` for known
+    values (case-insensitive, ``interactive`` is SCANNER), else
+    ``JOB_TYPE_UNKNOWN``. Callers must refuse to send UNKNOWN (never fall
+    back to background).
+    """
+    jt = str(job_type or "").strip().lower()
+    if jt in MONITOR_JOB_TYPES:
+        return "MONITOR"
+    if jt in SCANNER_JOB_TYPES:
+        return "SCANNER"
+    if jt in BACKGROUND_JOB_TYPES:
+        return "BACKGROUND"
+    fallback = _SCHEDULER_JOB_TIER_FALLBACK.get(jt)
+    if fallback is not None:
+        return fallback
+    return JOB_TYPE_UNKNOWN
+
+
+def utc_month_key(as_of_ms: int) -> str:
+    """UTC ``YYYY-MM`` month key for ``as_of_ms`` (D19.4, matches R01)."""
+    import datetime as _dt
+
+    moment = _dt.datetime.fromtimestamp(int(as_of_ms) / 1000.0, tz=_dt.timezone.utc)
+    return f"{moment.year:04d}-{moment.month:02d}"
+
+
+def monthly_effective_limit(account_monthly_limit: int, reserve_fraction: float) -> int:
+    """Effective monthly sends: ``floor(limit * (1 - reserve))`` (D11/D19.4)."""
+    limit = int(account_monthly_limit)
+    reserve = float(reserve_fraction)
+    if limit <= 0:
+        raise ValueError(f"account_monthly_limit must be > 0, got {account_monthly_limit!r}")
+    if not 0.0 <= reserve < 1.0:
+        raise ValueError(f"reserve_fraction must be in [0,1), got {reserve_fraction!r}")
+    import math as _math
+
+    return int(_math.floor(limit * (1.0 - reserve)))
+
+
+def is_deadline_exceeded(deadline_ms: int | None, now_ms: int) -> bool:
+    """True when ``deadline_ms`` is set and ``now_ms`` is past it."""
+    if deadline_ms is None:
+        return False
+    try:
+        return int(now_ms) > int(deadline_ms)
+    except (TypeError, ValueError):
+        return False
 
 
 def _default_clock_ms() -> int:
@@ -108,44 +199,165 @@ def _default_clock_ms() -> int:
 #: Static fixture: family -> weight or limit-bucket table. Weights are
 #: illustrative-but-fixed Binance public weights; the point is they are
 #: versioned and limit-aware, not guessed from rateLimits at runtime.
+#: R11a (endpoint-weights-v2): existing families/buckets retained, plus
+#: markKlines/fundingInfo/Spot/Alpha/CoinGecko/0x per D19.3. FAPI/Spot final
+#: weight is max(local token, Fixture frozen official IP weight) elsewhere;
+#: Alpha/CoinGecko/0x use independent host-local RPS/token limits.
 ENDPOINT_WEIGHTS: dict[str, Any] = {
-    "klines": {"default": 10, "buckets": [(100, 10), (500, 20), (1000, 30)]},
+    "klines": {"default": 10, "buckets": [(100, 10), (500, 20), (1000, 30)], "min": 1, "max": 1000},
+    "markKlines": {"default": 10, "buckets": [(100, 10), (500, 20), (1000, 30), (1500, 30)], "min": 1, "max": 1500},
     "fundingRate": {"default": 10, "buckets": [(100, 5), (500, 10), (1000, 20)]},
+    "fundingInfo": {"default": 5},
     "premiumIndex": {"default": 10},
     "premiumIndexAll": {"default": 10},
+    "futuresDepth": {"default": 20, "buckets": [(100, 20), (500, 30), (1000, 50)], "min": 1, "max": 1000, "require_limit": True},
     "oi": {"default": 10},
     "ratio": {"default": 10},
     "exchangeInfo": {"default": 20},
     "ticker": {"default": 5},
     "universe": {"default": 5},
     "spot": {"default": 10},
+    "spotKlines": {"default": 10, "buckets": [(100, 10), (500, 20), (1000, 30)], "min": 1, "max": 1000},
+    "spotDepth": {"default": 20, "buckets": [(100, 20), (500, 30), (1000, 50)], "min": 1, "max": 1000, "require_limit": True},
+    "spotTicker": {"default": 40},
+    "alphaTokenList": {"default": 10},
+    "alphaExchangeInfo": {"default": 10},
+    "alphaTicker": {"default": 10},
+    "alphaDepth": {"default": 10},
+    "alphaKlines": {"default": 10},
+    "cgDirectory": {"default": 1},
+    "cgMarkets": {"default": 1},
+    "cgCoin": {"default": 1},
+    "cgFx": {"default": 1},
+    "onchainPrice": {"default": 1},
 }
+
+#: R11a frozen Alpha paths (from data/binance_alpha.py five PATH constants).
+_ALPHA_PATH_TO_FAMILY: dict[str, str] = {
+    "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list": "alphaTokenList",
+    "/bapi/defi/v1/public/alpha-trade/get-exchange-info": "alphaExchangeInfo",
+    "/bapi/defi/v1/public/alpha-trade/ticker": "alphaTicker",
+    "/bapi/defi/v1/public/alpha-trade/fullDepth": "alphaDepth",
+    "/bapi/defi/v1/public/alpha-trade/klines": "alphaKlines",
+}
+
+#: R11a frozen 0x read-only price paths (adapter PRICE_PATH + public v2
+#: header no-suffix path). No trade/approve/calldata paths are ever allowed.
+_0X_PRICE_PATHS = frozenset(
+    {"/swap/allowance-holder/price/v2", "/swap/allowance-holder/price"}
+)
+
+
+def _fapi_mirror_host() -> str | None:
+    """HTTPS origin host of ``DIVE_FAPI_BASE`` when explicitly configured."""
+    import os as _os
+
+    raw = (_os.environ.get("DIVE_FAPI_BASE") or "").strip().rstrip("/")
+    if not raw:
+        return None
+    try:
+        host = urllib.parse.urlparse(raw).netloc.lower()
+    except Exception:
+        return None
+    return host or None
+
+
+def _spot_mirror_host() -> str | None:
+    import os as _os
+
+    raw = (_os.environ.get("DIVE_SPOT_BASE") or "").strip().rstrip("/")
+    if not raw:
+        return None
+    try:
+        host = urllib.parse.urlparse(raw).netloc.lower()
+    except Exception:
+        return None
+    return host or None
 
 
 def endpoint_family_for_url(url: str) -> str | None:
-    """Map a request URL to its budget family (``None`` = unknown)."""
+    """Map a request URL to its budget family (``None`` = unknown).
+
+    R11a: host + full path must both match (D19.3). A matching path on a
+    non-allowlisted host is still unknown. ``DIVE_FAPI_BASE`` mirror host is
+    the only fapi alias and shares the fapi budget; any other host never
+    inherits fapi rights. Unknown host/path/limit must refuse to send.
+    """
     try:
-        path = urllib.parse.urlparse(str(url)).path or str(url)
+        parts = urllib.parse.urlparse(str(url))
+        path = parts.path or str(url)
+        host = (parts.netloc or "").lower()
     except Exception:
         path = str(url)
-    if "/fapi/v1/klines" in path:
-        return "klines"
-    if "/fapi/v1/fundingRate" in path:
-        return "fundingRate"
-    if "/fapi/v1/fundingInfo" in path:
-        return "fundingInfo"
-    if "/fapi/v1/premiumIndex" in path:
-        return "premiumIndex"
-    if "/futures/data/openInterestHist" in path:
-        return "oi"
-    if "/futures/data/" in path:
-        return "ratio"
-    if "/fapi/v1/exchangeInfo" in path:
-        return "exchangeInfo"
-    if "/fapi/v1/ticker" in path:
-        return "ticker"
-    if "/api/v3/exchangeInfo" in path or "exchangeInfo" in path:
-        return "exchangeInfo"
+        host = ""
+    # Normalise fapi mirror alias for family resolution (shares fapi budget).
+    mirror = _fapi_mirror_host()
+    is_fapi = host in ("fapi.binance.com", "fapi") or (mirror is not None and host == mirror)
+    # Bare-host legacy ("fapi") without netloc: treat as fapi for compat.
+    if not host:
+        is_fapi = True
+    if is_fapi:
+        if path == "/fapi/v1/klines":
+            return "klines"
+        if path == "/fapi/v1/markPriceKlines":
+            return "markKlines"
+        if path == "/fapi/v1/fundingRate":
+            return "fundingRate"
+        if path == "/fapi/v1/fundingInfo":
+            return "fundingInfo"
+        if path == "/fapi/v1/premiumIndex":
+            return "premiumIndex"
+        if path == "/fapi/v1/depth":
+            return "futuresDepth"
+        if path == "/fapi/v1/exchangeInfo":
+            return "exchangeInfo"
+        if path == "/fapi/v1/ticker/24hr" or path == "/fapi/v1/ticker":
+            return "ticker"
+        if path.startswith("/futures/data/openInterestHist"):
+            return "oi"
+        if path.startswith("/futures/data/"):
+            return "ratio"
+        return None
+    spot_mirror = _spot_mirror_host()
+    is_spot = host in ("api.binance.com", "api") or (
+        spot_mirror is not None and host == spot_mirror
+    )
+    if is_spot:
+        if path == "/api/v3/klines":
+            return "spotKlines"
+        if path == "/api/v3/depth":
+            return "spotDepth"
+        if path == "/api/v3/ticker/24hr":
+            return "spotTicker"
+        if path == "/api/v3/exchangeInfo":
+            return "exchangeInfo"
+        # Legacy generic spot family for other /api/v3/* market paths is NOT
+        # allowed: unknown path must refuse (D19.3).
+        return None
+    if host in ("www.binance.com",):
+        family = _ALPHA_PATH_TO_FAMILY.get(path)
+        if family is not None:
+            return family
+        return None
+    if host in ("api.coingecko.com", "pro-api.coingecko.com"):
+        if path == "/api/v3/coins/list":
+            return "cgDirectory"
+        if path == "/api/v3/coins/markets":
+            return "cgMarkets"
+        if path == "/api/v3/simple/price":
+            return "cgFx"
+        # Dynamic /api/v3/coins/{id} after exact matches (list/markets first).
+        if path.startswith("/api/v3/coins/") and len(path) > len("/api/v3/coins/"):
+            remainder = path[len("/api/v3/coins/"):]
+            # Single id segment only (no extra slashes); query is not in path.
+            if remainder and "/" not in remainder:
+                return "cgCoin"
+        return None
+    if host in ("api.0x.org",):
+        if path in _0X_PRICE_PATHS:
+            return "onchainPrice"
+        # Trade/approve/calldata paths are never allowed even on this host.
+        return None
     return None
 
 
@@ -167,13 +379,20 @@ def endpoint_weight(
     """Weight for ``(family, limit)``; ``None`` when the endpoint is unknown.
 
     Unknown families are ``UNBUDGETED_ENDPOINT`` and must not be sent under a
-    budget. Known families without an explicit limit fall back to ``default``.
+    budget. Limit-bucketed families reject out-of-range/missing limits
+    (unknown limit => ``None``); spotTicker distinguishes single (2) vs full
+    list (40) by ``symbol`` presence.
     """
     if family is None:
         return None
     # premiumIndex single vs all share the same fixture weight.
     if family == "premiumIndex" and isinstance(params, dict) and params.get("symbol") is None:
         family = "premiumIndexAll"
+    # spotTicker: single symbol 2, full list 40 (D19.3).
+    if family == "spotTicker":
+        if isinstance(params, dict) and params.get("symbol"):
+            return 2
+        return 40
     spec = ENDPOINT_WEIGHTS.get(family)
     if spec is None:
         return None
@@ -181,23 +400,59 @@ def endpoint_weight(
         return spec
     limit = _limit_param(params)
     buckets = spec.get("buckets") if isinstance(spec, dict) else None
-    if limit is not None and buckets:
+    require_limit = bool(spec.get("require_limit")) if isinstance(spec, dict) else False
+    lo = spec.get("min") if isinstance(spec, dict) else None
+    hi = spec.get("max") if isinstance(spec, dict) else None
+    if buckets:
+        # Depth families require an explicit limit; klines families allow
+        # default when no limit is given but reject out-of-range values.
+        if limit is None:
+            if require_limit:
+                return None
+            default = spec.get("default", 10) if isinstance(spec, dict) else 10
+            return int(default)
+        # Non-positive or non-finite limits are unknown.
+        try:
+            lim = int(limit)
+        except (TypeError, ValueError):
+            return None
+        if lo is not None and lim < int(lo):
+            return None
+        if hi is not None and lim > int(hi):
+            return None
         for ceiling, weight in buckets:
-            if limit <= ceiling:
+            if lim <= int(ceiling):
                 return int(weight)
-        return int(buckets[-1][1])
+        return None
     default = spec.get("default", 10) if isinstance(spec, dict) else 10
     return int(default)
 
 
 def host_from_url(url: str) -> str:
-    """Normalise the host part of a URL for budget accounting."""
+    """Normalise the host part of a URL for budget accounting.
+
+    R11a: ``fapi.binance.com`` (+ explicit ``DIVE_FAPI_BASE`` mirror) share
+    the ``fapi`` budget; ``api.binance.com`` (+ ``DIVE_SPOT_BASE`` mirror)
+    share ``api``; Alpha/CoinGecko/0x keep independent host buckets. Any
+    other host keeps its own lowercased bucket but its paths still reject
+    as unknown at the family layer.
+    """
     try:
         netloc = urllib.parse.urlparse(str(url)).netloc
     except Exception:
         netloc = ""
     host = (netloc or "fapi").lower()
-    return {"fapi.binance.com": "fapi", "api.binance.com": "api"}.get(host, host)
+    if host in ("fapi.binance.com", "fapi"):
+        return "fapi"
+    if host in ("api.binance.com", "api"):
+        return "api"
+    mirror = _fapi_mirror_host()
+    if mirror is not None and host == mirror:
+        return "fapi"
+    spot_mirror = _spot_mirror_host()
+    if spot_mirror is not None and host == spot_mirror:
+        return "api"
+    return host
 
 
 # ---------------------------------------------------------------------------
@@ -417,12 +672,15 @@ class RequestBudget:
         # production 240 gives 48 monitor + 72 scanner + 120 background.
         monitor_reserve = int(total * self.monitor_reserve_frac)
         scanner_reserve = int(total * self.scanner_reserve_frac)
-        jt = str(job_type or "entry").lower()
-        if jt in MONITOR_JOB_TYPES or jt == "monitor":
+        tier = budget_class(job_type)
+        if tier == "MONITOR":
             return total
-        if jt in SCANNER_JOB_TYPES or jt == "scanner":
+        if tier == "SCANNER":
             return max(0, total - monitor_reserve)
-        return max(0, total - monitor_reserve - scanner_reserve)
+        if tier == "BACKGROUND":
+            return max(0, total - monitor_reserve - scanner_reserve)
+        # JOB_TYPE_UNKNOWN: no quota (refuse, never silent background).
+        return 0
 
     def _next_allowed_at(self, now: int, family: str, reason: str) -> int | None:
         """Next ms when the limiting window slides (denial-specific)."""
@@ -445,13 +703,26 @@ class RequestBudget:
         """Atomically reserve one send; ``Denied`` when the window is full.
 
         ``weight=None`` (unknown endpoint) is denied as
-        ``UNBUDGETED_ENDPOINT`` without sending. No ``await`` happens between
-        the check and the increment, so concurrent jobs cannot overshoot.
+        ``UNBUDGETED_ENDPOINT`` without sending. Unknown ``job_type``
+        (D19.3) is denied as ``JOB_TYPE_UNKNOWN`` without sending. No
+        ``await`` happens between the check and the increment, so concurrent
+        jobs cannot overshoot.
         """
         self._select_host(host)
         now = self.now_ms()
         family = str(endpoint_family or "unknown")
         jt = str(job_type or "entry")
+        # R11a: unknown job_type must refuse, never silent background.
+        if budget_class(jt) == JOB_TYPE_UNKNOWN:
+            self.denied_count += 1
+            return Denied(
+                reason_code=JOB_TYPE_UNKNOWN,
+                message=f"{JOB_TYPE_UNKNOWN}: job_type={jt!r} is not a known tier "
+                "(monitor/scanner/interactive/background); refusing to send",
+                next_allowed_at_ms=None,
+                job_type=jt,
+                endpoint_family=family,
+            )
         if weight is None:
             self.denied_count += 1
             return Denied(
@@ -661,7 +932,9 @@ class RequestContext:
     monitor(20%)/scanner(30%) reserves (``entry``/``backfill``/``retention``
     are background); ``host``/``endpoint_family`` scope the reservation;
     ``trace_id``/``identity_snapshot_id`` propagate provenance into cache
-    keys and job stats.
+    keys and job stats. R11a appends optional ``job_id``/``deadline_ms``
+    (default None) at the end; position/order of the R00 six fields is
+    preserved.
     """
 
     budget: RequestBudget | None = None
@@ -670,6 +943,8 @@ class RequestContext:
     endpoint_family: str | None = None
     trace_id: str | None = None
     identity_snapshot_id: str | None = None
+    job_id: str | None = None
+    deadline_ms: int | None = None
 
 
 def make_request_context(
@@ -680,6 +955,8 @@ def make_request_context(
     endpoint_family: str | None = None,
     trace_id: str | None = None,
     identity_snapshot_id: str | None = None,
+    job_id: str | None = None,
+    deadline_ms: int | None = None,
 ) -> RequestContext:
     """Build a :class:`RequestContext` (F04 handoff: use this constructor).
 
@@ -687,7 +964,9 @@ def make_request_context(
     ``data.http.get_json`` / ``data.funding.funding_history_range`` (and via
     ``EntryBudget(request_context=...)`` for Entry rounds). ``budget=None``
     means unbounded legacy behaviour (tests only — production always wires
-    the shared budget).
+    the shared budget). R11a appends ``job_id``/``deadline_ms`` keywords;
+    ``deadline_ms`` is checked before each transport send (expired => deny,
+    never send).
     """
     return RequestContext(
         budget=budget,
@@ -696,7 +975,35 @@ def make_request_context(
         endpoint_family=endpoint_family,
         trace_id=trace_id,
         identity_snapshot_id=identity_snapshot_id,
+        job_id=job_id,
+        deadline_ms=int(deadline_ms) if deadline_ms is not None else None,
     )
+
+
+async def reserve_monthly_budget(
+    repository: Any,
+    *,
+    provider: str,
+    month_key: str,
+    request_id: str,
+    monthly_limit: int,
+    as_of_ms: int,
+) -> Mapping[str, Any]:
+    """Reserve one monthly send via the R01 repository (D19.4).
+
+    Thin wrapper over ``RepositoryPort.reserve_provider_request`` so callers
+    never bypass the single-worker transaction (count/compare/insert atomic).
+    """
+    return await repository.reserve_provider_request(
+        provider, month_key, request_id, monthly_limit, as_of_ms
+    )
+
+
+async def finish_monthly_budget(
+    repository: Any, *, request_id: str, sent: bool, as_of_ms: int
+) -> None:
+    """Finish one monthly reservation via the R01 repository (D19.4)."""
+    await repository.finish_provider_request(request_id, sent, as_of_ms)
 
 
 _current_request_context: ContextVar[RequestContext | None] = ContextVar(

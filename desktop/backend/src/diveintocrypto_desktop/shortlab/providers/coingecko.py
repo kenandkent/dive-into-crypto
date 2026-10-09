@@ -63,9 +63,18 @@ log = logging.getLogger(__name__)
 PROVIDER_NAME = "coingecko"
 COINGECKO_BASE_URL = "https://api.coingecko.com"
 
-# Independent CoinGecko budget (free tier is ~5-15 calls/min); deliberately
-# separate from the Binance 80/5min and futures/data limiters.
-COINGECKO_MAX_PER_MIN = 10
+# R11a budget (D11/D19.4): monthly + local RPM + reserve. Defaults mirror
+# shortlab/default.yaml optimization.providers.coingecko.
+ACCOUNT_MONTHLY_LIMIT = 10000
+LOCAL_REQUESTS_PER_MINUTE = 30
+COINGECKO_RESERVE_FRACTION = 0.1
+BUDGET_LIMITED = "BUDGET_LIMITED"
+#: FX observations are valid for 60s; never guess USDT=1 when stale (D11).
+FX_MAX_AGE_MS = 60_000
+
+# Independent CoinGecko budget (R11a: 30/min local, separate from Binance
+# 80/5min and futures/data limiters; platform IP quota stays honest unknown).
+COINGECKO_MAX_PER_MIN = 30
 COINGECKO_PERIOD_SEC = 60
 
 # Design 23 / quality_freshness_sec.fundamentals + supply_float override.
@@ -113,6 +122,14 @@ class CoinGeckoBadResponse(Exception):
 
 class CoinGeckoUnconfigured(Exception):
     """No API key / bad plan: the network directory is unavailable (UNCONFIGURED)."""
+
+
+class _MonthlyExhausted(Exception):
+    """Monthly quota exhausted (maps to BUDGET_LIMITED UNAVAILABLE)."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +497,151 @@ def _retry_after_seconds(resp: aiohttp.ClientResponse) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# R11a budget helpers (D11/D19.4): monthly effective limit, UTC month key,
+# FX freshness. Totals never reset on restart (persistent BUDGET_COUNTER via
+# R01); lowering the configured limit never clears history.
+# ---------------------------------------------------------------------------
+
+
+def coingecko_effective_limit(
+    account_monthly_limit: int = ACCOUNT_MONTHLY_LIMIT,
+    reserve_fraction: float = COINGECKO_RESERVE_FRACTION,
+) -> int:
+    """Effective monthly sends: ``floor(limit * (1 - reserve))`` (D11)."""
+    import math as _math
+
+    limit = int(account_monthly_limit)
+    reserve = float(reserve_fraction)
+    if limit <= 0:
+        raise ValueError(f"account_monthly_limit must be > 0, got {account_monthly_limit!r}")
+    if not 0.0 <= reserve < 1.0:
+        raise ValueError(f"reserve_fraction must be in [0,1), got {reserve_fraction!r}")
+    return int(_math.floor(limit * (1.0 - reserve)))
+
+
+def coingecko_month_key(as_of_ms: int) -> str:
+    """UTC ``YYYY-MM`` for ``as_of_ms`` (D19.4, same as R01/request_budget)."""
+    import datetime as _dt
+
+    moment = _dt.datetime.fromtimestamp(int(as_of_ms) / 1000.0, tz=_dt.timezone.utc)
+    return f"{moment.year:04d}-{moment.month:02d}"
+
+
+def is_fx_fresh(source_as_of_ms: int | None, now_ms: int, max_age_ms: int = FX_MAX_AGE_MS) -> bool:
+    """True when an FX observation is fresh enough to reuse (D11).
+
+    ``None`` source time or age > ``max_age_ms`` (default 60s) is stale;
+    callers must keep ``UNKNOWN`` and never guess ``USDT=1`` to save quota.
+    """
+    if source_as_of_ms is None:
+        return False
+    try:
+        age = int(now_ms) - int(source_as_of_ms)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= int(max_age_ms)
+
+
+def build_markets_request(
+    coin_ids: list[str] | tuple[str, ...],
+    base_url: str = COINGECKO_BASE_URL,
+    *,
+    vs_currency: str = "usd",
+) -> tuple[str, dict[str, str]]:
+    """Build the ``(url, params)`` pair for the batch markets endpoint.
+
+    Pure function (no I/O): ``GET {base}/api/v3/coins/markets`` with
+    ``vs_currency`` + comma-joined ``ids``. Batch is preferred over per-coin
+    ``/coins/{id}`` for Fundamentals refresh (D11); per-coin documents remain
+    the fallback for supply detail.
+    """
+    ids = [str(c).strip() for c in (coin_ids or []) if str(c).strip()]
+    if not ids:
+        raise ValueError("build_markets_request requires at least one coin id")
+    url = f"{base_url.rstrip('/')}/api/v3/coins/markets"
+    params = {"vs_currency": str(vs_currency or "usd"), "ids": ",".join(ids)}
+    return url, params
+
+
+def build_fx_request(
+    coin_ids: list[str] | tuple[str, ...] | str,
+    base_url: str = COINGECKO_BASE_URL,
+    *,
+    vs_currencies: str = "usd",
+) -> tuple[str, dict[str, str]]:
+    """Build the ``(url, params)`` pair for ``/simple/price`` FX reuse.
+
+    Pure function (no I/O): batch FX for the given ids without forcing a
+    per-coin ``/coins/{id}`` fetch every minute. Callers reuse a fresh
+    (<=60s) observation of the same currency instead of re-pulling.
+    """
+    if isinstance(coin_ids, str):
+        ids = [coin_ids.strip()] if coin_ids.strip() else []
+    else:
+        ids = [str(c).strip() for c in (coin_ids or []) if str(c).strip()]
+    if not ids:
+        raise ValueError("build_fx_request requires at least one coin id")
+    url = f"{base_url.rstrip('/')}/api/v3/simple/price"
+    return url, {"ids": ",".join(ids), "vs_currencies": str(vs_currencies or "usd")}
+
+
+def parse_markets_payload(
+    payload: Any,
+    *,
+    request_url: str,
+    fetched_at_ms: int,
+) -> tuple[Fundamentals, ...]:
+    """Parse a ``/coins/markets`` list into :class:`Fundamentals` tuples.
+
+    Each row must carry ``id``; absent numeric fields stay ``None`` (never
+    0). Raises :class:`CoinGeckoBadResponse` for non-list payloads.
+    """
+    if not isinstance(payload, list):
+        raise CoinGeckoBadResponse("coins/markets payload must be a list")
+    out: list[Fundamentals] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            raise CoinGeckoBadResponse("coins/markets row must be an object")
+        coin_id = row.get("id")
+        if not isinstance(coin_id, str) or not coin_id.strip():
+            raise CoinGeckoBadResponse("coins/markets row misses string id")
+        market_cap = row.get("market_cap")
+        fdv = row.get("fully_diluted_valuation", row.get("fdv"))
+        circulating = row.get("circulating_supply")
+        total = row.get("total_supply")
+        maximum = row.get("max_supply")
+        ath = row.get("ath")
+        ath_change_pct = row.get("ath_change_percentage")
+        ath_date_raw = row.get("ath_date")
+        last_updated_raw = row.get("last_updated")
+        out.append(
+            Fundamentals(
+                coingecko_id=coin_id.strip(),
+                symbol=row.get("symbol") if isinstance(row.get("symbol"), str) else None,
+                name=row.get("name") if isinstance(row.get("name"), str) else None,
+                price_usd=_as_float(row.get("current_price")),
+                market_cap_usd=_as_float(market_cap),
+                fdv_usd=_as_float(fdv),
+                circulating_supply=_as_float(circulating),
+                total_supply=_as_float(total),
+                max_supply=_as_float(maximum),
+                ath_usd=_as_float(ath),
+                ath_change=(float(ath_change_pct) / 100.0)
+                if isinstance(ath_change_pct, (int, float)) and not isinstance(ath_change_pct, bool)
+                else None,
+                ath_date_ms=_as_time_ms(ath_date_raw),
+                categories=tuple(row.get("categories") or ())
+                if isinstance(row.get("categories"), (list, tuple))
+                else (),
+                last_updated_ms=_as_time_ms(last_updated_raw),
+                request_url=request_url,
+                fetched_at_ms=fetched_at_ms,
+            )
+        )
+    return tuple(out)
+
+
 class CoinGeckoProvider:
     """``CoinGeckoProvider.fetch(identity) -> ProviderResult[Fundamentals]``.
 
@@ -503,11 +665,17 @@ class CoinGeckoProvider:
         limiter: AsyncLimiter | None = None,
         fetcher: _Fetcher | None = None,
         transport_verified: bool | None = None,
+        account_monthly_limit: int = ACCOUNT_MONTHLY_LIMIT,
+        reserve_fraction: float = COINGECKO_RESERVE_FRACTION,
+        repository: Any | None = None,
+        supply_ttl_sec: int = SUPPLY_TTL_SEC,
+        uuid_fn: Callable[[], str] | None = None,
     ) -> None:
         self._base_url = base_url
         self._timeout_sec = timeout_sec
         self._max_retries = max_retries
         self._market_ttl_ms = market_ttl_sec * 1000
+        self._supply_ttl_ms = int(supply_ttl_sec) * 1000
         self._clock = clock or (lambda: int(time.time() * 1000))
         self._sleep = sleep
         self._limiter_override = limiter
@@ -519,6 +687,13 @@ class CoinGeckoProvider:
             transport_verified
         )
         self._cache: dict[str, _CacheEntry] = {}
+        # R11a monthly + supply/FX reuse (D11/D19.4).
+        self._account_monthly_limit = int(account_monthly_limit)
+        self._reserve_fraction = float(reserve_fraction)
+        self._repository = repository
+        self._supply_cache: dict[str, _CacheEntry] = {}
+        self._fx_cache: dict[str, tuple[int, str, int]] = {}
+        self._uuid_fn = uuid_fn
 
     @property
     def _active_limiter(self) -> AsyncLimiter:
@@ -531,6 +706,75 @@ class CoinGeckoProvider:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        self._supply_cache.clear()
+        self._fx_cache.clear()
+
+    def effective_monthly_limit(self) -> int:
+        """Effective monthly sends after reserve (D11/D19.4, default 9000)."""
+        return coingecko_effective_limit(
+            self._account_monthly_limit, self._reserve_fraction
+        )
+
+    def get_cached_fx(self, currency: str, now_ms: int | None = None) -> str | None:
+        """Reuse a fresh (<=60s) FX observation for ``currency`` (D11).
+
+        Returns the cached rate string when fresh, else ``None`` (caller
+        keeps ``UNKNOWN``; never guesses ``USDT=1`` to save quota). ``USD``
+        is the only implied 1 (no fetch needed).
+        """
+        if str(currency or "").upper() == "USD":
+            return "1"
+        now = int(now_ms) if now_ms is not None else int(self._clock())
+        row = self._fx_cache.get(str(currency or "").upper())
+        if row is None:
+            return None
+        as_of_ms, rate, _known_ms = row
+        if not is_fx_fresh(as_of_ms, now):
+            return None
+        return rate
+
+    def put_fx(self, currency: str, rate: str, source_as_of_ms: int) -> None:
+        """Record an FX observation for later 60s reuse (D11)."""
+        now = int(self._clock())
+        self._fx_cache[str(currency or "").upper()] = (
+            int(source_as_of_ms),
+            str(rate),
+            int(now),
+        )
+
+    async def _check_monthly(self, now_ms: int) -> tuple[str, str] | None:
+        """Reserve one monthly send via the repository when wired (D19.4).
+
+        Returns ``(request_id, month_key)`` on admission, ``None`` when no
+        repository is wired (in-memory RPM only). On exhaustion returns a
+        ``BUDGET_LIMITED``-style failure via exception? Callers check
+        ``None`` vs tuple; exhaustion raises a typed error handled as
+        ``BUDGET_LIMITED`` UNAVAILABLE (never counted as sent).
+        """
+        if self._repository is None:
+            return None
+        import uuid as _uuid_mod
+
+        month_key = coingecko_month_key(int(now_ms))
+        request_id = self._uuid_fn() if self._uuid_fn is not None else str(_uuid_mod.uuid4())
+        result = await self._repository.reserve_provider_request(
+            PROVIDER_NAME,
+            month_key,
+            request_id,
+            self.effective_monthly_limit(),
+            int(now_ms),
+        )
+        if not bool(result.get("admitted")):
+            raise _MonthlyExhausted(str(result.get("reason_code") or "BUDGET_MONTHLY_EXHAUSTED"))
+        return request_id, month_key
+
+    async def _finish_monthly(self, request_id: str | None, sent: bool, now_ms: int) -> None:
+        if request_id is None or self._repository is None:
+            return
+        try:
+            await self._repository.finish_provider_request(request_id, sent, int(now_ms))
+        except Exception:
+            pass
 
     async def _default_fetcher(self, url: str, params: Mapping[str, Any]) -> Any:
         session = await get_session()
@@ -578,7 +822,18 @@ class CoinGeckoProvider:
             error_message=error_message,
         )
 
-    async def fetch(self, identity: Any) -> ProviderResult[Fundamentals]:
+    async def fetch(
+        self, identity: Any, *, request_context: Any | None = None
+    ) -> ProviderResult[Fundamentals]:
+        """Fetch one coin document (R11a: ``request_context`` forwarded).
+
+        ``request_context`` is accepted for R11a/R11b HTTP-layer uniformity
+        and never double-charges: cache hits never reserve, and this provider
+        performs a single budgeted send per call (RPM + optional monthly via
+        the repository). Production callers pass the shared context; tests
+        omit it (legacy unbounded path preserved).
+        """
+        _ = request_context  # single-charge: no duplicate budgeting here
         now_ms = self._clock()
         raw_id = getattr(identity, "coingecko_id", None)
         coingecko_id = str(raw_id).strip() if raw_id is not None else ""
@@ -613,6 +868,24 @@ class CoinGeckoProvider:
 
         url, params = build_coin_request(coingecko_id, self._base_url)
         request_url = _request_url_for_snapshot(url, params)
+        # R11a monthly gate (persistent BUDGET_COUNTER, restart-retained).
+        # Cache hits above never reserve; lowering the limit never resets
+        # history (R01 single-worker transaction decides admission).
+        monthly_hold: tuple[str, str] | None = None
+        try:
+            monthly_hold = await self._check_monthly(now_ms)
+        except _MonthlyExhausted as exc:
+            log.info("coingecko budget-limited id=%s reason=%s", coingecko_id, exc.reason_code)
+            return ProviderResult(
+                status="UNAVAILABLE",  # type: ignore[arg-type]
+                source=PROVIDER_NAME,
+                fetched_at_ms=now_ms,
+                as_of_ms=(cached.as_of_ms if cached is not None else None),
+                data=(cached.data if cached is not None else None),
+                stale=bool(cached is not None),
+                reason_code=BUDGET_LIMITED,
+                error_message=f"coingecko monthly quota exhausted ({exc.reason_code})",
+            )
         try:
             async with self._active_limiter:
                 payload = await run_with_retries(
@@ -621,10 +894,14 @@ class CoinGeckoProvider:
                     max_retries=self._max_retries,
                 )
         except CoinGeckoNotFound as exc:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached, COINGECKO_UNKNOWN_ID, "ERROR", str(exc), now_ms
             )
         except TransientUpstreamError as exc:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             if exc.status == 429:
                 return self._failure(
                     cached,
@@ -641,6 +918,8 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except (asyncio.TimeoutError, TimeoutError):
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached,
                 COINGECKO_TIMEOUT,
@@ -649,6 +928,8 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except aiohttp.ClientError as exc:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached,
                 COINGECKO_NETWORK_ERROR,
@@ -657,10 +938,15 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except CoinGeckoBadResponse as exc:
+            # Fetcher-level bad response still consumed transport (counts).
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(cached, COINGECKO_CLIENT_ERROR, "ERROR", str(exc), now_ms)
         except Exception as exc:  # noqa: BLE001 - encapsulated, never raised
             # Raw text is truncated and redacted by ProviderResult's
             # sanitize_error_message; it never reaches the public API.
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             detail = str(exc)[:200]
             suffix = f": {detail}" if detail else ""
             return self._failure(
@@ -679,6 +965,8 @@ class CoinGeckoProvider:
                 fetched_at_ms=now_ms,
             )
         except CoinGeckoBadResponse as exc:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached, COINGECKO_BAD_RESPONSE, "ERROR", str(exc), now_ms
             )
@@ -691,6 +979,13 @@ class CoinGeckoProvider:
         self._cache[coingecko_id] = _CacheEntry(
             data=fundamentals, fetched_at_ms=now_ms, as_of_ms=as_of_ms
         )
+        # Supply view shares the same atomic document but has an independent
+        # 6h TTL (D11): refresh the supply cache alongside the market cache.
+        self._supply_cache[coingecko_id] = _CacheEntry(
+            data=fundamentals, fetched_at_ms=now_ms, as_of_ms=as_of_ms
+        )
+        if monthly_hold is not None:
+            await self._finish_monthly(monthly_hold[0], True, self._clock())
         log.info("coingecko ok id=%s as_of_ms=%s", coingecko_id, as_of_ms)
         return ProviderResult(
             status="OK",
@@ -702,6 +997,178 @@ class CoinGeckoProvider:
             reason_code=None,
             error_message=None,
         )
+
+    async def fetch_many(
+        self, identities: list[Any] | tuple[Any, ...], *, request_context: Any | None = None
+    ) -> dict[str, ProviderResult[Fundamentals]]:
+        """Batch Fundamentals refresh preferring ``/coins/markets`` (D11).
+
+        Cache hits (market TTL) never send; misses are fetched in one batch
+        markets call (single monthly + RPM charge for the batch) with per-coin
+        fallback to :meth:`fetch` on partial failure. Supply uses the
+        independent 6h TTL via ``_supply_cache``. ``request_context`` is
+        accepted for uniformity and never double-charges.
+        """
+        _ = request_context
+        now_ms = self._clock()
+        ids: list[str] = []
+        by_id: dict[str, Any] = {}
+        for ident in identities or []:
+            raw = getattr(ident, "coingecko_id", None)
+            cid = str(raw).strip() if raw is not None else ""
+            if cid and cid not in by_id:
+                by_id[cid] = ident
+                ids.append(cid)
+        out: dict[str, ProviderResult[Fundamentals]] = {}
+        misses: list[str] = []
+        for cid in ids:
+            cached = self._cache.get(cid)
+            if cached is not None and now_ms - cached.fetched_at_ms <= self._market_ttl_ms:
+                out[cid] = ProviderResult(
+                    status="OK",
+                    source=PROVIDER_NAME,
+                    fetched_at_ms=cached.fetched_at_ms,
+                    as_of_ms=cached.as_of_ms,
+                    data=cached.data,
+                    stale=False,
+                    reason_code=None,
+                    error_message=None,
+                )
+            else:
+                misses.append(cid)
+        if not misses:
+            return out
+        # Single batch markets fetch for all misses (one transport).
+        url, params = build_markets_request(misses, self._base_url)
+        request_url = _request_url_for_snapshot(url, params)
+        monthly_hold: tuple[str, str] | None = None
+        try:
+            monthly_hold = await self._check_monthly(now_ms)
+        except _MonthlyExhausted as exc:
+            for cid in misses:
+                cached = self._cache.get(cid)
+                out[cid] = ProviderResult(
+                    status="UNAVAILABLE",  # type: ignore[arg-type]
+                    source=PROVIDER_NAME,
+                    fetched_at_ms=now_ms,
+                    as_of_ms=(cached.as_of_ms if cached is not None else None),
+                    data=(cached.data if cached is not None else None),
+                    stale=bool(cached is not None),
+                    reason_code=BUDGET_LIMITED,
+                    error_message=f"coingecko monthly quota exhausted ({exc.reason_code})",
+                )
+            return out
+        try:
+            async with self._active_limiter:
+                payload = await run_with_retries(
+                    lambda: self._fetcher(url, params),
+                    sleep=self._sleep or asyncio.sleep,
+                    max_retries=self._max_retries,
+                )
+        except Exception as exc:  # noqa: BLE001 - per-coin fallback below
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            for cid in misses:
+                # Fall back to single fetch (preserves per-coin error mapping).
+                out[cid] = await self.fetch(by_id[cid], request_context=request_context)
+            return out
+        try:
+            parsed = parse_markets_payload(payload, request_url=request_url, fetched_at_ms=now_ms)
+        except CoinGeckoBadResponse as exc:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            for cid in misses:
+                out[cid] = await self.fetch(by_id[cid], request_context=request_context)
+            _ = exc
+            return out
+        by_parsed: dict[str, Fundamentals] = {f.coingecko_id: f for f in parsed}
+        if monthly_hold is not None:
+            await self._finish_monthly(monthly_hold[0], True, self._clock())
+        for cid in misses:
+            fund = by_parsed.get(cid)
+            if fund is None:
+                # Not in batch response: per-coin fallback (honest, no guess).
+                out[cid] = await self.fetch(by_id[cid], request_context=request_context)
+                continue
+            as_of = fund.last_updated_ms if fund.last_updated_ms is not None else now_ms
+            self._cache[cid] = _CacheEntry(data=fund, fetched_at_ms=now_ms, as_of_ms=as_of)
+            self._supply_cache[cid] = _CacheEntry(data=fund, fetched_at_ms=now_ms, as_of_ms=as_of)
+            out[cid] = ProviderResult(
+                status="OK",
+                source=PROVIDER_NAME,
+                fetched_at_ms=now_ms,
+                as_of_ms=as_of,
+                data=fund,
+                stale=False,
+                reason_code=None,
+                error_message=None,
+            )
+        return out
+
+    async def fetch_fx(
+        self, coin_ids: list[str] | tuple[str, ...] | str, *, request_context: Any | None = None
+    ) -> dict[str, str | None]:
+        """Batch FX via ``/simple/price`` with 60s reuse (D11).
+
+        Fresh (<=60s) cached FX for the same currency is reused without a new
+        CoinGecko send; missing/stale FX returns ``None`` (caller keeps
+        ``UNKNOWN``, never guesses ``USDT=1``). ``request_context`` is
+        accepted for uniformity.
+        """
+        _ = request_context
+        now_ms = self._clock()
+        if isinstance(coin_ids, str):
+            wanted = [coin_ids.strip()] if coin_ids.strip() else []
+        else:
+            wanted = [str(c).strip() for c in (coin_ids or []) if str(c).strip()]
+        out: dict[str, str | None] = {}
+        need: list[str] = []
+        for cid in wanted:
+            # FX cache is keyed by coin id upper; reuse when fresh.
+            row = self._fx_cache.get(cid.upper())
+            if row is not None and is_fx_fresh(row[0], now_ms):
+                out[cid] = row[1]
+            else:
+                need.append(cid)
+                out[cid] = None
+        if not need:
+            return out
+        url, params = build_fx_request(need, self._base_url)
+        monthly_hold: tuple[str, str] | None = None
+        try:
+            monthly_hold = await self._check_monthly(now_ms)
+        except _MonthlyExhausted:
+            return out
+        try:
+            async with self._active_limiter:
+                payload = await run_with_retries(
+                    lambda: self._fetcher(url, params),
+                    sleep=self._sleep or asyncio.sleep,
+                    max_retries=self._max_retries,
+                )
+        except Exception:
+            if monthly_hold is not None:
+                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            return out
+        if monthly_hold is not None:
+            await self._finish_monthly(monthly_hold[0], True, self._clock())
+        if isinstance(payload, Mapping):
+            for cid in need:
+                row = payload.get(cid) or payload.get(cid.lower()) or payload.get(cid.upper())
+                price: str | None = None
+                if isinstance(row, Mapping):
+                    raw = row.get("usd")
+                    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                        try:
+                            value = float(raw)
+                        except (TypeError, ValueError):
+                            value = None
+                        if value is not None and value == value and value > 0:
+                            price = str(raw)
+                if price is not None:
+                    out[cid] = price
+                    self._fx_cache[cid.upper()] = (now_ms, price, now_ms)
+        return out
 
     def _failure(
         self,
@@ -729,6 +1196,8 @@ class CoinGeckoProvider:
 
 
 __all__ = [
+    "ACCOUNT_MONTHLY_LIMIT",
+    "BUDGET_LIMITED",
     "COINGECKO_BAD_RESPONSE",
     "COINGECKO_BASE_URL",
     "COINGECKO_CLIENT_ERROR",
@@ -744,11 +1213,14 @@ __all__ = [
     "COINGECKO_PRO_BASE_URL",
     "COINGECKO_PRO_KEY_PARAM",
     "COINGECKO_RATE_LIMITED",
+    "COINGECKO_RESERVE_FRACTION",
     "COINGECKO_TIMEOUT",
     "COINGECKO_UNKNOWN_ID",
     "COINGECKO_UPSTREAM_ERROR",
+    "FX_MAX_AGE_MS",
     "IDENTITY_DIRECTORY_UNCONFIGURED",
     "IDENTITY_NOT_MAPPED",
+    "LOCAL_REQUESTS_PER_MINUTE",
     "MARKET_TTL_SEC",
     "PROVIDER_NAME",
     "SUPPLY_GRACE_SEC",
@@ -762,10 +1234,16 @@ __all__ = [
     "build_coin_detail_request",
     "build_coin_request",
     "build_coins_list_request",
+    "build_fx_request",
+    "build_markets_request",
+    "coingecko_effective_limit",
+    "coingecko_month_key",
     "coingecko_route",
     "coins_list_size_bytes",
+    "is_fx_fresh",
     "parse_coin_document",
     "parse_coin_platforms",
     "parse_coins_list",
+    "parse_markets_payload",
     "redact_coins_list_url",
 ]
