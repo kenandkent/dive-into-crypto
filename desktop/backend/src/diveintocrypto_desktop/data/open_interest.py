@@ -27,6 +27,18 @@ from crypcodile.exchanges.binance.backfill import _live_fetch_open_interest_hist
 from diveintocrypto_desktop.data.http import FAPI_DATA, TransientUpstreamError, run_with_retries
 from diveintocrypto_desktop.shortlab import observations as _obs
 
+try:  # pragma: no cover - import guard
+    from diveintocrypto_desktop.shortlab.request_budget import (
+        RequestContext,
+        get_current_request_context,
+    )
+except Exception:  # pragma: no cover
+    from typing import Any as _Any
+
+    RequestContext = _Any  # type: ignore[assignment,misc]
+    def get_current_request_context():  # type: ignore[no-redef]
+        return None
+
 _VENUE = "binance-usdm"
 
 # Binance publishes openInterestHist for these periods only.
@@ -233,17 +245,20 @@ async def fetch_oi_hist_observed(
     as_of_ms: int | None = None,
     now_ms: int | None = None,
     identity_snapshot_id: str | None = None,
+    request_context: Any | None = None,
 ) -> _obs.Observed[list[dict]]:
-    """Recent open-interest points wrapped as an ``Observed`` (F02).
+    """Recent open-interest points wrapped as an ``Observed`` (F02/R03).
 
     Legacy :func:`fetch_oi_hist` keeps its signature and return type; the
     wrapper only adds the PIT envelope (completion ``known_at``; native
-    ``oi`` quantity and quote ``oi_value`` nominal stay separated). OI
+    ``oi`` quantity and quote ``oi_value`` nominal stay separated, with the
+    dollar-unit source retained via :func:`resolve_oi_value_usd`). OI
     carries no result cache, so every call is fresh. ``as_of_ms`` is
     accepted for the downstream cutoff check.
+    R03: accepts keyword ``request_context`` (no duplicate budgeting here).
     """
     _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
-    points = await fetch_oi_hist(symbol, period, limit)
+    points = await fetch_oi_hist(symbol, period, limit, request_context=request_context)
     completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     times = sorted(_to_ms(p.get("t")) for p in points or [])
     times = [t for t in times if t is not None]
@@ -262,8 +277,23 @@ async def fetch_oi_hist_observed(
     )
 
 
-async def fetch_oi_hist(symbol: str, period: str = "5m", limit: int = 48) -> list[dict]:
-    """Return recent open-interest points ``[{t, oi, oi_value}]`` (t in ns)."""
+async def fetch_oi_hist(
+    symbol: str,
+    period: str = "5m",
+    limit: int = 48,
+    *,
+    request_context: Any | None = None,
+) -> list[dict]:
+    """Return recent open-interest points ``[{t, oi, oi_value}]`` (t in ns).
+
+    R03: ``oi`` stays a base-asset quantity, ``oi_value`` stays the quote
+    nominal (the only USD-approximable leg, via :func:`resolve_oi_value_usd`
+    with its ``oi_value_source`` retained). Both time (``t``/``source_as_of``)
+    and the dollar source are preserved; unit mismatches stay
+    ``OI_UNIT_UNVERIFIED`` (never a quantity-as-USD). Accepts keyword
+    ``request_context`` (no duplicate budgeting here).
+    """
+    _ = request_context  # R03 API uniformity; OI transport charges via its own limiter
     if period not in OI_PERIODS:
         period = "5m"
     now_ms = int(time.time() * 1000)

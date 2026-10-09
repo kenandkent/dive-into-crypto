@@ -13,6 +13,12 @@ degenerate numbers.
 
 Panel-only by design: served by ``GET /api/symbol/{symbol}``, never attached to
 scan rows (a full scan must not multiply depth calls). Cached 10 seconds.
+
+R03 (D04.3/D18.2): raw book sides are retained separately (bids vs asks) so
+R06a/R06b/R11a/R11b can compute per-side contract VWAP + coverage (never a
+merged total alone). ``fetch_book_observed`` wraps the verbatim sides + panel
+as an ``Observed`` with its receipt; legacy :func:`snapshot` keeps its exact
+return shape (``to_legacy`` compatible).
 """
 
 from __future__ import annotations
@@ -22,6 +28,17 @@ import time
 from typing import Any
 
 from diveintocrypto_desktop.data.http import FAPI_V1, get_json
+from diveintocrypto_desktop.shortlab import observations as _obs
+
+try:  # pragma: no cover - import guard
+    from diveintocrypto_desktop.shortlab.request_budget import (
+        RequestContext,
+        get_current_request_context,
+    )
+except Exception:  # pragma: no cover
+    RequestContext = Any  # type: ignore[assignment,misc]
+    def get_current_request_context():  # type: ignore[no-redef]
+        return None
 
 logger = logging.getLogger("trading_bot.data.orderbook")
 
@@ -38,9 +55,36 @@ def reset_cache() -> None:
     _cache.clear()
 
 
-async def fetch_depth(symbol: str, limit: int = DEPTH_LIMIT) -> dict:
-    """Raw depth payload ``{bids: [[p, q]…], asks: [[p, q]…]}``."""
-    return await get_json(f"{FAPI_V1}/depth", {"symbol": symbol, "limit": limit})
+async def _budgeted_get_json(url: str, params: dict[str, Any] | None, ctx: Any | None) -> Any:
+    """GET preserving legacy 2-arg fakes (R03). Only forwards the keyword on
+    the budgeted path; the HTTP layer charges once (no duplicate budgeting)."""
+    if ctx is not None and getattr(ctx, "budget", None) is not None:
+        return await get_json(url, params, request_context=ctx)
+    if params is None:
+        return await get_json(url)
+    return await get_json(url, params)
+
+
+def _resolve_book_context(request_context: Any | None) -> Any | None:
+    if request_context is not None:
+        return request_context
+    try:
+        return get_current_request_context()
+    except Exception:
+        return None
+
+
+async def fetch_depth(
+    symbol: str, limit: int = DEPTH_LIMIT, *, request_context: Any | None = None
+) -> dict:
+    """Raw depth payload ``{bids: [[p, q]…], asks: [[p, q]…]}`` (sides verbatim).
+
+    R03: accepts keyword ``request_context`` forwarded to the shared HTTP
+    layer (``futuresDepth`` family per D19.3; existing families untouched, no
+    duplicate charge here).
+    """
+    ctx = _resolve_book_context(request_context)
+    return await _budgeted_get_json(f"{FAPI_V1}/depth", {"symbol": symbol, "limit": limit}, ctx)
 
 
 def parse_levels(rows: Any) -> list[tuple[float, float]]:
@@ -129,17 +173,22 @@ def book_depth_min_1pct(panel: dict) -> float | None:
         return None
 
 
-async def snapshot(symbol: str) -> dict:
+async def snapshot(symbol: str, *, request_context: Any | None = None) -> dict:
     """Cached ``book`` block (10s TTL on SUCCESS only); ``{"unavailable": reason}``
     on failure. Errors are never cached — a failed fetch is re-attempted on the
     next call instead of serving the stale failure for the TTL window.
+    R03: accepts keyword ``request_context`` (forwarded; legacy callers omit it).
     """
     now = time.monotonic()
     cached = _cache.get(symbol)
     if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
     try:
-        raw = await fetch_depth(symbol)
+        ctx = _resolve_book_context(request_context)
+        if ctx is None:
+            raw = await fetch_depth(symbol)
+        else:
+            raw = await fetch_depth(symbol, request_context=ctx)
         panel = book_panel(parse_levels(raw.get("bids")), parse_levels(raw.get("asks")))
     except Exception as e:
         logger.warning("orderbook: %s fetch failed — %s", symbol, str(e)[:80])
@@ -148,3 +197,72 @@ async def snapshot(symbol: str) -> dict:
         return panel  # never cached — re-attempted on the next call
     _cache[symbol] = (time.monotonic(), panel)
     return panel
+
+
+_BOOK_SOURCE = "binance-futures-book"
+
+
+async def fetch_book_observed(
+    symbol: str,
+    limit: int = DEPTH_LIMIT,
+    *,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+    request_context: Any | None = None,
+) -> _obs.Observed[dict]:
+    """Raw book sides + panel wrapped as an ``Observed`` (R03/D18.2).
+
+    ``value`` retains both sides separately -- ``{"symbol", "bids", "asks",
+    "panel"}`` where ``bids``/``asks`` are the verbatim ``[[price, qty]]``
+    string pairs from ``/fapi/v1/depth`` (never merged into a single total),
+    and ``panel`` is the legacy :func:`book_panel` block. ``meta.source_as_of``
+    is the panel ``ts`` (``None`` when unavailable); ``known_at`` is the
+    completion time. Cache is not used here (every call is a fresh receipt);
+    :func:`snapshot` keeps its 10s panel cache.
+    """
+    ctx = _resolve_book_context(request_context)
+    try:
+        if ctx is None:
+            raw = await fetch_depth(symbol, limit)
+        else:
+            raw = await fetch_depth(symbol, limit, request_context=ctx)
+    except Exception as exc:
+        completed_err = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        unavailable = {"unavailable": str(exc)[:120], "symbol": symbol, "bids": [], "asks": []}
+        return _obs.make_observation(
+            unavailable,
+            source=_BOOK_SOURCE,
+            source_as_of_ms=None,
+            fetched_at_ms=completed_err,
+            known_at_ms=completed_err,
+            status="UNAVAILABLE",
+            reason_code=str(getattr(exc, "reason_code", "BOOK_UNAVAILABLE") or "BOOK_UNAVAILABLE"),
+            identity_snapshot_id=identity_snapshot_id,
+        )
+    bids_raw = raw.get("bids") if isinstance(raw, dict) else []
+    asks_raw = raw.get("asks") if isinstance(raw, dict) else []
+    panel = book_panel(parse_levels(bids_raw), parse_levels(asks_raw), now_ms=now_ms)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    source_as_of = panel.get("ts") if isinstance(panel, dict) else None
+    try:
+        source_as_of = int(source_as_of) if source_as_of is not None else completed
+    except (TypeError, ValueError):
+        source_as_of = completed
+    value = {
+        "symbol": symbol,
+        "bids": list(bids_raw) if isinstance(bids_raw, list) else [],
+        "asks": list(asks_raw) if isinstance(asks_raw, list) else [],
+        "panel": dict(panel) if isinstance(panel, dict) else panel,
+    }
+    status = "OK" if isinstance(panel, dict) and "unavailable" not in panel else "UNAVAILABLE"
+    return _obs.make_observation(
+        value,
+        source=_BOOK_SOURCE,
+        source_as_of_ms=source_as_of,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        status=status,
+        reason_code=None if status == "OK" else panel.get("unavailable") if isinstance(panel, dict) else "BOOK_UNAVAILABLE",
+        units=_obs.ObservationUnits(quote_asset="USDT"),
+        identity_snapshot_id=identity_snapshot_id,
+    )

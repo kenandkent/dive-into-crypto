@@ -22,6 +22,19 @@ from typing import Any
 from diveintocrypto_desktop.data.http import FAPI_V1, LoopBoundLock, get_json
 from diveintocrypto_desktop.shortlab import observations as _obs
 
+# R03: additive request-context passthrough (D19). Legacy fakes patch
+# ``universe.get_json`` as ``fake(url, params=None)`` without the keyword, so
+# the keyword is only forwarded on the budgeted path (mirrors funding).
+try:  # pragma: no cover - import guard for offline tooling
+    from diveintocrypto_desktop.shortlab.request_budget import (
+        RequestContext,
+        get_current_request_context,
+    )
+except Exception:  # pragma: no cover
+    RequestContext = Any  # type: ignore[assignment,misc]
+    def get_current_request_context():  # type: ignore[no-redef]
+        return None
+
 # Stablecoin / fiat bases excluded from the scan (no directional edge).
 _SKIP_BASES = {"USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "EUR", "GBP", "USTC"}
 
@@ -269,7 +282,67 @@ def reset_universe_cache() -> None:
     reset_contract_metadata()
 
 
-async def perp_symbols() -> dict[str, dict[str, Any]]:
+async def _budgeted_get_json(
+    url: str, params: dict[str, Any] | None, ctx: Any | None
+) -> Any:
+    """Call ``get_json`` preserving legacy fake signatures (R03 compat).
+
+    Legacy test doubles patch ``universe.get_json`` as
+    ``fake(url, params=None)`` without the additive ``request_context`` kwarg.
+    Only pass the kwarg when a real budget is present; otherwise use the exact
+    legacy call shape. The context (incl. future job_id/deadline_ms) is
+    forwarded verbatim to the HTTP layer -- never re-charged here.
+    """
+    if ctx is not None and getattr(ctx, "budget", None) is not None:
+        return await get_json(url, params, request_context=ctx)
+    if params is None:
+        return await get_json(url)
+    return await get_json(url, params)
+
+
+def _resolve_universe_context(request_context: Any | None) -> Any | None:
+    if request_context is not None:
+        return request_context
+    try:
+        return get_current_request_context()
+    except Exception:
+        return None
+
+
+def _ticker_close_time_ms(ticker: Any) -> int | None:
+    """Source ``closeTime`` of one ``ticker/24hr`` row (R03/D04.3).
+
+    ``None`` when absent/invalid -- never the local clock.
+    """
+    if not isinstance(ticker, dict):
+        return None
+    for key in ("closeTime", "close_time", "close_time_ms"):
+        raw = ticker.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _universe_source_as_of(tickers: Any) -> int | None:
+    """Max retained ``closeTime`` across tickers (receipt source time)."""
+    best: int | None = None
+    if isinstance(tickers, (list, tuple)):
+        for t in tickers:
+            ms = _ticker_close_time_ms(t)
+            if ms is not None and (best is None or ms > best):
+                best = ms
+    return best
+
+
+async def perp_symbols(
+    *, request_context: Any | None = None
+) -> dict[str, dict[str, Any]]:
     """Tradable USDT perps ``{symbol: {base, quote}}`` (30s TTL cache)."""
     global _perps, _perps_ts
     now = time.monotonic()
@@ -277,12 +350,14 @@ async def perp_symbols() -> dict[str, dict[str, Any]]:
         async with _cache_lock:
             now = time.monotonic()
             if _perps is None or now - _perps_ts >= _UNIVERSE_TTL:
-                _perps = await _perp_symbols()
+                _perps = await _perp_symbols(request_context=request_context)
                 _perps_ts = now
     return _perps or {}
 
 
-async def all_tickers() -> list[dict]:
+async def all_tickers(
+    *, request_context: Any | None = None
+) -> list[dict]:
     """RAW ``ticker/24hr`` payload (30s TTL cache, shared with the universe)."""
     global _raw_tickers, _raw_tickers_ts
     now = time.monotonic()
@@ -290,13 +365,17 @@ async def all_tickers() -> list[dict]:
         async with _cache_lock:
             now = time.monotonic()
             if _raw_tickers is None or now - _raw_tickers_ts >= _UNIVERSE_TTL:
-                _raw_tickers = await get_json(f"{FAPI_V1}/ticker/24hr")
+                ctx = _resolve_universe_context(request_context)
+                _raw_tickers = await _budgeted_get_json(f"{FAPI_V1}/ticker/24hr", None, ctx)
                 _raw_tickers_ts = now
     return _raw_tickers or []
 
 
-async def _perp_symbols() -> dict[str, dict[str, Any]]:
-    info: dict[str, Any] = await get_json(f"{FAPI_V1}/exchangeInfo")
+async def _perp_symbols(
+    *, request_context: Any | None = None
+) -> dict[str, dict[str, Any]]:
+    ctx = _resolve_universe_context(request_context)
+    info: dict[str, Any] = await _budgeted_get_json(f"{FAPI_V1}/exchangeInfo", None, ctx)
     raw = info.get("symbols") or []
     # Retain FULL lifecycle metadata (all statuses/contract types) before the
     # TRADING-perp filter below narrows the scannable universe.
@@ -313,11 +392,16 @@ async def _perp_symbols() -> dict[str, dict[str, Any]]:
     return out
 
 
-async def _fetch_universe() -> list[dict]:
-    perps, tickers = await asyncio.gather(
-        _perp_symbols(),
-        get_json(f"{FAPI_V1}/ticker/24hr"),
-    )
+async def _fetch_universe(
+    *, request_context: Any | None = None
+) -> list[dict]:
+    ctx = _resolve_universe_context(request_context)
+    # Forward the same context to both legs; the HTTP layer charges once per
+    # real send (no duplicate budgeting here). Legacy fakes without the kwarg
+    # are preserved via _budgeted_get_json.
+    perps_coro = _perp_symbols(request_context=ctx)
+    ticker_coro = _budgeted_get_json(f"{FAPI_V1}/ticker/24hr", None, ctx)
+    perps, tickers = await asyncio.gather(perps_coro, ticker_coro)
     # stash the raw payload + perp map for dependent surfaces (0 extra calls)
     global _raw_tickers, _raw_tickers_ts, _perps, _perps_ts
     _raw_tickers, _raw_tickers_ts = tickers, time.monotonic()
@@ -325,9 +409,14 @@ async def _fetch_universe() -> list[dict]:
 
     rows: list[dict] = []
     for t in tickers:
+        if not isinstance(t, dict):
+            continue
         sym = t.get("symbol")
         if sym not in perps:
             continue
+        # R03/D04.3: retain source closeTime per ticker (receipt source time).
+        # Legacy keys unchanged; closeTime is additive for to_legacy compat.
+        close_ms = _ticker_close_time_ms(t)
         rows.append(
             {
                 "s": sym,
@@ -335,17 +424,23 @@ async def _fetch_universe() -> list[dict]:
                 "price": float(t["lastPrice"]),
                 "ch": float(t["priceChangePercent"]),
                 "quote_volume": float(t["quoteVolume"]),
+                "closeTime": close_ms,
             }
         )
     rows.sort(key=lambda r: r["quote_volume"], reverse=True)
     return rows
 
 
-async def list_universe(limit: int | None = None) -> list[dict]:
+async def list_universe(
+    limit: int | None = None, *, request_context: Any | None = None
+) -> list[dict]:
     """Return ``[{symbol, name, price, ch, quote_volume}]`` sorted by 24h quote
     volume (desc), served from a 30s TTL cache. ``name`` falls back to the base
     asset. Errors are never cached — a failed refresh propagates and the next
     call retries.
+
+    R03: rows additionally carry source ``closeTime`` (additive); legacy
+    callers ignore it via :func:`to_legacy` compat.
     """
     global _cache, _cache_ts
     now = time.monotonic()
@@ -353,7 +448,12 @@ async def list_universe(limit: int | None = None) -> list[dict]:
         async with _cache_lock:
             now = time.monotonic()
             if _cache is None or now - _cache_ts >= _UNIVERSE_TTL:
-                _cache = await _fetch_universe()  # raises propagate; cache untouched
+                # Only forward the context when explicitly provided; legacy
+                # callers (and their _fetch_universe mocks) keep the old shape.
+                if request_context is None:
+                    _cache = await _fetch_universe()  # raises propagate; cache untouched
+                else:
+                    _cache = await _fetch_universe(request_context=request_context)
                 _cache_ts = now
     rows = _cache or []
     return rows[:limit] if limit else rows
@@ -411,12 +511,15 @@ async def fetch_exchange_info_observed(
     *,
     now_ms: int | None = None,
     identity_snapshot_id: str | None = None,
+    request_context: Any | None = None,
 ) -> _obs.Observed[dict]:
     """Raw ``exchangeInfo`` payload wrapped as an ``Observed`` (F02/B16.1).
 
     ``value`` is the verbatim payload (original per-symbol ``filters`` and
     ``serverTime`` preserved); ``meta.source_as_of_ms`` is ``serverTime``
     (``None`` when the venue omits it -- never the local clock).
+    R03: accepts keyword ``request_context`` forwarded to the HTTP layer
+    (no duplicate budgeting here).
     """
     global _exchange_info_observed, _exchange_info_observed_mono
     now_mono = time.monotonic()
@@ -432,7 +535,8 @@ async def fetch_exchange_info_observed(
             and now_mono - _exchange_info_observed_mono < _EXCHANGE_INFO_OBSERVED_TTL
         ):
             return _exchange_info_observed
-        payload: dict[str, Any] = await get_json(f"{FAPI_V1}/exchangeInfo")
+        ctx = _resolve_universe_context(request_context)
+        payload: dict[str, Any] = await _budgeted_get_json(f"{FAPI_V1}/exchangeInfo", None, ctx)
         completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
         raw_symbols = payload.get("symbols") or []
         update_contract_metadata(raw_symbols, completed)
@@ -456,12 +560,16 @@ async def fetch_universe_observed(
     as_of_ms: int | None = None,
     now_ms: int | None = None,
     identity_snapshot_id: str | None = None,
+    request_context: Any | None = None,
 ) -> _obs.Observed[list[dict]]:
-    """Ranked universe rows wrapped as an ``Observed`` (F02).
+    """Ranked universe rows wrapped as an ``Observed`` (F02/R03).
 
     Mirrors the 30s legacy TTL: a cache hit returns the identical
     ``Observed`` with its original ``known_at_ms``. ``as_of_ms`` is
     accepted for the downstream cutoff check only.
+    R03/D04.3: each row retains source ``closeTime``; ``meta.source_as_of_ms``
+    is the max retained ``closeTime`` (``None`` when the venue omits it).
+    ``value`` via :func:`to_legacy` stays API-compatible.
     """
     _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
     global _universe_observed, _universe_observed_mono
@@ -478,12 +586,20 @@ async def fetch_universe_observed(
             and now_mono - _universe_observed_mono < _UNIVERSE_TTL
         ):
             return _slice_universe_observed(_universe_observed, limit)
-        rows = await _fetch_universe()  # raises propagate; observed cache untouched
+        ctx = _resolve_universe_context(request_context)
+        if ctx is None:
+            rows = await _fetch_universe()  # raises propagate; observed cache untouched
+        else:
+            rows = await _fetch_universe(request_context=ctx)
         completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        # R03: retain per-ticker closeTime as the source time (receipt).
+        source_as_of = _universe_source_as_of(rows)
+        if source_as_of is None and _raw_tickers:
+            source_as_of = _universe_source_as_of(_raw_tickers)
         _universe_observed = _obs.make_observation(
             rows,
             source=_UNIVERSE_SOURCE,
-            source_as_of_ms=None,
+            source_as_of_ms=source_as_of,
             fetched_at_ms=completed,
             known_at_ms=completed,
             units=_obs.ObservationUnits(quote_asset="USDT"),

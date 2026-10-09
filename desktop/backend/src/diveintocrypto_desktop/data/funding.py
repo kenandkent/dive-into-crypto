@@ -430,13 +430,22 @@ async def fetch_funding_history_observed(
     as_of_ms: int | None = None,
     now_ms: int | None = None,
     identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
 ) -> _obs.Observed[list[dict]]:
-    """Settled funding events wrapped as an ``Observed`` (F02).
+    """Settled funding events wrapped as an ``Observed`` (F02/R03).
 
     ``as_of_ms`` is the decision cutoff the caller validates against via
     ``validate_observation``; it is not used to trim the window here.
+    R03: ``request_context`` is forwarded to the paged range reader (single
+    budget path in ``data/http.py``; no duplicate charge here). The raw
+    observation writes its receipt (``known_at``/``source_as_of``); rereading
+    the associated record must restore the identical receipt (see
+    ``shortlab.observations`` bridge). A complete archive is never patched
+    with "now fetched".
     """
-    events = await funding_history_range(symbol, start_ms, end_ms, limit=limit)
+    events = await funding_history_range(
+        symbol, start_ms, end_ms, limit=limit, request_context=request_context
+    )
     completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     cov = funding_coverage(events, start_ms, end_ms)
     source_as_of = cov.last_event_ms
@@ -463,14 +472,16 @@ async def fetch_premium_index_observed(
     as_of_ms: int | None = None,
     now_ms: int | None = None,
     identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
 ) -> _obs.Observed[dict]:
-    """Current premium-index row wrapped as an ``Observed`` (F02).
+    """Current premium-index row wrapped as an ``Observed`` (F02/R03).
 
     ``meta.source_as_of_ms`` is the exchange ``time`` field (``None`` when
     absent -- never the local clock); ``known_at_ms`` is the completion time.
+    R03: ``request_context`` forwarded to the HTTP layer (no duplicate charge).
     """
     _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
-    row = await premium_index(symbol)
+    row = await premium_index(symbol, request_context=request_context)
     completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     return _obs.make_observation(
         row,
@@ -480,3 +491,178 @@ async def fetch_premium_index_observed(
         known_at_ms=completed,
         identity_snapshot_id=identity_snapshot_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# R03 fundingInfo -> FundingScheduleSegment (D05.1/D18.2).
+#
+# ``/fapi/v1/fundingInfo`` returns ONLY symbols with an adjusted settlement
+# regime (adjustedFundingRateCap/Floor + fundingIntervalHours). A missing
+# symbol proves nothing about its history -- it must NOT be inferred as 8h,
+# and the current observation's effective_from is the observation boundary
+# itself (never extended into unverified history). Without a verifiable old
+# regime archive the caller reports HISTORY_BOOTSTRAPPING (history shown, no
+# complete entry Gate). Only CONFIRMED segments may grant complete coverage
+# (R05 consumes them via RepairPorts).
+#
+# Family: ``fundingInfo`` (D19.3 local weight 5, shares the Funding 80/300s
+# window). Existing ``fundingRate`` family/weights are untouched.
+# ---------------------------------------------------------------------------
+
+_FUNDING_INFO_SOURCE = "binance-futures-fundingInfo"
+_FUNDING_INFO_FAMILY = "fundingInfo"
+
+#: R03 archive reason when no verifiable old-regime schedule exists.
+HISTORY_BOOTSTRAPPING = "HISTORY_BOOTSTRAPPING"
+#: R03 schedule-unknown reason (no CONFIRMED segment covers the window).
+FUNDING_SCHEDULE_UNKNOWN = "FUNDING_SCHEDULE_UNKNOWN"
+#: Legacy funding observation without a receipt.
+FUNDING_LEGACY_UNVERIFIED = "UNVERIFIED"
+
+
+def history_bootstrapping_reasons(has_archive: bool) -> tuple[str, ...]:
+    """``(HISTORY_BOOTSTRAPPING,)`` when no verifiable old archive exists."""
+    if has_archive:
+        return ()
+    return (HISTORY_BOOTSTRAPPING,)
+
+
+def _funding_info_interval_hours(row: Any) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    for key in ("fundingIntervalHours", "fundingInterval", "intervalHours"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+async def fetch_funding_info(
+    *, request_context: RequestContext | None = None
+) -> list[dict]:
+    """Raw ``/fapi/v1/fundingInfo`` rows (adjusted symbols only).
+
+    R03: accepts keyword ``request_context`` forwarded to the shared HTTP
+    layer (single charge there; no duplicate budgeting here). Pagination is
+    not required (single document); 429/5xx retries honour ``Retry-After``
+    via ``data/http.py``.
+    """
+    ctx = request_context if request_context is not None else get_current_request_context()
+    rows: Any = await _budgeted_get_json(f"{FAPI_V1}/fundingInfo", None, ctx)
+    if rows is None:
+        return []
+    if isinstance(rows, dict):
+        # Some mirrors wrap the list; keep the raw rows verbatim.
+        for key in ("data", "rows", "symbols"):
+            if isinstance(rows.get(key), list):
+                rows = rows[key]
+                break
+        else:
+            return [rows]
+    return list(rows) if isinstance(rows, list) else []
+
+
+async def fetch_funding_info_observed(
+    *,
+    as_of_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
+) -> _obs.Observed[list[dict]]:
+    """Current ``fundingInfo`` document wrapped as an ``Observed`` (R03).
+
+    ``fundingInfo`` carries no source time, so ``meta.source_as_of_ms`` stays
+    ``None`` (never the local clock); ``known_at`` is the completion time.
+    ``value`` is the verbatim row list (adjusted symbols only).
+    """
+    _ = as_of_ms
+    rows = await fetch_funding_info(request_context=request_context)
+    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    return _obs.make_observation(
+        rows,
+        source=_FUNDING_INFO_SOURCE,
+        source_as_of_ms=None,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+        identity_snapshot_id=identity_snapshot_id,
+    )
+
+
+def funding_info_to_schedule_segments(
+    info_rows: Any,
+    *,
+    observed_at_ms: int,
+    known_at_ms: int,
+    source: str = _FUNDING_INFO_SOURCE,
+    evidence_ref_prefix: str = "fundingInfo",
+) -> tuple[Any, ...]:
+    """Build ``FundingScheduleSegment``s from a ``fundingInfo`` snapshot.
+
+    Each adjusted symbol yields one segment with ``effective_from_ms`` set to
+    the observation boundary (``observed_at_ms``) -- never extended into
+    unverified history -- and ``effective_to_ms=None``. ``anchor_ms`` mirrors
+    the boundary; ``verification`` is ``CONFIRMED`` for rows with an explicit
+    positive ``fundingIntervalHours``, else ``UNKNOWN``. Symbols absent from
+    the snapshot yield no segment (callers report ``HISTORY_BOOTSTRAPPING`` /
+    ``FUNDING_SCHEDULE_UNKNOWN`` instead of inferring 8h).
+    """
+    try:
+        from diveintocrypto_desktop.shortlab.repair_contracts import (
+            FundingScheduleSegment,
+        )
+    except Exception:  # pragma: no cover - contract import guard
+        FundingScheduleSegment = None  # type: ignore[assignment]
+
+    observed = int(observed_at_ms)
+    known = int(known_at_ms)
+    segments: list[Any] = []
+    rows = list(info_rows) if isinstance(info_rows, (list, tuple)) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            continue
+        interval = _funding_info_interval_hours(row)
+        verification = "CONFIRMED" if interval is not None else "UNKNOWN"
+        if interval is None:
+            interval = 8
+        schedule_id = f"{symbol}:{observed}:{interval}"
+        evidence_ref = f"{evidence_ref_prefix}:{symbol}:{known}"
+        if FundingScheduleSegment is None:  # fallback dict shape
+            segments.append(
+                {
+                    "schedule_id": schedule_id,
+                    "symbol": symbol,
+                    "effective_from_ms": observed,
+                    "effective_to_ms": None,
+                    "interval_hours": interval,
+                    "anchor_ms": observed,
+                    "known_at_ms": known,
+                    "source": source,
+                    "evidence_ref": evidence_ref,
+                    "verification": verification,
+                }
+            )
+        else:
+            segments.append(
+                FundingScheduleSegment(
+                    schedule_id=schedule_id,
+                    symbol=symbol,
+                    effective_from_ms=observed,
+                    effective_to_ms=None,
+                    interval_hours=interval,
+                    anchor_ms=observed,
+                    known_at_ms=known,
+                    source=source,
+                    evidence_ref=evidence_ref,
+                    verification=verification,
+                )
+            )
+    return tuple(segments)

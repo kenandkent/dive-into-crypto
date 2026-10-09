@@ -581,9 +581,17 @@ async def spot_history(
         try:
             from diveintocrypto_desktop.data import binance_klines as futures_klines
 
-            candles = await futures_klines.fetch_klines(
-                futures_symbol, "1d", limit=SPOT_DAILY_LIMIT, end_ms=window_end
-            )
+            # R03: forward the caller's request_context to the futures daily leg
+            # (tolerates legacy fakes without the keyword).
+            try:
+                candles = await futures_klines.fetch_klines(
+                    futures_symbol, "1d", limit=SPOT_DAILY_LIMIT, end_ms=window_end,
+                    request_context=request_context,
+                )
+            except TypeError:
+                candles = await futures_klines.fetch_klines(
+                    futures_symbol, "1d", limit=SPOT_DAILY_LIMIT, end_ms=window_end
+                )
             for c in candles or []:
                 try:
                     open_ms = int(c["t"]) // 1_000_000

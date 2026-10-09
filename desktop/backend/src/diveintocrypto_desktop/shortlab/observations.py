@@ -20,12 +20,21 @@ Design A4.1/A4.2/A4.3, B16.1; plan F02 (AC02/AC03). This module owns
   missing day is never zero-filled). OI-window ends must agree with the
   price window within one 5-minute period (``WINDOW_MISALIGNED``).
 
+R03 (D03.2/D05.1/D18.2): receipt persistence bridge. ``observation_to_record``
+writes the raw compatible value + full ``observations-v1`` meta (+
+``repair-contract-v1`` marker) without restamping; ``observation_from_record``
+restores the identical receipt (never "now fetched"). A legacy record without
+a receipt (``known_at_ms`` None) is restored with ``reason_code=UNVERIFIED``
+and can never prove freshness via :func:`validate_observation`.
+
 Record dataclasses stay frozen in ``repository.py``; this module adds no
 storage types.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Generic, TypeVar
@@ -42,6 +51,37 @@ CLOCK_SKEW = "CLOCK_SKEW"
 LEGACY_PROVENANCE_UNKNOWN = "LEGACY_PROVENANCE_UNKNOWN"
 UNIT_UNKNOWN = "UNIT_UNKNOWN"
 WINDOW_MISALIGNED = "WINDOW_MISALIGNED"
+
+#: R03 (D03.2/D05.1/D18.2): receipt / archive reason codes.
+#: ``UNVERIFIED`` marks a legacy record without a receipt (no known_at);
+#: ``RECEIPT_ONLY`` marks an observation whose source carries no time (usable
+#: only where explicitly allowed, never as realtime market time);
+#: ``HISTORY_BOOTSTRAPPING`` marks a window without a verifiable old-regime
+#: archive (history shown, no complete entry Gate).
+UNVERIFIED = "UNVERIFIED"
+RECEIPT_ONLY = "RECEIPT_ONLY"
+HISTORY_BOOTSTRAPPING = "HISTORY_BOOTSTRAPPING"
+FUNDING_SCHEDULE_UNKNOWN = "FUNDING_SCHEDULE_UNKNOWN"
+
+#: Repair schema marker stamped on persisted market records (D18.2).
+REPAIR_SCHEMA_VERSION = "repair-contract-v1"
+
+#: Market observation kinds persisted via :func:`observation_to_record`
+#: (D18.2 value_json/meta_json contract).
+MARKET_OBSERVATION_KINDS = frozenset(
+    {
+        "TICKER",
+        "MARK",
+        "MARK_BAR_1H",
+        "OI",
+        "BOOK",
+        "RULES",
+        "FUNDING_INFO",
+        "ACTIVATION_CHECK",
+        "EVENT_FX",
+        "BUDGET_COUNTER",
+    }
+)
 
 #: OI-window / price-window agreement tolerance (one 5m period, A5.1/F02.1).
 OI_PRICE_SYNC_TOLERANCE_MS = 5 * 60 * 1000
@@ -316,3 +356,195 @@ def make_observation(
             raw_snapshot_id=raw_snapshot_id,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# R03 receipt persistence bridge (D03.2/D18.2).
+#
+# ``value_json`` is the original compatible value (never a re-parsed copy);
+# ``meta_json`` is the full ``observations-v1`` meta plus
+# ``repair_schema_version=repair-contract-v1``. Restart restores the identical
+# receipt (``known_at``/``source_as_of``/``fetched_at``); a complete archive is
+# never patched with "now fetched". A legacy record without a receipt keeps
+# ``known_at_ms=None`` and is explicitly marked ``reason_code=UNVERIFIED``.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    try:
+        text = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        text = json.dumps(str(value), ensure_ascii=False, allow_nan=False)
+    return text.encode("utf-8")
+
+
+def _meta_to_dict(meta: ObservationMeta) -> dict[str, Any]:
+    units = meta.units
+    if isinstance(units, ObservationUnits):
+        units_dict: dict[str, Any] | None = {
+            "price_unit": units.price_unit,
+            "qty_unit": units.qty_unit,
+            "quote_asset": units.quote_asset,
+            "fx_source": units.fx_source,
+            "multiplier_source": units.multiplier_source,
+        }
+    elif isinstance(units, dict):
+        units_dict = dict(units)
+    else:
+        units_dict = None
+    return {
+        "status": meta.status,
+        "source": meta.source,
+        "source_schema_version": meta.source_schema_version,
+        "reason_code": meta.reason_code,
+        "source_as_of_ms": meta.source_as_of_ms,
+        "fetched_at_ms": meta.fetched_at_ms,
+        "known_at_ms": meta.known_at_ms,
+        "window_start_ms": meta.window_start_ms,
+        "window_end_ms": meta.window_end_ms,
+        "complete": meta.complete,
+        "coverage_fraction": meta.coverage_fraction,
+        "units": units_dict,
+        "identity_snapshot_id": meta.identity_snapshot_id,
+        "raw_snapshot_id": meta.raw_snapshot_id,
+        "repair_schema_version": REPAIR_SCHEMA_VERSION,
+    }
+
+
+def _meta_from_dict(data: Any) -> ObservationMeta:
+    if not isinstance(data, dict):
+        data = {}
+    units_raw = data.get("units")
+    units: ObservationUnits | None = None
+    if isinstance(units_raw, dict):
+        try:
+            units = ObservationUnits(
+                price_unit=units_raw.get("price_unit"),
+                qty_unit=units_raw.get("qty_unit"),
+                quote_asset=units_raw.get("quote_asset"),
+                fx_source=units_raw.get("fx_source"),
+                multiplier_source=units_raw.get("multiplier_source"),
+            )
+        except Exception:
+            units = None
+    status = data.get("status", "OK")
+    if status not in _OK_STATUSES:
+        status = "OK"
+    return ObservationMeta(
+        status=status,
+        source=str(data.get("source", "")),
+        source_schema_version=data.get("source_schema_version", OBSERVATION_SCHEMA_VERSION),
+        reason_code=data.get("reason_code"),
+        source_as_of_ms=data.get("source_as_of_ms"),
+        fetched_at_ms=data.get("fetched_at_ms"),
+        known_at_ms=data.get("known_at_ms"),
+        window_start_ms=data.get("window_start_ms"),
+        window_end_ms=data.get("window_end_ms"),
+        complete=data.get("complete"),
+        coverage_fraction=data.get("coverage_fraction"),
+        units=units,
+        identity_snapshot_id=data.get("identity_snapshot_id"),
+        raw_snapshot_id=data.get("raw_snapshot_id"),
+    )
+
+
+def observation_to_record(
+    observed: Observed[Any],
+    *,
+    kind: str,
+    symbol: str,
+    observation_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist an ``Observed`` without restamping its receipt (R03/D18.2).
+
+    ``value_json`` keeps the original compatible value; ``meta_json`` keeps
+    the full ``observations-v1`` envelope plus ``repair_schema_version``.
+    ``raw_sha256`` is the canonical-JSON SHA256 of the value (content
+    integrity, not an exchange signature).
+    """
+    meta = observed.meta
+    value = observed.value
+    raw_sha256 = hashlib.sha256(_canonical_bytes(value)).hexdigest()
+    known = meta.known_at_ms
+    source_as_of = meta.source_as_of_ms
+    if observation_id is None:
+        observation_id = f"{symbol}:{kind}:{known}:{source_as_of}"
+    return {
+        "observation_id": str(observation_id),
+        "symbol": str(symbol),
+        "kind": str(kind),
+        "source_as_of_ms": source_as_of,
+        "known_at_ms": known,
+        "value_json": value,
+        "meta_json": _meta_to_dict(meta),
+        "raw_sha256": raw_sha256,
+    }
+
+
+def observation_from_record(record: Any) -> Observed[Any]:
+    """Restore an ``Observed`` with its original receipt (R03/D03.2).
+
+    The stored ``known_at``/``source_as_of``/``fetched_at`` are returned
+    verbatim -- never replaced with the restore (now) time. A legacy record
+    without a receipt (``known_at_ms`` None) is marked
+    ``reason_code=UNVERIFIED`` instead of being silently trusted.
+    """
+    if not isinstance(record, dict):
+        raise ValueError("observation record must be a mapping")
+    value = record.get("value_json", record.get("value"))
+    meta_json = record.get("meta_json", {})
+    if not isinstance(meta_json, dict):
+        meta_json = {}
+    # Top-level columns win when meta_json omits them (legacy rows).
+    for key in ("source_as_of_ms", "known_at_ms"):
+        if meta_json.get(key) is None and record.get(key) is not None:
+            meta_json = dict(meta_json)
+            meta_json[key] = record.get(key)
+    if meta_json.get("fetched_at_ms") is None and record.get("known_at_ms") is not None:
+        # Very old rows only carry known_at; fetched_at mirrors it (receipt).
+        meta_json = dict(meta_json)
+        meta_json["fetched_at_ms"] = record.get("known_at_ms")
+    meta = _meta_from_dict(meta_json)
+    if meta.known_at_ms is None and meta.reason_code is None:
+        # Legacy without receipt: explicit UNVERIFIED, never a fresh receipt.
+        try:
+            meta = ObservationMeta(
+                status=meta.status,
+                source=meta.source,
+                source_schema_version=meta.source_schema_version,
+                reason_code=UNVERIFIED,
+                source_as_of_ms=meta.source_as_of_ms,
+                fetched_at_ms=meta.fetched_at_ms,
+                known_at_ms=None,
+                window_start_ms=meta.window_start_ms,
+                window_end_ms=meta.window_end_ms,
+                complete=meta.complete,
+                coverage_fraction=meta.coverage_fraction,
+                units=meta.units,
+                identity_snapshot_id=meta.identity_snapshot_id,
+                raw_snapshot_id=meta.raw_snapshot_id,
+            )
+        except Exception:
+            pass
+    return Observed(value=value, meta=meta)
+
+
+def is_legacy_without_receipt(record_or_observed: Any) -> bool:
+    """True when a record/observation carries no receipt (``known_at`` None)."""
+    if isinstance(record_or_observed, Observed):
+        return record_or_observed.meta.known_at_ms is None
+    if isinstance(record_or_observed, dict):
+        if record_or_observed.get("known_at_ms") is not None:
+            return False
+        meta = record_or_observed.get("meta_json")
+        if isinstance(meta, dict) and meta.get("known_at_ms") is not None:
+            return False
+        return True
+    return False
