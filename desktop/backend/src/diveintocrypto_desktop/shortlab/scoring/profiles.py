@@ -33,6 +33,7 @@ _BASE_TO_FULL: dict[str, str] = {
 _VALID_MANUAL = frozenset(
     {
         "MEME",
+        "GENERAL",
         "LOW_FLOAT_VC",
         "GENERAL_ALT",
         "MEME_LITE",
@@ -174,8 +175,12 @@ def select_profile(
         )
 
     categories = _categories_of(fundamentals, identity)
-    fundamentals_present = fundamentals is not None
-    meme_hit = fundamentals_present and _is_meme(categories)
+    # R04/D04.2: verified Meme persists even when fundamentals/MC/ATH are
+    # temporarily missing -- missing data only changes DQ, never the class.
+    # A Meme mark from either side counts; when fundamentals are absent the
+    # identity side alone still preserves MEME (transient failure must not
+    # flip a verified Meme to GENERAL).
+    meme_hit = _is_meme(categories)
 
     float_ratio, fdv_mc = _fundamentals_numbers(fundamentals)
     low_float_hit = (

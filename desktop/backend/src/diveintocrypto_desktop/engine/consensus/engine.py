@@ -56,16 +56,35 @@ class ConsensusEngine:
         else:
             final_signal = Signal.NEUTRAL
 
-        # Step 4: Force NEUTRAL on high conflict
-        conflict_threshold = self.consensus_config.get("conflict_ratio_threshold", 0.6)
+        # Step 4: Force NEUTRAL on severe conflict (R04/D04.3).
+        # Threshold default 0.4, legal range (0, 0.5]; minority/(buy+sell).
+        # No bilateral votes => ratio 0; all missing (active 0) => UNKNOWN path
+        # (no forced neutral, confidence stays derived). Severe conflict keeps
+        # the true buy/sell counts for UI and forces confidence 0 below.
+        conflict_threshold = self.consensus_config.get("conflict_ratio_threshold", 0.4)
+        try:
+            conflict_threshold_f = float(conflict_threshold)
+        except (TypeError, ValueError):
+            raise ValueError(f"conflict_ratio_threshold must be a number, got {conflict_threshold!r}")
+        if not (0 < conflict_threshold_f <= 0.5):
+            raise ValueError(
+                f"conflict_ratio_threshold must be in (0, 0.5], got {conflict_threshold_f!r}"
+            )
         active = score_data.get("active_signals", 0)
+        severe_conflict = False
+        conflict_ratio: float | None = None
         if active > 0:
             minority = min(score_data["buy_count"], score_data["sell_count"])
-            if minority / active > conflict_threshold:
+            conflict_ratio = minority / active
+            if conflict_ratio >= conflict_threshold_f:
                 final_signal = Signal.NEUTRAL
+                severe_conflict = True
 
-        # Step 5: Calculate confidence (0-100)
-        confidence = self._calculate_confidence(score_data, risk_data)
+        # Step 5: Calculate confidence (0-100); severe conflict forces 0.
+        if severe_conflict:
+            confidence = 0
+        else:
+            confidence = self._calculate_confidence(score_data, risk_data)
 
         # Step 6: Determine if trading is advised
         should_trade = self._should_trade(final_signal, confidence, risk_data)
@@ -81,6 +100,9 @@ class ConsensusEngine:
             "should_trade": should_trade,
             "weighted_score": weighted_score,
             "reason": reason,
+            "conflict_ratio": conflict_ratio,
+            "severe_conflict": severe_conflict,
+            "conflict_threshold": conflict_threshold_f,
         }
 
         logger.info(
@@ -167,4 +189,17 @@ class ConsensusEngine:
         ]
         if risk_data["risk_factors"]:
             parts.append(f"Risks: {'; '.join(risk_data['risk_factors'][:3])}")
+        # R04: severe-conflict reason is preserved even though the direction
+        # is forced to NEUTRAL with 0 confidence (counts stay true above).
+        active = score_data.get("active_signals", 0)
+        if active > 0:
+            minority = min(score_data.get("buy_count", 0), score_data.get("sell_count", 0))
+            ratio = minority / active
+            threshold = self.consensus_config.get("conflict_ratio_threshold", 0.4)
+            try:
+                thr = float(threshold)
+            except (TypeError, ValueError):
+                thr = 0.4
+            if ratio >= thr:
+                parts.append(f"SevereConflict(ratio={ratio:.2f}>=thr={thr:.2f})")
         return " | ".join(parts)

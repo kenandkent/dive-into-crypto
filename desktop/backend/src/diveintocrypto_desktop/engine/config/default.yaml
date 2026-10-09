@@ -8,7 +8,7 @@
 # nothing in the scanner reads them; this service is a scanner, not a bot.
 consensus:
   buy_threshold: 0.4
-  conflict_ratio_threshold: 0.6
+  conflict_ratio_threshold: 0.4
   min_active_signals: 4
   sell_threshold: -0.4
   strong_buy_threshold: 1.2

@@ -745,16 +745,30 @@ def build_feature_inputs(
         else None
     )
 
-    # -- 7D package: one price move, one OI move, same cutoff ----------------
+    # -- 7D package: one price move, one OI move, same cutoff (R04/D04.3) --
+    # Price compares the last closed UTC day D vs D-7 close (7x24h, never
+    # expanded from D-7 open to 8D). OI compares the two corresponding close
+    # moments; each end looks back at most 5min for the nearest known sample
+    # (never future samples). Range is 7*DAY_MS; an 8D span is rejected.
     price_change_7d: float | None = None
     price_window_start: int | None = None
     price_window_end: int | None = None
     if len(closes) >= 8 and len(opens) >= 8:
         prev, last = closes[-8], closes[-1]
+        open_d7, open_d = opens[-8], opens[-1]
+        # Strict consecutive-day guard: D open minus D-7 open must be 7 days.
+        # Gappy/missing days never fabricate a 7D return; an 8D expansion
+        # (open D-7 to close D) is rejected by construction below.
         if prev is not None and last is not None and prev > 0:
-            price_change_7d = last / prev - 1.0
-            price_window_start = opens[-8]
-            price_window_end = opens[-1] + DAY_MS
+            try:
+                span_ok = (int(open_d) - int(open_d7)) == 7 * DAY_MS
+            except (TypeError, ValueError):
+                span_ok = False
+            if span_ok:
+                price_change_7d = last / prev - 1.0
+                # Close moments (not opens): 7x24h window.
+                price_window_start = int(open_d7) + DAY_MS
+                price_window_end = int(open_d) + DAY_MS
 
     oi_leg = legs["oi_history"]
     oi_points: list[tuple[int, float | None]] = []
@@ -765,52 +779,76 @@ def build_feature_inputs(
                 continue  # PIT: never score a point from after the cutoff
             oi_points.append((moment, _finite(_field(point, "oi_value", "oiValue"))))
     oi_points.sort(key=lambda item: item[0])
-    # The 7D OI leg shares the price window's ends (same package, same
-    # cutoff): candidates run from the price-window start (minus one
-    # tolerance period) to the price-window end. A stub that does not span
-    # the window fails the alignment gate below -- never a faked ratio.
-    cands: list[tuple[int, float | None]] = []
-    if price_window_start is not None and price_window_end is not None:
-        cands = [
-            (moment, value)
-            for moment, value in oi_points
-            if price_window_start - _obs.OI_PRICE_SYNC_TOLERANCE_MS
-            <= moment
-            <= price_window_end
-        ]
+    # R04: per-end backward 5min lookup at the two close moments (same frozen
+    # package, same cutoff). Each end takes the nearest known sample at or
+    # before the close within 5min; future samples are never used; an 8D
+    # span (e.g. D-7 open) is outside the 5min lookback and is rejected.
+    def _latest_at_or_before(close_ms: int) -> tuple[int, float | None] | None:
+        best: tuple[int, float | None] | None = None
+        lo = close_ms - _obs.OI_PRICE_SYNC_TOLERANCE_MS
+        for moment, value in oi_points:
+            if moment <= close_ms and moment >= lo:
+                best = (moment, value)
+        return best
+
     oi_change_7d: float | None = None
     oi_window_start: int | None = None
     oi_window_end: int | None = None
     oi_window_reason: str | None = None
     oi_value_usd: float | None = None
-    if cands:
-        first_ms, first_oi = cands[0]
-        last_ms, last_oi = cands[-1]
+    # OI latest value (for oi_value_usd) is the nearest at-or-before the D
+    # close within 5min when the 7D window exists, else the latest known
+    # at-or-before cutoff (nominal, never unit-scaled).
+    latest_oi_ms: int | None = None
+    latest_oi_val: float | None = None
+    if oi_points:
+        # Latest at-or-before cutoff (already filtered) for nominal display.
+        latest_oi_ms, latest_oi_val = oi_points[-1]
+    if price_window_start is not None and price_window_end is not None:
+        start_hit = _latest_at_or_before(price_window_start)
+        end_hit = _latest_at_or_before(price_window_end)
         quote = (oi_leg.quote_asset or "USDT").strip().upper()
         if quote not in USD_QUOTES:
             oi_window_reason = UNIT_UNKNOWN
-        elif price_window_start is None or price_window_end is None:
+        elif start_hit is None or end_hit is None:
             oi_window_reason = WINDOW_MISALIGNED
         else:
-            usable, reason = _obs.oi_price_window_usable(
-                first_ms, last_ms, price_window_start, price_window_end
-            )
-            if not usable:
-                oi_window_reason = reason
-            elif first_oi is None or last_oi is None or not (first_oi > 0 and last_oi > 0):
+            first_ms, first_oi = start_hit
+            last_ms, last_oi = end_hit
+            # Both ends must be within 5min backward (enforced by lookup);
+            # an 8D-separated pair can never both hit, so it is rejected.
+            if first_oi is None or last_oi is None or not (first_oi > 0 and last_oi > 0):
                 oi_window_reason = "OI_UNIT_UNVERIFIED"
             else:
                 oi_change_7d = last_oi / first_oi - 1.0
                 oi_window_start, oi_window_end = first_ms, last_ms
-        if last_oi is not None and last_oi > 0 and quote in USD_QUOTES:
+        # Nominal OI value uses the D-close sample when available (same
+        # frozen instant as price D), else falls back to latest known.
+        display_ms: int | None = None
+        display_val: float | None = None
+        if end_hit is not None:
+            display_ms, display_val = end_hit
+        else:
+            display_ms, display_val = latest_oi_ms, latest_oi_val
+        if display_val is not None and display_val > 0 and quote in USD_QUOTES:
             # sumOpenInterestValue is quote nominal, not contract quantity.
             # Convert quote→USD only; never apply the contract multiplier.
-            oi_value_usd = (last_oi if quote == "USD" else
-                            last_oi * fx if fx is not None and fx > 0 else None)
+            oi_value_usd = (display_val if quote == "USD" else
+                            display_val * fx if fx is not None and fx > 0 else None)
+            # If the D-close sample itself is missing, the 7D leg stays
+            # misaligned even though a nominal value may still display.
+            if end_hit is None and oi_window_reason is None:
+                oi_window_reason = WINDOW_MISALIGNED
         elif oi_window_reason is None:
             oi_window_reason = "OI_UNIT_UNVERIFIED"
     elif oi_leg.usable:
         oi_window_reason = WINDOW_MISALIGNED
+        # Still surface a nominal when the price window is absent but OI is known.
+        if latest_oi_val is not None and latest_oi_val > 0:
+            quote2 = (oi_leg.quote_asset or "USDT").strip().upper()
+            if quote2 in USD_QUOTES:
+                oi_value_usd = (latest_oi_val if quote2 == "USD" else
+                                latest_oi_val * fx if fx is not None and fx > 0 else None)
     else:
         oi_window_reason = oi_leg.failure_reason or DATA_MISSING
 

@@ -51,22 +51,34 @@ def assess_risk(
                 risk_score += 2
                 risk_factors.append(f"Weak trend (ADX={adx_val:.1f} < {adx_min})")
 
-    # 3. Signal conflict analysis
+    # 3. Signal conflict analysis (R04/D04.3: minority/(buy+sell), default 0.4,
+    # legal range (0, 0.5]; >= threshold is severe, true ratio preserved).
     buy_count = score_data.get("buy_count", 0)
     sell_count = score_data.get("sell_count", 0)
     active = score_data.get("active_signals", 0)
 
+    conflict_ratio: float | None = None
     if active > 0:
         minority = min(buy_count, sell_count)
         conflict_ratio = minority / active
-        conflict_threshold = config.get("consensus", {}).get("conflict_ratio_threshold", 0.6)
+        conflict_threshold = config.get("consensus", {}).get("conflict_ratio_threshold", 0.4)
+        try:
+            thr = float(conflict_threshold)
+        except (TypeError, ValueError):
+            raise ValueError(f"conflict_ratio_threshold must be a number, got {conflict_threshold!r}")
+        if not (0 < thr <= 0.5):
+            raise ValueError(f"conflict_ratio_threshold must be in (0, 0.5], got {thr!r}")
 
-        if conflict_ratio > conflict_threshold:
+        if conflict_ratio >= thr:
             risk_score += 3
             risk_factors.append(f"High signal conflict (ratio={conflict_ratio:.2f})")
         elif conflict_ratio > 0.3:
             risk_score += 1
             risk_factors.append(f"Moderate signal conflict (ratio={conflict_ratio:.2f})")
+    else:
+        # No bilateral votes => ratio 0 path (no conflict factor); all missing
+        # (active 0) stays UNKNOWN-like with no forced conflict claim.
+        conflict_ratio = 0.0 if (buy_count == 0 and sell_count == 0) else None
 
     # 4. Minimum active signals check
     min_active = config.get("consensus", {}).get("min_active_signals", 4)
@@ -101,4 +113,5 @@ def assess_risk(
         "risk_score": risk_score,
         "risk_factors": risk_factors,
         "position_size_modifier": position_size_modifier,
+        "conflict_ratio": conflict_ratio,
     }

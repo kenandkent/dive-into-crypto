@@ -42,7 +42,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from diveintocrypto_desktop.shortlab.models import CandidateState
-from diveintocrypto_desktop.shortlab.risk.squeeze import evaluate_squeeze
+from diveintocrypto_desktop.shortlab.risk.squeeze import (
+    SQUEEZE_CHECK_UNVERIFIED,
+    evaluate_squeeze,
+    evaluate_squeeze_state,
+)
 
 __all__ = [
     "VETO_DATA_IDENTITY",
@@ -64,6 +68,8 @@ __all__ = [
     "MULTIPLIER_UNVERIFIED",
     "LISTING_AGE_UNKNOWN",
     "READY_INPUT_STALE",
+    "RISK_INPUT_UNVERIFIED",
+    "SQUEEZE_CHECK_UNVERIFIED",
     "LTSS_BELOW_READY",
     "ENTRY_NOT_AVAILABLE",
     "ENTRY_BUDGET_EXHAUSTED",
@@ -109,6 +115,10 @@ IDENTITY_REVIEW_REQUIRED = "IDENTITY_REVIEW_REQUIRED"
 MULTIPLIER_UNVERIFIED = "MULTIPLIER_UNVERIFIED"
 LISTING_AGE_UNKNOWN = "LISTING_AGE_UNKNOWN"
 READY_INPUT_STALE = "READY_INPUT_STALE"
+# R04/D04.3: frozen Ticker 24h missing => execution NOT_READY.
+RISK_INPUT_UNVERIFIED = "RISK_INPUT_UNVERIFIED"
+# Re-exported from squeeze for status mapping (prereq met, confirm unknown).
+# (SQUEEZE_CHECK_UNVERIFIED is imported above.)
 
 LTSS_BELOW_READY = "LTSS_BELOW_READY"
 ENTRY_NOT_AVAILABLE = "ENTRY_NOT_AVAILABLE"
@@ -143,6 +153,8 @@ NOT_READY_ORDER = (
     MULTIPLIER_UNVERIFIED,
     LISTING_AGE_UNKNOWN,
     READY_INPUT_STALE,
+    RISK_INPUT_UNVERIFIED,
+    SQUEEZE_CHECK_UNVERIFIED,
 )
 WARN_ORDER = (
     WARN_HIGH_VOLATILITY,
@@ -152,6 +164,9 @@ WARN_ORDER = (
 )
 
 # -- thresholds (mirror default.yaml candidate/liquidity/veto) ---------------
+# R04: watch/candidate/ready all consume config (0<=watch<=candidate<=ready).
+WATCH_LTSS = 60
+CANDIDATE_LTSS = 70
 READY_LTSS = 80
 READY_ENTRY = 70
 READY_DQ = 80
@@ -214,6 +229,9 @@ class RiskPolicy:
     / :func:`derive_status` so a decision never mixes thresholds from two
     config generations. Defaults mirror the frozen module constants (and
     therefore ``default.yaml``) so omitting the policy replays history.
+
+    R04: watch/candidate/ready all consume config (``0<=watch<=candidate
+    <=ready<=100``, validated in ``shortlab.config`` and re-checked here).
     """
 
     veto_dq_threshold: float = VETO_DQ_THRESHOLD
@@ -222,10 +240,26 @@ class RiskPolicy:
     new_token_days: int = NEW_TOKEN_DAYS
     hard_min_futures_qv: float = HARD_MIN_FUTURES_QV
     hard_min_oi_usd: float = HARD_MIN_OI_USD
+    watch_ltss: float = WATCH_LTSS
+    candidate_ltss: float = CANDIDATE_LTSS
     ready_ltss: float = READY_LTSS
     ready_entry: float = READY_ENTRY
     ready_dq: float = READY_DQ
     ready_tradeability: float = READY_TRADEABILITY
+
+    def __post_init__(self) -> None:
+        for name in ("watch_ltss", "candidate_ltss", "ready_ltss"):
+            try:
+                val = float(getattr(self, name))
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a number")
+            if not 0 <= val <= 100:
+                raise ValueError(f"{name} must be in [0, 100], got {val!r}")
+        if not (float(self.watch_ltss) <= float(self.candidate_ltss) <= float(self.ready_ltss)):
+            raise ValueError(
+                "candidate thresholds require ready>=candidate>=watch, got "
+                f"watch={self.watch_ltss} candidate={self.candidate_ltss} ready={self.ready_ltss}"
+            )
 
 
 def risk_policy_from_config(config: Any) -> RiskPolicy:
@@ -246,6 +280,8 @@ def risk_policy_from_config(config: Any) -> RiskPolicy:
         new_token_days=int(veto.new_token_days),
         hard_min_futures_qv=float(liquidity.hard_min_futures_volume_usd),
         hard_min_oi_usd=float(liquidity.hard_min_open_interest_usd),
+        watch_ltss=float(candidate.watch_ltss),
+        candidate_ltss=float(candidate.candidate_ltss),
         ready_ltss=float(candidate.ready_ltss),
         ready_entry=float(candidate.ready_entry),
         ready_dq=float(candidate.ready_data_quality),
@@ -449,18 +485,34 @@ def evaluate_risks(
         ):
             vetoes.append(VETO_CONTRACT_DELISTING)
 
-    # -- breakout pauses -----------------------------------------------------
+    # -- breakout pauses (R04: frozen Ticker 24h; missing => NOT_READY) ----
+    # 24h Breakout uses the same frozen Ticker change; a missing change shows
+    # RISK_INPUT_UNVERIFIED with execution NOT_READY (never silently OK).
     chg_24h = _finite(_pick(features, meta, "price_change_24h", "ret_24h", "chg_24h"))
     chg_7d = _finite(
         _pick(features, meta, "price_change_7d", "ret_7d", "return_7d", "chg_7d")
     )
+    missing_24h = _pick(features, meta, "price_change_24h", "ret_24h", "chg_24h") is None
+    if missing_24h:
+        pauses.append(RISK_INPUT_UNVERIFIED)
     if chg_24h is not None and chg_24h >= float(breakout_24h):
         pauses.append(PAUSE_BREAKOUT_24H)
     if chg_7d is not None and chg_7d >= float(breakout_7d):
         pauses.append(PAUSE_BREAKOUT_7D)
 
-    if evaluate_squeeze(features, meta):
+    # -- squeeze frozen tri-state (R04/D04.3) --------------------------------
+    # PAUSE only on full conjunction; NEED_CONFIRM (prereq met, confirm
+    # unknown incl. late micro frozen-out) surfaces as NOT_READY
+    # SQUEEZE_CHECK_UNVERIFIED via pauses (mapped in derive_status); UNKNOWN
+    # (prereq itself unknown) claims nothing; OK needs no extra confirm.
+    try:
+        _sq_state = evaluate_squeeze_state(features, meta)
+    except Exception:
+        _sq_state = "UNKNOWN"
+    if _sq_state == "PAUSE":
         pauses.append(PAUSE_SQUEEZE)
+    elif _sq_state == "NEED_CONFIRM":
+        pauses.append(SQUEEZE_CHECK_UNVERIFIED)
 
     funding_30d = _finite(_pick(features, meta, "funding_30d", "funding30d"))
     funding_7d = _finite(_pick(features, meta, "funding_7d", "funding7d"))
@@ -562,7 +614,7 @@ def evaluate_risks(
 
     return RiskResult(
         vetoes=_sort_unique(vetoes, BLOCK_ORDER),
-        pauses=_sort_unique(pauses, PAUSE_ORDER),
+        pauses=_sort_unique(pauses, (*PAUSE_ORDER, RISK_INPUT_UNVERIFIED, SQUEEZE_CHECK_UNVERIFIED)),
         warnings=_sort_unique(warnings, WARN_ORDER),
     )
 
@@ -610,6 +662,8 @@ def derive_status(
     stale: Any,
     *,
     entry_budget_exhausted: bool = False,
+    watch_ltss: float = WATCH_LTSS,
+    candidate_ltss: float = CANDIDATE_LTSS,
     ready_ltss: float = READY_LTSS,
     ready_entry: float = READY_ENTRY,
     ready_dq: float = READY_DQ,
@@ -626,7 +680,25 @@ def derive_status(
     snapshot expired). Extra keyword thresholds default to the frozen
     ``default.yaml`` gates (plus the ``VETO_DQ_THRESHOLD`` safety net) and
     exist for explicit boundary tests and pinned-policy replay.
+
+    R04: ``watch_ltss``/``candidate_ltss``/``ready_ltss`` all consume config
+    (``0<=watch<=candidate<=ready<=100``); ``RISK_INPUT_UNVERIFIED`` and
+    ``SQUEEZE_CHECK_UNVERIFIED`` arriving via ``risk.pauses`` map to
+    execution NOT_READY (never PAUSED).
     """
+    try:
+        w_thr = float(watch_ltss)
+        c_thr = float(candidate_ltss)
+        r_thr = float(ready_ltss)
+    except (TypeError, ValueError):
+        raise ValueError("watch/candidate/ready thresholds must be numbers")
+    for name, val in (("watch_ltss", w_thr), ("candidate_ltss", c_thr), ("ready_ltss", r_thr)):
+        if not 0 <= val <= 100:
+            raise ValueError(f"{name} must be in [0, 100], got {val!r}")
+    if not (w_thr <= c_thr <= r_thr):
+        raise ValueError(
+            f"candidate thresholds require ready>=candidate>=watch, got watch={w_thr} candidate={c_thr} ready={r_thr}"
+        )
     ltss_num = _finite(ltss)
     entry_num = _finite(entry)
     dq_num = _dq_value(dq)
@@ -636,10 +708,10 @@ def derive_status(
     confidence, multiplier, has_valid_onboard = _identity_parts(identity)
     risk_vetoes, risk_pauses, risk_warnings = _risk_lists(risk)
 
-    # -- candidateStatus ------------------------------------------------------
-    if ltss_num is None or ltss_num < 60:
+    # -- candidateStatus (R04: all three thresholds consume config) ---------
+    if ltss_num is None or ltss_num < w_thr:
         candidate: str = "EXCLUDED"
-    elif ltss_num < 70:
+    elif ltss_num < c_thr:
         candidate = "WATCH"
     else:
         candidate = "CANDIDATE"
@@ -659,11 +731,24 @@ def derive_status(
         if VETO_LOW_DATA_QUALITY not in effective_vetoes:
             effective_vetoes.append(VETO_LOW_DATA_QUALITY)
     vetoes = _sort_unique(effective_vetoes, BLOCK_ORDER)
-    pauses = _sort_unique(list(risk_pauses), PAUSE_ORDER)
+    # R04: frozen-input NOT_READY markers travel via pauses but never PAUSE.
+    pending_not_ready: list[str] = []
+    true_pauses: list[str] = []
+    for code in list(risk_pauses):
+        if code in (RISK_INPUT_UNVERIFIED, SQUEEZE_CHECK_UNVERIFIED):
+            if code not in pending_not_ready:
+                pending_not_ready.append(code)
+        else:
+            true_pauses.append(code)
+    pauses = _sort_unique(true_pauses, PAUSE_ORDER)
     warnings = _sort_unique(list(risk_warnings), WARN_ORDER)
 
     # -- executionStatus --------------------------------------------------------
+    # Precedence: BLOCK > non-CANDIDATE NOT_READY > MEDIUM/MULTIPLIER/LISTING
+    # > frozen-input NOT_READY (RISK/SQUEEZE unverified) > PAUSE > READY.
     not_ready: list[str] = []
+    # Surface frozen-input unverified even when a veto already blocks (reasons).
+    not_ready.extend(pending_not_ready)
     if vetoes:
         execution = "BLOCKED"
     elif candidate != "CANDIDATE":
@@ -677,6 +762,8 @@ def derive_status(
     elif has_valid_onboard is not True:
         execution = "NOT_READY"
         not_ready.append(LISTING_AGE_UNKNOWN)
+    elif pending_not_ready:
+        execution = "NOT_READY"
     elif pauses:
         execution = "PAUSED"
     elif (

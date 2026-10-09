@@ -3,6 +3,12 @@
 Pure functions over settled history and verified USD notionals. ``None``
 means missing and contributes 0 downstream; an incomplete 30D/90D funding
 window is missing (never a partial sum masquerading as a full window).
+
+R04/D05.2: funding completeness is the R05 schedule coverage
+(``FundingCoverage``/``compute_schedule_coverage``), never a separate
+max-24h gap rule invented here. Callers pass the R05 coverage object via
+``coverage``; when present it decides completeness (``complete`` is ignored
+except as a fallback when no coverage is supplied).
 """
 
 from __future__ import annotations
@@ -10,6 +16,41 @@ from __future__ import annotations
 from typing import Any
 
 RAW_MAX = 25
+
+
+def _coverage_complete(coverage: Any) -> bool | None:
+    """Return R05 completeness from a coverage object, or None when absent.
+
+    Accepts ``FundingCoverage``-like objects (``complete``/``coverage_fraction``
+    attributes), mappings with ``complete``/``coverage_fraction`` keys, or
+    ``None`` (caller falls back to the legacy ``complete`` flag).
+    """
+    if coverage is None:
+        return None
+    get = None
+    if isinstance(coverage, dict):
+        try:
+            return bool(coverage.get("complete", False))
+        except Exception:
+            return False
+    for attr in ("complete", "is_complete"):
+        try:
+            val = getattr(coverage, attr, None)
+        except Exception:
+            continue
+        if val is not None:
+            return bool(val)
+    # Mapping-like with attribute access fallback.
+    try:
+        get = coverage.get  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    if callable(get):
+        try:
+            return bool(get("complete", False))
+        except Exception:
+            return False
+    return None
 
 
 def _finite(value: Any) -> float | None:
@@ -27,7 +68,7 @@ def _finite(value: Any) -> float | None:
 
 
 def score_funding_30d(
-    funding_30d: Any, *, complete: bool = True
+    funding_30d: Any, *, complete: bool = True, coverage: Any = None
 ) -> tuple[int | None, float | None, str | None]:
     """Design 10.3 bins (decimal fractions, left-closed, last bin unbounded)::
 
@@ -38,9 +79,15 @@ def score_funding_30d(
         [0.01, 0.02)    -> 6
         >= 0.02         -> 8
     ``complete=False`` (funding gap) forces ``None``/``FUNDING_HISTORY_INCOMPLETE``.
+
+    R04: when ``coverage`` (R05 ``FundingCoverage``) is supplied it decides
+    completeness; the legacy ``complete`` flag is only a fallback. No
+    max-24h rule is invented here.
     """
+    r05 = _coverage_complete(coverage)
+    effective_complete = bool(r05) if r05 is not None else bool(complete)
     value = _finite(funding_30d)
-    if value is None or not complete:
+    if value is None or not effective_complete:
         return None, value, "FUNDING_HISTORY_INCOMPLETE"
     if value <= 0:
         return 0, value, "FUNDING_NON_POSITIVE"
@@ -56,11 +103,16 @@ def score_funding_30d(
 
 
 def score_positive_ratio(
-    ratio: Any, *, complete: bool = True, field: str = "POSITIVE_RATIO"
+    ratio: Any, *, complete: bool = True, coverage: Any = None, field: str = "POSITIVE_RATIO"
 ) -> tuple[int | None, float | None, str | None]:
-    """>=0.7=3, >=0.55=2, >=0.4=1, else 0. Incomplete window -> null."""
+    """>=0.7=3, >=0.55=2, >=0.4=1, else 0. Incomplete window -> null.
+
+    R04: ``coverage`` (R05) overrides ``complete`` when supplied.
+    """
+    r05 = _coverage_complete(coverage)
+    effective_complete = bool(r05) if r05 is not None else bool(complete)
     value = _finite(ratio)
-    if value is None or not complete:
+    if value is None or not effective_complete:
         return None, value, "FUNDING_HISTORY_INCOMPLETE"
     if value >= 0.7:
         return 3, value, None
