@@ -166,14 +166,86 @@ function shortlabTabFromHash(){
 }
 function ShortLabShell({ initialTab }){
   const [tab, setTab] = useState(() => initialTab || shortlabTabFromHash());
+  /* R13b: routed planner pair (funding carry or directional/balanced candidate
+     symbol + snapshotId) parsed from the planner hash via workflow-bindings.
+     ShortLabView itself is untouched (not an R13b owner); the pair flows
+     Funding analyze → planner hash → HedgePlanner candidate. */
+  const readPlannerSel = () => {
+    try {
+      if (typeof shortlabPlannerSelectionFromHash === "function") return shortlabPlannerSelectionFromHash();
+      if (typeof window !== "undefined" && window.WORKFLOW_BINDINGS && typeof window.WORKFLOW_BINDINGS.shortlabPlannerSelectionFromHash === "function") return window.WORKFLOW_BINDINGS.shortlabPlannerSelectionFromHash();
+    } catch (e) {}
+    try {
+      const h = (typeof location !== "undefined" && location.hash) || "";
+      const m = String(h).match(/#\/shortlab\/planner\/([^\/]+)(?:\/(.+))?/);
+      if (m) {
+        let sym = m[1]; let snap = m[2] || null;
+        try { sym = decodeURIComponent(sym); } catch (e) {}
+        try { if (snap != null) snap = decodeURIComponent(snap); } catch (e) {}
+        return { symbol: sym || null, snapshotId: snap };
+      }
+    } catch (e) {}
+    return { symbol: null, snapshotId: null };
+  };
+  const buildPlannerHash = (symbol, snapshotId) => {
+    try {
+      if (typeof formatPlannerHash === "function") return formatPlannerHash(symbol, snapshotId);
+      if (typeof window !== "undefined" && window.WORKFLOW_BINDINGS && typeof window.WORKFLOW_BINDINGS.formatPlannerHash === "function") return window.WORKFLOW_BINDINGS.formatPlannerHash(symbol, snapshotId);
+    } catch (e) {}
+    const sym = String(symbol || ""); const snap = snapshotId != null ? String(snapshotId) : "";
+    if (!sym && !snap) return "#/shortlab/planner";
+    if (!snap) return "#/shortlab/planner/" + encodeURIComponent(sym);
+    return "#/shortlab/planner/" + encodeURIComponent(sym) + "/" + encodeURIComponent(snap);
+  };
+  const [plannerSel, setPlannerSel] = useState(readPlannerSel);
   useEffect(() => {
-    const onHash = () => setTab(shortlabTabFromHash());
+    const onHash = () => { setTab(shortlabTabFromHash()); try { setPlannerSel(readPlannerSel()); } catch (e) {} };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
   const go = (t) => {
     setTab(t);
     try { const h = "#/shortlab/" + t; if (location.hash !== h) location.hash = h; } catch (e) {}
+  };
+  /* R13b real routing: funding analyze carries symbol/snapshotId into planner
+     (planner refreshes real Gate/quotes on arrival); saves verify via real
+     list_plans (hedgePlans) then monitor — never a localStorage替身. */
+  const handleFundingAnalyze = (sel) => {
+    const sym = sel && (sel.symbol || (sel.item && (sel.item.symbol || sel.item.Symbol)));
+    const snap = sel && (sel.snapshotId != null ? sel.snapshotId : sel.snapshot_id) != null
+      ? (sel.snapshotId != null ? sel.snapshotId : sel.snapshot_id)
+      : (sel && sel.item ? (sel.item.snapshotId != null ? sel.item.snapshotId : sel.item.snapshot_id) : null);
+    const hash = buildPlannerHash(sym || "", snap || "");
+    try { if (location.hash !== hash) location.hash = hash; } catch (e) {}
+    try { setPlannerSel({ symbol: sym ? String(sym).toUpperCase() : null, snapshotId: snap != null ? String(snap) : null }); } catch (e) {}
+    setTab("planner");
+  };
+  const handleViewPlan = (plan) => {
+    try {
+      if (typeof window !== "undefined" && window.DIVE && typeof window.DIVE.hedgePlans === "function") {
+        window.DIVE.hedgePlans({ limit: 50, offset: 0 }).catch(() => {}).finally(() => {
+          try { location.hash = "#/shortlab/plans"; } catch (e) {}
+          setTab("plans");
+        });
+        return;
+      }
+    } catch (e) {}
+    try { location.hash = "#/shortlab/plans"; } catch (e) {}
+    setTab("plans");
+  };
+  const handleGotoMonitor = (plan) => {
+    try {
+      const pid = plan && (plan.planId != null ? plan.planId : plan.plan_id);
+      if (pid && typeof window !== "undefined" && window.DIVE && typeof window.DIVE.hedgePlan === "function") {
+        window.DIVE.hedgePlan(pid).catch(() => {}).finally(() => {
+          try { location.hash = "#/shortlab/monitor"; } catch (e) {}
+          setTab("monitor");
+        });
+        return;
+      }
+    } catch (e) {}
+    try { location.hash = "#/shortlab/monitor"; } catch (e) {}
+    setTab("monitor");
   };
   const tabBtn = (id, labelKey, fallback) => (
     <button key={id} className={"chip" + (tab === id ? " on" : "")} role="tab"
@@ -182,8 +254,8 @@ function ShortLabShell({ initialTab }){
     </button>
   );
   let page = null;
-  if (tab === "funding") page = (typeof FundingView !== "undefined") ? <FundingView/> : <div className="reason">Funding · H09 bundle missing</div>;
-  else if (tab === "planner") page = (typeof HedgePlanner !== "undefined") ? <HedgePlanner/> : <div className="reason">Planner · H09 bundle missing</div>;
+  if (tab === "funding") page = (typeof FundingView !== "undefined") ? <FundingView onAnalyze={handleFundingAnalyze}/> : <div className="reason">Funding · H09 bundle missing</div>;
+  else if (tab === "planner") page = (typeof HedgePlanner !== "undefined") ? <HedgePlanner candidate={plannerSel && plannerSel.symbol ? { symbol: plannerSel.symbol, snapshotId: plannerSel.snapshotId } : null} fundingSelection={plannerSel && plannerSel.symbol ? { symbol: plannerSel.symbol, snapshotId: plannerSel.snapshotId } : null} onViewPlan={handleViewPlan} onGotoMonitor={handleGotoMonitor}/> : <div className="reason">Planner · H09 bundle missing</div>;
   else if (tab === "monitor") page = (typeof HedgeMonitor !== "undefined") ? <HedgeMonitor/> : <div className="reason">Monitor · H09 bundle missing</div>;
   else if (tab === "alerts") page = (typeof HedgeAlerts !== "undefined") ? <HedgeAlerts/> : <div className="reason">Alerts · H09 bundle missing</div>;
   else if (tab === "evidence") page = (typeof ShortLabEvidence !== "undefined") ? <ShortLabEvidence/> : <div className="reason">Evidence · bundle missing</div>;

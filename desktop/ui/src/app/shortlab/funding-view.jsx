@@ -95,13 +95,20 @@ function FundingView({ filters, initial, onAnalyze }) {
 
   const setF = (k, v) => setLocal((f) => ({ ...f, [k]: v }));
 
-  /* R13a D12.1: analyze carries symbol + snapshotId into Planner. Pure
-     callback; fallback sets the planner hash so no HTTP happens here. */
+  /* R13b D12.1 real routing: analyze carries symbol + snapshotId into Planner
+     via workflow-bindings (formatPlannerHash) when present; planner refreshes
+     real Gate/quotes on arrival (no stale reuse). Pure callback; fallback sets
+     the planner hash so no HTTP happens here. */
   const handleAnalyze = (it) => {
     const sym = (it && (it.symbol || it.Symbol)) || "";
     const snap = (it && (it.snapshotId != null ? it.snapshotId : it.snapshot_id)) || (it && (it.fcsSnapshotId || it.fcs_snapshot_id)) || "";
-    if (typeof onAnalyze === "function") { try { onAnalyze({ symbol: sym, snapshotId: snap, item: it }); } catch (e) {} return; }
-    try { location.hash = "#/shortlab/planner/" + encodeURIComponent(sym) + "/" + encodeURIComponent(snap); } catch (e) {}
+    let wfHash = null;
+    try {
+      if (typeof formatPlannerHash === "function") wfHash = formatPlannerHash(sym, snap);
+      else if (typeof window !== "undefined" && window.WORKFLOW_BINDINGS && typeof window.WORKFLOW_BINDINGS.formatPlannerHash === "function") wfHash = window.WORKFLOW_BINDINGS.formatPlannerHash(sym, snap);
+    } catch (e) { wfHash = null; }
+    if (typeof onAnalyze === "function") { try { onAnalyze({ symbol: sym, snapshotId: snap, item: it, hash: wfHash }); } catch (e) {} return; }
+    try { location.hash = wfHash || ("#/shortlab/planner/" + encodeURIComponent(sym) + "/" + encodeURIComponent(snap)); } catch (e) {}
   };
 
   if (loading) {

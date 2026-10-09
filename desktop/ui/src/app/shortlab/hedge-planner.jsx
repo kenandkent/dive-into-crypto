@@ -71,8 +71,27 @@ function HedgePlannerDefaults() {
   };
 }
 
-function HedgePlanner({ initial, onViewPlan, onGotoMonitor }) {
-  const [form, setForm] = React.useState(HedgePlannerDefaults());
+function HedgePlanner({ initial, onViewPlan, onGotoMonitor, candidate, fundingSelection, initialSymbol, initialSnapshotId }) {
+  const [form, setForm] = React.useState(() => {
+    const base = HedgePlannerDefaults();
+    /* R13b: prefill routed symbol/snapshotId (funding carry or directional/
+       balanced candidate via workflow-bindings hash) without guessing. */
+    try {
+      const candSym = (candidate && (candidate.symbol || candidate.Symbol))
+        || (fundingSelection && (fundingSelection.symbol || fundingSelection.Symbol))
+        || initialSymbol || (initial && (initial.symbol || initial.candidateSymbol));
+      if (candSym && String(candSym).trim() !== "") base.symbol = String(candSym).toUpperCase().trim();
+    } catch (e) { /* keep default; routed hash effect below still applies */ }
+    return base;
+  });
+  const [routedSnapshotId, setRoutedSnapshotId] = React.useState(() => {
+    try {
+      const s = (candidate && (candidate.snapshotId != null ? candidate.snapshotId : candidate.snapshot_id))
+        || (fundingSelection && (fundingSelection.snapshotId != null ? fundingSelection.snapshotId : fundingSelection.snapshot_id))
+        || initialSnapshotId || (initial && (initial.snapshotId != null ? initial.snapshotId : initial.snapshot_id));
+      return s != null ? String(s) : null;
+    } catch (e) { return null; }
+  });
   const [venues, setVenues] = React.useState(initial && initial.venues ? initial.venues : null);
   const [venuesErr, setVenuesErr] = React.useState(initial && initial.venuesError ? initial.venuesError : null);
   const [sim, setSim] = React.useState(initial && initial.simulation ? normalizeHedgeSimulation(initial.simulation) : null);
@@ -85,6 +104,22 @@ function HedgePlanner({ initial, onViewPlan, onGotoMonitor }) {
   const [simInputs, setSimInputs] = React.useState(null);
   const seqRef = React.useRef(0);
   const abortRef = React.useRef(null);
+
+  /* R13b: adopt routed planner pair from hash when no explicit candidate prop
+     (funding analyze → planner via workflow-bindings shortlabPlannerSelection). */
+  React.useEffect(() => {
+    if ((candidate && candidate.symbol) || (fundingSelection && fundingSelection.symbol) || initialSymbol) return;
+    let sel = null;
+    try {
+      if (typeof shortlabPlannerSelectionFromHash === "function") sel = shortlabPlannerSelectionFromHash();
+      else if (typeof window !== "undefined" && window.WORKFLOW_BINDINGS && typeof window.WORKFLOW_BINDINGS.shortlabPlannerSelectionFromHash === "function") sel = window.WORKFLOW_BINDINGS.shortlabPlannerSelectionFromHash();
+    } catch (e) { sel = null; }
+    if (sel && sel.symbol && String(sel.symbol).trim() !== "") {
+      const sym = String(sel.symbol).toUpperCase().trim();
+      setForm((f) => (f.symbol === sym ? f : { ...f, symbol: sym }));
+      if (sel.snapshotId != null) setRoutedSnapshotId(String(sel.snapshotId));
+    }
+  }, []);
 
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -161,6 +196,27 @@ function HedgePlanner({ initial, onViewPlan, onGotoMonitor }) {
   const doCreatePlan = () => {
     const sid = sim && (sim.simulationId || sim.simulation_id);
     if (!sid) { setPlanErr("no simulation to freeze"); return; }
+    /* R13b: real Gate/quote shape assertion before freezing (no stale/expired
+       entry). Uses workflow-bindings assertFreshSimulation/assertQuoteShape
+       when present; expired or malformed quotes block save with an honest
+       error instead of a Fake plan. */
+    try {
+      const wf = (typeof window !== "undefined" && window.WORKFLOW_BINDINGS) || null;
+      const assertFresh = (typeof assertFreshSimulation === "function") ? assertFreshSimulation
+        : (wf && typeof wf.assertFreshSimulation === "function" ? wf.assertFreshSimulation : null);
+      if (assertFresh && sim) assertFresh(sim, Date.now());
+      const assertQ = (typeof assertQuoteShape === "function") ? assertQuoteShape
+        : (wf && typeof wf.assertQuoteShape === "function" ? wf.assertQuoteShape : null);
+      if (assertQ && Array.isArray(venueList) && venueList.length > 0) {
+        // At least one venue quote must be fresh; stale quotes never grant entry.
+        let fresh = 0;
+        for (const q of venueList) { try { assertQ(q, Date.now()); fresh += 1; } catch (e) {} }
+        if (fresh === 0) assertQ(venueList[0], Date.now());
+      }
+    } catch (e) {
+      setPlanErr((e && e.message) || String(e));
+      return;
+    }
     const seq = ++seqRef.current;
     setBusy(true); setPlanErr(null);
     const clientRequestId = `plan-${sid}-${Date.now().toString(36)}`;
@@ -171,6 +227,26 @@ function HedgePlanner({ initial, onViewPlan, onGotoMonitor }) {
         setBusy(false);
         setPlanErr((e && e.message) || String(e));
       });
+  };
+
+  /* R13b: click-suggestion refresh entry point — re-reads the frozen decision
+     plus fresh venue quotes via workflow-bindings refreshDecisionAndQuotes
+     (real adapters, asserted shapes, superseded responses ignored). Planner
+     calls this before trusting a routed snapshotId for entry. */
+  const doRefreshGateQuotes = (decisionId) => {
+    const did = String(decisionId || "").trim();
+    const sym = String(form.symbol || "").toUpperCase().trim();
+    if (!did || !sym) return Promise.reject(new Error("refreshDecisionAndQuotes: missing decisionId/symbol"));
+    try {
+      const wf = (typeof window !== "undefined" && window.WORKFLOW_BINDINGS) || null;
+      const factory = (typeof createWorkflowBindings === "function") ? createWorkflowBindings
+        : (wf && typeof wf.createWorkflowBindings === "function" ? wf.createWorkflowBindings : null);
+      if (!factory) return Promise.reject(new Error("refreshDecisionAndQuotes: workflow bindings unavailable"));
+      const bindings = factory({ dive: window.DIVE, navigate: (h) => h, nowMs: () => Date.now() });
+      return bindings.refreshDecisionAndQuotes(did, sym, {});
+    } catch (e) {
+      return Promise.reject(e);
+    }
   };
 
   React.useEffect(() => () => { if (abortRef.current) { try { abortRef.current.abort(); } catch (e) {} } }, []);
