@@ -1045,15 +1045,15 @@ def test_schema_target_for_config_phasing() -> None:
     from diveintocrypto_desktop.shortlab.config import ProviderConfig
 
     base = load_shortlab_config()
-    # F01: schema target decoupled from provider flags (always 4; hedge -> 5 in H01)
-    assert schema_target_for_config(base) == 4
+    # R01: schema target unified to 6 regardless of provider flags (was 4-split, then H01 4/5).
+    assert schema_target_for_config(base) == 6
     providers = dict(base.providers)
     providers["unlock"] = ProviderConfig(enabled=True, api_key_env="DIVE_TOKENOMIST_API_KEY")
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 6
     providers["social"] = ProviderConfig(enabled=True, api_key_env="DIVE_LUNARCRUSH_API_KEY")
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 6
     providers["catalyst"] = ProviderConfig(enabled=True, api_key_env=None)
-    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 4
+    assert schema_target_for_config(dataclasses.replace(base, providers=providers)) == 6
 
 
 # ---------------------------------------------------------------------------

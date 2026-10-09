@@ -242,7 +242,8 @@ class TestCompleteFundingAndShared7D:
         assert meta["funding_7d"] is inputs.funding_7d
         assert meta["funding_30d"] is inputs.funding_30d
         assert inputs.price_change_7d == pytest.approx(31.96 / 34.0 - 1.0)
-        assert inputs.oi_change_7d == pytest.approx(0.06)
+        # R04: OI compares two corresponding closes over 7x24h (was 8D open->close 0.06).
+        assert inputs.oi_change_7d == pytest.approx(0.05210918)
         # Same cutoff-aligned package: OI ends agree with the price window.
         assert inputs.price_window_end_ms == MIDNIGHT
         assert inputs.oi_window_end_ms == MIDNIGHT

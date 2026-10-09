@@ -35,7 +35,8 @@ def _write_user_yaml(tmp_path: Path, payload: dict) -> Path:
 def test_b40_subtrees_present_with_onchain_env_pin():
     from diveintocrypto_desktop.shortlab.config import load_shortlab_config
     config = load_shortlab_config()
-    assert config.funding_capture.fcs_version == "fcs_v1"
+    # R00 (D15): default is now fcs_v2 (was fcs_v1).
+    assert config.funding_capture.fcs_version == "fcs_v2"
     assert config.funding_capture.reference_notional_usd == 10000
     assert config.funding_capture.enabled is False
     assert config.hedge.enabled is False
@@ -52,6 +53,15 @@ def test_b40_subtrees_present_with_onchain_env_pin():
     assert dict(onchain)["chain_id"] == 1
 
 
+def _as_v1(config):
+    """Explicit v1 projection for appendix goldens (default is v2 since R00)."""
+    import dataclasses
+    return dataclasses.replace(
+        config,
+        funding_capture=dataclasses.replace(
+            config.funding_capture, fcs_version="fcs_v1"))
+
+
 def test_three_hashes_match_appendix_goldens():
     from diveintocrypto_desktop.shortlab.config import (
         fcs_config_hash,
@@ -59,7 +69,7 @@ def test_three_hashes_match_appendix_goldens():
         hedge_policy_hash,
         load_shortlab_config,
     )
-    config = load_shortlab_config()
+    config = _as_v1(load_shortlab_config())
     assert fcs_config_hash(config) == GOLDEN_FCS
     assert hedge_cost_config_hash(config) == GOLDEN_COST
     assert hedge_policy_hash(config) == GOLDEN_POLICY
@@ -113,9 +123,11 @@ def test_crlf_indent_reorder_do_not_change_hashes():
         assert hashlib.sha256(canon.encode("utf-8")).hexdigest() == golden
     # Type normalisation: 1 vs 1.0 for a float bin still hashes identically
     # only when the schema normalises (float fields); int bins stay ints.
-    assert fcs_config_hash(config) == GOLDEN_FCS
-    assert hedge_cost_config_hash(config) == GOLDEN_COST
-    assert hedge_policy_hash(config) == GOLDEN_POLICY
+    # Appendix goldens describe the v1 projection; the default is v2 (R00).
+    v1 = _as_v1(config)
+    assert fcs_config_hash(v1) == GOLDEN_FCS
+    assert hedge_cost_config_hash(v1) == GOLDEN_COST
+    assert hedge_policy_hash(v1) == GOLDEN_POLICY
 
 
 def test_value_changes_move_hashes_secret_changes_do_not(tmp_path, monkeypatch):
@@ -125,7 +137,7 @@ def test_value_changes_move_hashes_secret_changes_do_not(tmp_path, monkeypatch):
         hedge_policy_hash,
         load_shortlab_config,
     )
-    base = load_shortlab_config()
+    base = _as_v1(load_shortlab_config())
     assert fcs_config_hash(base) == GOLDEN_FCS
     # Scoring-relevant changes move the FCS hash.
     changed = _write_user_yaml(
@@ -142,16 +154,16 @@ def test_value_changes_move_hashes_secret_changes_do_not(tmp_path, monkeypatch):
     # Refresh cadence / provider enablement / URLs / env secrets never do.
     cadence = _write_user_yaml(
         tmp_path, {"shortlab": {"hedge": {"refresh": {"opportunity_sec": 60}}}})
-    assert fcs_config_hash(load_shortlab_config(cadence)) == GOLDEN_FCS
-    assert hedge_cost_config_hash(load_shortlab_config(cadence)) == GOLDEN_COST
-    assert hedge_policy_hash(load_shortlab_config(cadence)) == GOLDEN_POLICY
+    assert fcs_config_hash(_as_v1(load_shortlab_config(cadence))) == GOLDEN_FCS
+    assert hedge_cost_config_hash(_as_v1(load_shortlab_config(cadence))) == GOLDEN_COST
+    assert hedge_policy_hash(_as_v1(load_shortlab_config(cadence))) == GOLDEN_POLICY
     capability = _write_user_yaml(
         tmp_path, {"shortlab": {"hedge": {"providers": {"binance_alpha": {"enabled": True}}}}})
-    assert fcs_config_hash(load_shortlab_config(capability)) == GOLDEN_FCS
+    assert fcs_config_hash(_as_v1(load_shortlab_config(capability))) == GOLDEN_FCS
     monkeypatch.setenv("SHORTLAB_0X_API_KEY", "super-secret-0x-key")
-    assert fcs_config_hash(load_shortlab_config()) == GOLDEN_FCS
-    assert hedge_cost_config_hash(load_shortlab_config()) == GOLDEN_COST
-    assert hedge_policy_hash(load_shortlab_config()) == GOLDEN_POLICY
+    assert fcs_config_hash(_as_v1(load_shortlab_config())) == GOLDEN_FCS
+    assert hedge_cost_config_hash(_as_v1(load_shortlab_config())) == GOLDEN_COST
+    assert hedge_policy_hash(_as_v1(load_shortlab_config())) == GOLDEN_POLICY
 
 
 def test_secrets_urls_paths_absent_from_hashes_logs_and_api(monkeypatch):
