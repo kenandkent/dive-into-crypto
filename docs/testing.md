@@ -13,7 +13,7 @@ Test counts are **approximate** — they move as features land. The CI workflow
 |---|---|---|---|---|
 | 1 | Backend engine | `cd desktop/backend && uv sync && uv run pytest -q` | ~1300 | The reference engine: all 60 indicators + 3 overlays, consensus/verdict logic, data parsers, cross-language parity fixtures, per-endpoint client behaviour (offline), plus the Short-Lab/Hedge contract suites |
 | 2 | Root E2E | `uv run --project desktop/backend pytest tests/ -q` | ~95 | Opaque-box end-to-end behaviour against the packaged engine (offline: `tests/conftest.py` mocks the data layer), adversarial math, Gradle signing static analysis |
-| 3 | UI | `cd desktop/ui && npm ci && npm test` (then `node build.mjs`) | ~49 | The "nothing is synthesised" guarantees of the React front-end: failed fetches never reach the demo generator, and demo mode always renders its banner + per-value markers; Short-Lab/hedge view contracts |
+| 3 | UI | `cd desktop/ui && npm ci && npm test` (then `node build.mjs`) | ~96 | The "nothing is synthesised" guarantees of the React front-end: failed fetches never reach the demo generator, and demo mode always renders its banner + per-value markers; Short-Lab/hedge view contracts |
 | 4 | Android | `cd android && ./gradlew :app:test` (JDK 17) | ~129 | The Kotlin engine unit tests, including the fixture-verified parity mirror of the Python reference |
 
 CI additionally builds the debug APK (`:app:assembleDebug`) and enforces the **dist-drift
@@ -29,7 +29,7 @@ cd desktop/backend && uv sync && uv run pytest -q
 # 2 · Root E2E suite (~95 tests, offline — data layer is mocked)
 uv run --project desktop/backend pytest tests/ -q
 
-# 3 · UI suite (~49 tests) + rebuild the committed bundle
+# 3 · UI suite (~96 tests) + rebuild the committed bundle
 cd desktop/ui && npm ci && npm test && node build.mjs
 
 # 4 · Android unit tests (~129 tests, needs JDK 17)

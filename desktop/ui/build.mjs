@@ -24,6 +24,9 @@ const FILES = [
   "shortlab/hedge-planner.jsx",
   "shortlab/hedge-monitor.jsx",
   "shortlab/hedge-alerts.jsx",
+  "shortlab/workflow-model.mjs",
+  "shortlab/decision-panel.jsx",
+  "shortlab/plans-view.jsx",
   "desktop-app.jsx", // "Depth Terminal" UI — shell + screens
 ];
 
