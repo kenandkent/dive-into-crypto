@@ -28,7 +28,117 @@ __all__ = [
     "QuoteCache",
     "reset_quote_cache",
     "Venue",
+    "SPOT_FEES_INCLUDED",
+    "ONCHAIN_FEES_INCLUDED",
+    "SPOT_CONDITIONAL_CAPABILITY",
+    "ONCHAIN_EXECUTION_KIND",
+    "project_spot_capabilities",
+    "project_onchain_capabilities",
 ]
+
+
+#: R06b (D06.2/D06.3): honest fee-inclusion flags (no default-free).
+#: Spot/Alpha quotes carry an explicit policy-estimate fee
+#: (``estimated_fee_usd`` with VWAP impact single-counted), so
+#: ``fees_included=True``. On-chain 0x price carries no fee leg
+#: (``estimated_fee_usd=None``, gas may be null), so ``False``.
+SPOT_FEES_INCLUDED = True
+ONCHAIN_FEES_INCLUDED = False
+
+#: R06b: real capability projection (never an execution permission).
+#: Spot venues expose no verified conditional/stop execution in V1; the
+#: manual exit plan stays ``MANUAL_EXIT_ONLY``. On-chain quotes stay
+#: ``INDICATIVE`` only.
+SPOT_CONDITIONAL_CAPABILITY = "MANUAL_EXIT_ONLY"
+ONCHAIN_EXECUTION_KIND = "INDICATIVE"
+
+
+def project_spot_capabilities(
+    rules: Any | None,
+    *,
+    venue: str,
+    depth_limit: int | None = None,
+    max_price_impact_bps: float | None = None,
+) -> dict[str, Any]:
+    """Project honest spot capability extras (R06b, read-only).
+
+    Returns capability keys only (no order placement, no execution
+    permission): ``fees_included`` (always ``True`` for spot), explicit
+    ``stop_orders_supported`` evidence (``True``/``False`` only with a
+    source ref, else ``None`` for ``UNKNOWN``) and the manual-exit marker.
+    Callers merge the result into ``SpotVenueQuote.capabilities``.
+    """
+    stop_flag: bool | None = None
+    source_ref: str | None = None
+    try:
+        raw_flag = getattr(rules, "stop_orders_supported", None)
+        if isinstance(raw_flag, bool):
+            stop_flag = raw_flag
+        raw_ref = getattr(rules, "conditional_orders_source_ref", None)
+        if isinstance(raw_ref, str) and raw_ref.strip():
+            source_ref = raw_ref.strip()
+        order_types = getattr(rules, "order_types", None)
+        if isinstance(order_types, Mapping):
+            has_stop_true = any(
+                order_types.get(k) is True for k in ("STOP", "STOP_MARKET", "STOP_LOSS", "CONDITIONAL")
+            )
+            has_stop_keys = any(k in order_types for k in ("STOP", "STOP_MARKET", "STOP_LOSS", "CONDITIONAL"))
+            if has_stop_true and stop_flag is None:
+                stop_flag = True
+                if source_ref is None:
+                    try:
+                        source_ref = str(getattr(rules, "rule_version", "") or "")
+                    except Exception:
+                        source_ref = None
+                    if not source_ref:
+                        source_ref = None
+            elif has_stop_keys and stop_flag is None:
+                # Explicit all-False STOP keys are UNSUPPORTED evidence;
+                # absence alone stays None (UNKNOWN).
+                if all(order_types.get(k) is False for k in ("STOP", "STOP_MARKET", "STOP_LOSS", "CONDITIONAL") if k in order_types):
+                    stop_flag = False
+                    if source_ref is None:
+                        try:
+                            source_ref = str(getattr(rules, "rule_version", "") or "")
+                        except Exception:
+                            source_ref = None
+                        if not source_ref:
+                            source_ref = None
+    except Exception:
+        pass
+    # Without a source ref the flag has no rule evidence: project UNKNOWN.
+    if stop_flag is not None and not source_ref:
+        stop_flag = None
+    out: dict[str, Any] = {
+        "fees_included": bool(SPOT_FEES_INCLUDED),
+        "stop_orders_supported": stop_flag,
+        "spot_conditional_capability": str(SPOT_CONDITIONAL_CAPABILITY),
+        "execution_kind": "QUOTE_ONLY",
+    }
+    if source_ref is not None:
+        out["conditional_orders_source_ref"] = str(source_ref)
+    if depth_limit is not None:
+        out["depth_limit_projection"] = int(depth_limit)
+    if max_price_impact_bps is not None:
+        try:
+            out["max_price_impact_bps_projection"] = float(max_price_impact_bps)
+        except (TypeError, ValueError):
+            pass
+    _ = venue
+    return out
+
+
+def project_onchain_capabilities() -> dict[str, Any]:
+    """Project honest on-chain capability extras (R06b, read-only).
+
+    ``INDICATIVE`` only: no trade payload, no execution permission.
+    """
+    return {
+        "fees_included": bool(ONCHAIN_FEES_INCLUDED),
+        "quote_kind": str(ONCHAIN_EXECUTION_KIND),
+        "execution_kind": "INDICATIVE_ONLY",
+        "simulation_verified": False,
+    }
 
 
 def _require_decimal_str(name: str, value: Any) -> str:

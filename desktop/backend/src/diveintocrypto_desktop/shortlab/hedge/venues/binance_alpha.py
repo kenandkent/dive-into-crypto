@@ -479,6 +479,29 @@ class BinanceAlphaVenue:
             ref_notional = target * mid
         expires_at = fetched_ms + self._quote_ttl_ms
         as_of = source_ts if source_ts is not None else fetched_ms
+        # R06b (D06.2/D06.3): honest fee flag + real capability projection.
+        # Alpha stays indicative-only for protection purposes: no new trading
+        # capability or execution permission is added here (quote-only).
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.venues.base import (  # noqa: WPS433
+                SPOT_FEES_INCLUDED as _SPOT_FEES,
+                project_spot_capabilities as _project_spot,
+            )
+
+            _alpha_extra = _project_spot(
+                rules, venue=BINANCE_ALPHA, depth_limit=used_limit,
+                max_price_impact_bps=self._max_impact_bps,
+            )
+            # Alpha has no verified conditional-order execution in V1.
+            _alpha_extra = dict(_alpha_extra)
+            _alpha_extra["execution_kind"] = "QUOTE_ONLY_INDICATIVE"
+        except Exception:
+            _alpha_extra = {
+                "fees_included": True,
+                "spot_conditional_capability": "MANUAL_EXIT_ONLY",
+                "execution_kind": "QUOTE_ONLY_INDICATIVE",
+            }
+            _SPOT_FEES = True  # type: ignore[assignment]
         quote = SpotVenueQuote(
             venue=BINANCE_ALPHA, canonical_id=canonical_id, symbol=symbol,
             chain=None, contract_address=None, as_of_ms=as_of,
@@ -510,10 +533,12 @@ class BinanceAlphaVenue:
                 "limit_supported": bool(rules.order_types.get("LIMIT")),
                 "market_supported": bool(rules.order_types.get("MARKET")),
                 "depth_limit": used_limit, "max_price_impact_bps": self._max_impact_bps,
+                **dict(_alpha_extra),
             },
             identity_confidence=confidence,
             status="OK" if status == "OK" else status,
             reason_code=reason_code,
+            fees_included=bool(_SPOT_FEES),
         )
         result = ProviderResult(
             status=status,  # type: ignore[arg-type]

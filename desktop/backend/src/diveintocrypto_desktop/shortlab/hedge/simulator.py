@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from diveintocrypto_desktop.shortlab.hedge.models import HedgeSimulationResult, Readiness
 
-__all__ = ["SimulationValidationError", "validate_simulation"]
+__all__ = ["SimulationValidationError", "validate_simulation", "validate_goal_mode"]
 
 
 class SimulationValidationError(ValueError):
@@ -58,11 +58,93 @@ def _actual_ratio(result: HedgeSimulationResult) -> tuple[Decimal | None, Decima
     return target, actual, abs(actual - target)
 
 
+def validate_goal_mode(request: Any | None) -> tuple[str | None, list[str]]:
+    """Validate repair goal/mode pair (D03.3, pure).
+
+    Returns ``(effective_goal, reasons)``. ``None`` request carries no
+    goal verdict (legacy history, read-only). ``ABSOLUTE`` only allows
+    ``CARRY_CAPTURE`` (explicit ``BALANCED``/``DIRECTIONAL_SHORT`` is
+    ``GOAL_MODE_MISMATCH``); ``RELATIVE`` without goal derives
+    ``BALANCED``; explicit ``DIRECTIONAL_SHORT`` is allowed.
+    """
+    if request is None:
+        return None, []
+    mode = request.get("mode", getattr(request, "mode", None)) if isinstance(request, Mapping) else getattr(request, "mode", None)
+    goal = request.get("goal", getattr(request, "goal", None)) if isinstance(request, Mapping) else getattr(request, "goal", None)
+    if mode not in ("ABSOLUTE", "RELATIVE"):
+        return None, ["HEDGE_MODE_UNKNOWN"]
+    if goal is None:
+        effective = "CARRY_CAPTURE" if mode == "ABSOLUTE" else "BALANCED"
+        return effective, []
+    if goal not in ("CARRY_CAPTURE", "DIRECTIONAL_SHORT", "BALANCED"):
+        return None, ["HEDGE_GOAL_INVALID"]
+    if mode == "ABSOLUTE" and goal != "CARRY_CAPTURE":
+        return goal, ["GOAL_MODE_MISMATCH"]
+    return goal, []
+
+
+def _validate_breakdown(result: HedgeSimulationResult) -> list[str]:
+    """Validate repair ``readiness_breakdown``/``economics`` internals (D03.3/D18).
+
+    Checks internal consistency only (gates -> readiness, enum validity);
+    a repair ``NOT_READY`` alongside a legacy ``READY`` is allowed: they are
+    separate tracks (legacy research vs bound-ports repair). Missing
+    breakdown/economics on legacy results is also allowed (LEGACY).
+    """
+    extra: list[str] = []
+    bd = getattr(result, "readiness_breakdown", None)
+    if bd is None:
+        return extra
+    if not isinstance(bd, Mapping):
+        return ["BREAKDOWN_INVALID"]
+    for key in ("data_complete", "funding_gate", "execution_gate", "economic_gate", "protection_status", "readiness"):
+        if key not in bd:
+            extra.append("BREAKDOWN_INVALID")
+            return extra
+    if bd.get("protection_status") not in (
+        "CONFIRMED",
+        "PENDING",
+        "UNSUPPORTED",
+        "UNKNOWN",
+        "EXPIRED",
+        "MANUAL_EXIT_ONLY",
+    ):
+        extra.append("BREAKDOWN_PROTECTION_INVALID")
+    if bd.get("readiness") not in ("READY", "NOT_READY", "BLOCKED"):
+        extra.append("BREAKDOWN_READINESS_INVALID")
+    # Gate internal consistency: READY requires all three PASS.
+    try:
+        gates = [bd.get("funding_gate"), bd.get("execution_gate"), bd.get("economic_gate")]
+        statuses = []
+        for gate in gates:
+            if isinstance(gate, Mapping):
+                statuses.append(str(gate.get("status", "UNKNOWN")))
+            else:
+                statuses.append(str(getattr(gate, "status", "UNKNOWN")))
+        if bd.get("readiness") == "READY" and not all(s == "PASS" for s in statuses):
+            extra.append("BREAKDOWN_READINESS_MISMATCH")
+        if bd.get("readiness") not in ("READY", "NOT_READY", "BLOCKED"):
+            pass
+    except Exception:
+        extra.append("BREAKDOWN_INVALID")
+    # Economics shape: hold 1..365 or None; unknown stays UNKNOWN, never 0.
+    econ = getattr(result, "economics", None)
+    if econ is not None:
+        if not isinstance(econ, Mapping):
+            extra.append("ECONOMICS_INVALID")
+        else:
+            hold = econ.get("hold_days")
+            if hold is not None and (not isinstance(hold, int) or isinstance(hold, bool) or not 1 <= hold <= 365):
+                extra.append("HOLD_DAYS_UNKNOWN")
+    return extra
+
+
 def validate_simulation(
     result: HedgeSimulationResult,
     now_ms: int,
     *,
     policy: Any = None,
+    request: Any | None = None,
 ) -> Readiness:
     """Gate a simulation result to a :class:`Readiness` verdict (H04.2).
 
@@ -200,6 +282,16 @@ def validate_simulation(
             if "RISK_VALIDATION_FALSE_VERIFIED" not in reasons:
                 reasons.append("RISK_VALIDATION_FALSE_VERIFIED")
             break
+
+    # 7. R06b repair: goal/mode + breakdown/economics internals (D03.3/D18).
+    # Legacy results without a request stay read-only (no new verdict).
+    _, _goal_reasons = validate_goal_mode(request)
+    for reason in _goal_reasons:
+        if reason not in reasons:
+            reasons.append(reason)
+    for reason in _validate_breakdown(result):
+        if reason not in reasons:
+            reasons.append(reason)
 
     value = "NOT_READY" if reasons else "READY"
     risk = str(result.risk_validation or "UNKNOWN")

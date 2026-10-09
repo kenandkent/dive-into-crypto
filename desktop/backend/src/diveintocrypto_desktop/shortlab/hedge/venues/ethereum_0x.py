@@ -88,6 +88,8 @@ __all__ = [
     "NO_ROUTE",
     "QUOTE_EXPIRED",
     "PRICE_SCHEMA_REJECTED",
+    "ONCHAIN_FEES_INCLUDED",
+    "ONCHAIN_EXECUTION_KIND",
     "Ethereum0xPriceVenue",
     "is_onchain_quote_expired",
     "build_poc_report",
@@ -121,6 +123,10 @@ RATE_LIMITED = "RATE_LIMITED"
 NO_ROUTE = "NO_ROUTE"
 QUOTE_EXPIRED = "QUOTE_EXPIRED"
 PRICE_SCHEMA_REJECTED = "PRICE_SCHEMA_REJECTED"
+#: R06b (D06.2/D06.3): honest fee flag (no fee leg in 0x price) + real
+#: indicative-only capability projection (never an execution permission).
+ONCHAIN_FEES_INCLUDED = False
+ONCHAIN_EXECUTION_KIND = "INDICATIVE_ONLY"
 ONCHAIN_GAS_UNAVAILABLE = "ONCHAIN_GAS_UNAVAILABLE"
 ONCHAIN_DECIMALS_UNVERIFIED = "ONCHAIN_DECIMALS_UNVERIFIED"
 ONCHAIN_IDENTITY_UNVERIFIED = "ONCHAIN_IDENTITY_UNVERIFIED"
@@ -844,6 +850,11 @@ class Ethereum0xPriceVenue:
             simulation_verified=False, quote_currency=QUOTE_ASSET,
             quote_to_usd=None, fetched_at_ms=fetched_ms,
             status=result_status, reason_code=reason,
+            # R06b (D06.2/D06.3): honest fee flag + indicative-only projection.
+            # 0x price carries no fee leg (fee None, gas may be null), so
+            # fees_included=False; quote stays INDICATIVE with no execution
+            # permission (read-only price, never a trade payload).
+            fees_included=False,
         )
         # Stamp the expiry provenance without touching the frozen DTO shape:
         # consumers read `expires_at_ms`; operators read the transport log.

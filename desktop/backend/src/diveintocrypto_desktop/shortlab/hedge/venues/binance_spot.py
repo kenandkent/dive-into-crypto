@@ -472,6 +472,26 @@ class BinanceSpotVenue:
             ref_notional = target * mid
         # 9. DTO -------------------------------------------------------------
         expires_at = fetched_ms + self._quote_ttl_ms
+        # R06b (D06.2/D06.3): honest fee flag + real capability projection.
+        # Spot fee is an explicit policy estimate (VWAP impact single-counted);
+        # no execution permission is added here (quote-only).
+        try:
+            from diveintocrypto_desktop.shortlab.hedge.venues.base import (  # noqa: WPS433
+                SPOT_FEES_INCLUDED as _SPOT_FEES,
+                project_spot_capabilities as _project_spot,
+            )
+
+            _spot_extra = _project_spot(
+                rules, venue=BINANCE_SPOT, depth_limit=used_limit,
+                max_price_impact_bps=self._max_impact_bps,
+            )
+        except Exception:
+            _spot_extra = {
+                "fees_included": True,
+                "spot_conditional_capability": "MANUAL_EXIT_ONLY",
+                "execution_kind": "QUOTE_ONLY",
+            }
+            _SPOT_FEES = True  # type: ignore[assignment]
         quote = SpotVenueQuote(
             venue=BINANCE_SPOT, canonical_id=canonical_id, symbol=symbol,
             chain=None, contract_address=None, as_of_ms=fetched_ms,
@@ -504,10 +524,12 @@ class BinanceSpotVenue:
                 "market_supported": bool(rules.order_types.get("MARKET")),
                 "depth_limit": used_limit, "max_price_impact_bps": self._max_impact_bps,
                 "buy_coverage_ratio": float(buy_cov), "sell_coverage_ratio": float(sell_cov),
+                **dict(_spot_extra),
             },
             identity_confidence=confidence,
             status="OK" if status == "OK" else status,
             reason_code=reason_code,
+            fees_included=bool(_SPOT_FEES),
         )
         result = ProviderResult(
             status=status,  # type: ignore[arg-type]

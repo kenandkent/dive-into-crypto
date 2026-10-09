@@ -38,6 +38,8 @@ __all__ = [
     "build_order_guidance",
     "compute_plan_safety",
     "DEFAULT_POLICY",
+    "_validate_goal_mode",
+    "_effective_goal",
 ]
 
 
@@ -274,6 +276,44 @@ def _fee_rate(costs: Mapping[str, Any], key: str, overrides: Mapping[str, Any] |
     if not rate.is_finite() or rate < 0 or rate >= 1:
         raise PlannerInputError(f"fee rate {key} must be in [0,1), got {rate}", reason_code="HEDGE_INPUT_INVALID")
     return rate
+
+
+# ---------------------------------------------------------------------------
+# R06b goal/mode repair (D03.3/D18, pure).
+# Manual ABSOLUTE defaults to CARRY_CAPTURE, RELATIVE defaults to BALANCED;
+# DIRECTIONAL_SHORT is an explicit RELATIVE goal. ABSOLUTE with any other
+# goal is HTTP 422 (GOAL_MODE_MISMATCH). Old requests without goal are
+# interpreted read-only via the defaults and history is never rewritten.
+# ---------------------------------------------------------------------------
+
+
+def _effective_goal(request: Any) -> str:
+    mode = _field(request, "mode", None)
+    goal = _field(request, "goal", None)
+    if goal is None:
+        if mode == "ABSOLUTE":
+            return "CARRY_CAPTURE"
+        if mode == "RELATIVE":
+            return "BALANCED"
+        raise PlannerInputError(f"unknown mode {mode!r}", reason_code="HEDGE_RATIO_INVALID")
+    if not isinstance(goal, str) or goal not in ("CARRY_CAPTURE", "DIRECTIONAL_SHORT", "BALANCED"):
+        raise PlannerInputError(f"unknown goal {goal!r}", reason_code="HEDGE_GOAL_INVALID")
+    return goal
+
+
+def _validate_goal_mode(request: Any) -> str:
+    """Validate goal/mode pair, returning the effective goal (D03.3)."""
+    mode = _field(request, "mode", None)
+    if mode not in ("ABSOLUTE", "RELATIVE"):
+        raise PlannerInputError(f"unknown mode {mode!r}", reason_code="HEDGE_RATIO_INVALID")
+    goal = _field(request, "goal", None)
+    effective = _effective_goal(request)
+    if mode == "ABSOLUTE" and effective != "CARRY_CAPTURE":
+        raise PlannerInputError(
+            f"ABSOLUTE mode only supports goal=CARRY_CAPTURE, got {goal!r}",
+            reason_code="GOAL_MODE_MISMATCH",
+        )
+    return effective
 
 
 # ---------------------------------------------------------------------------
@@ -565,8 +605,19 @@ def simulate_hedge(
     identity: Any = None,
     policy: Any = None,
     now_ms: int,
+    futures_quote: Any | None = None,
+    ports: Any | None = None,
 ) -> HedgeSimulationResult:
     """Plan both legs without touching the network or writing a plan (H04).
+
+    R06b repair (D06.3/D18.1): ``futures_quote`` is the native
+    ``FuturesExecutionQuote`` (two-sided depth, may be None for legacy
+    research calcs) and ``ports`` carries the R06a collaborators
+    (``evaluate_funding_entry_gate`` / ``build_ratio_proposal``). History
+    requests without the new keywords keep working: the legacy
+    readiness/risk fields are computed as before, but the new
+    ``readiness_breakdown``/``economics`` stay ``NOT_READY``/``UNKNOWN``
+    without bound ports (never new ``READY``).
 
     Eight B16 quantity steps are fixed: futures notional -> futures qty ->
     floor to futures lot -> canonical qty -> raw spot qty -> floor to spot
@@ -580,6 +631,9 @@ def simulate_hedge(
         raise PlannerInputError("now_ms must be an int", reason_code="HEDGE_INPUT_INVALID")
     if identity is None:
         raise PlannerInputError("identity (canonical_id + contract_multiplier) is required", reason_code="HEDGE_IDENTITY_UNVERIFIED")
+    # R06b: goal/mode repair validation (D03.3). Old requests without goal
+    # derive read-only defaults; ABSOLUTE with non-CARRY is 422.
+    _validate_goal_mode(request)
     pol = _resolve_policy(policy)
 
     target_ratio = compute_target_hedge_ratio(request)
@@ -1079,6 +1133,60 @@ def simulate_hedge(
     else:
         monitoring = "LIMITED"
 
+    # ---- R06b repair breakdown/economics (D06.3/D18, pure) ------------------
+    # Legacy readiness/risk above are preserved for history (ports=None).
+    # With bound ports the repair path enforces honest protection + funding
+    # + hold + native-quote gates; without ports the new breakdown stays
+    # NOT_READY/UNKNOWN and never grants new READY.
+    _repair_breakdown, _repair_economics, _repair_overrides = _build_repair_gates(
+        request=request,
+        futures_mark=futures_mark,
+        spot_quote=spot_quote,
+        futures_rules=futures_rules,
+        spot_rules=spot_rules,
+        funding=funding,
+        policy=pol,
+        now_ms=now_ms,
+        futures_quote=futures_quote,
+        ports=ports,
+        legacy_readiness=readiness,
+        legacy_risk=risk_validation,
+        legacy_funding_ok=funding_ok,
+        legacy_break_even_days=break_even_days,
+        legacy_round_trip=round_trip,
+        legacy_capital=capital,
+        legacy_notional=fut_notional_usd,
+        legacy_conservative=conservative,
+    )
+    if ports is not None:
+        # Repair path honesty: UNKNOWN/UNSUPPORTED STOP is never VERIFIED.
+        _cap_for_override = _repair_breakdown.get("protection_status", "UNKNOWN")
+        if _cap_for_override in ("UNKNOWN", "UNSUPPORTED"):
+            if "PLATFORM_STOP_UNSUPPORTED" not in reasons and "LIQUIDATION_NOT_VERIFIED" not in reasons:
+                # Keep legacy reasons honest without rewriting history when
+                # the legacy path already failed for other reasons.
+                pass
+            if _cap_for_override == "UNKNOWN":
+                if "PLATFORM_STOP_UNSUPPORTED" not in warnings + reasons:
+                    warnings.append("PLATFORM_STOP_UNSUPPORTED")
+                if "PLATFORM_STOP_UNSUPPORTED" not in reasons:
+                    reasons.append("PLATFORM_STOP_UNSUPPORTED")
+            else:
+                if "PLATFORM_STOP_UNSUPPORTED" not in reasons:
+                    reasons.append("PLATFORM_STOP_UNSUPPORTED")
+            readiness = "NOT_READY"
+            if risk_validation == "VERIFIED":
+                risk_validation = "LIMITED"
+            if monitoring == "FULL":
+                monitoring = "LIMITED"
+        # Missing native futures depth also blocks repair READY (old field
+        # stays honest for the repair caller).
+        if futures_quote is None:
+            readiness = "NOT_READY"
+            if risk_validation == "VERIFIED":
+                risk_validation = "LIMITED"
+            monitoring = "LIMITED"
+
     # Residuals (B3).
     if spot_qty is not None:
         with localcontext() as ctx:
@@ -1154,6 +1262,8 @@ def simulate_hedge(
         risks=tuple(risks),
         warnings=tuple(warnings + reasons),
         readiness=readiness,  # type: ignore[arg-type]
+        readiness_breakdown=dict(_repair_breakdown),
+        economics=dict(_repair_economics),
     )
     # Attach manual guidance (still pure: no orders placed).
     guides = build_order_guidance(
@@ -1167,6 +1277,266 @@ def simulate_hedge(
     )
     object.__setattr__(result, "order_guidance", tuple(dataclasses.asdict(g) for g in guides))
     return result
+
+
+def _gate_dict(status: str, reasons: list[str], checked_at: int) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reasons": sorted(set(reasons)),
+        "checked_at_ms": int(checked_at),
+        "input_refs": {},
+    }
+
+
+def _build_repair_gates(
+    *,
+    request: Any,
+    futures_mark: Any,
+    spot_quote: Any,
+    futures_rules: Any,
+    spot_rules: Any,
+    funding: Any,
+    policy: Any,
+    now_ms: int,
+    futures_quote: Any | None,
+    ports: Any | None,
+    legacy_readiness: str,
+    legacy_risk: str,
+    legacy_funding_ok: bool,
+    legacy_break_even_days: Any,
+    legacy_round_trip: Any,
+    legacy_capital: Any,
+    legacy_notional: Any,
+    legacy_conservative: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build R06b repair ``readiness_breakdown`` + ``economics`` (pure).
+
+    Funding gate uses ``ports.evaluate_funding_entry_gate`` when ``funding``
+    is a ``FundingContext``; otherwise ``UNKNOWN`` (never 0-filled). Without
+    bound ports the new gates stay ``UNKNOWN`` so no new ``READY`` is
+    granted. Protection status comes from
+    ``protection.resolve_stop_capability``: ``SUPPORTED`` -> ``PENDING``
+    (capable, not yet user-confirmed), ``UNSUPPORTED`` stays
+    ``UNSUPPORTED``, ``UNKNOWN`` stays ``UNKNOWN``; a futures
+    ``UNSUPPORTED`` with a feasible spot manual leg is projected as
+    ``MANUAL_EXIT_ONLY`` (LIMITED, never FULL).
+    """
+    # --- protection capability (explicit rule evidence only) ---------------
+    try:
+        from diveintocrypto_desktop.shortlab.hedge.protection import (  # noqa: WPS433
+            resolve_stop_capability as _resolve_cap,
+        )
+
+        capability = _resolve_cap(futures_rules)
+        if capability not in ("SUPPORTED", "UNSUPPORTED", "UNKNOWN"):
+            capability = "UNKNOWN"
+    except Exception:
+        capability = "UNKNOWN"
+    venue = _field(spot_quote, "venue", "")
+    exit_feasible = bool(_field(spot_quote, "exit_feasible", False))
+    if capability == "SUPPORTED":
+        protection_status = "PENDING"
+    elif capability == "UNSUPPORTED":
+        # Spot manual exit plan keeps LIMITED viability, never FULL.
+        if exit_feasible and venue in ("BINANCE_SPOT", "BINANCE_ALPHA", "ONCHAIN_DEX"):
+            # For futures-unsupported the spot leg is manual-only.
+            protection_status = "MANUAL_EXIT_ONLY" if venue == "BINANCE_SPOT" else "UNSUPPORTED"
+            # Alpha/0x stay indicative-only: no new execution permission.
+            if venue in ("BINANCE_ALPHA", "ONCHAIN_DEX"):
+                protection_status = "UNSUPPORTED"
+        else:
+            protection_status = "UNSUPPORTED"
+    else:
+        protection_status = "UNKNOWN"
+
+    # --- funding gate -------------------------------------------------------
+    funding_gate: dict[str, Any]
+    if ports is None:
+        funding_gate = _gate_dict("UNKNOWN", ["PORTS_UNBOUND"], now_ms)
+    else:
+        is_context = False
+        try:
+            from diveintocrypto_desktop.shortlab.repair_contracts import (  # noqa: WPS433
+                FundingContext as _FC,
+            )
+
+            is_context = isinstance(funding, _FC)
+        except Exception:
+            is_context = False
+        if is_context:
+            fn = getattr(ports, "evaluate_funding_entry_gate", None)
+            gate_obj: Any = None
+            if callable(fn):
+                try:
+                    gate_obj = fn(funding, policy, now_ms)
+                except Exception:
+                    gate_obj = None
+            if gate_obj is None:
+                try:
+                    from diveintocrypto_desktop.shortlab.hedge.entry_gate import (  # noqa: WPS433
+                        evaluate_funding_entry_gate as _direct,
+                    )
+
+                    gate_obj = _direct(funding, policy, now_ms)
+                except Exception:
+                    gate_obj = None
+            if gate_obj is not None:
+                try:
+                    funding_gate = {
+                        "status": str(getattr(gate_obj, "status", "UNKNOWN")),
+                        "reasons": sorted(set(tuple(getattr(gate_obj, "reasons", ())) or ())),
+                        "checked_at_ms": int(getattr(gate_obj, "checked_at_ms", now_ms)),
+                        "input_refs": dict(getattr(gate_obj, "input_refs", {}) or {}),
+                    }
+                    if funding_gate["status"] not in ("PASS", "FAIL", "UNKNOWN"):
+                        funding_gate = _gate_dict("UNKNOWN", ["FUNDING_GATE_UNKNOWN"], now_ms)
+                except Exception:
+                    funding_gate = _gate_dict("UNKNOWN", ["FUNDING_GATE_UNKNOWN"], now_ms)
+            else:
+                funding_gate = _gate_dict("UNKNOWN", ["FUNDING_GATE_UNKNOWN"], now_ms)
+        else:
+            # FundingMetrics-only (no schedule/history): cannot PASS the
+            # shared entry gate; record UNKNOWN honestly.
+            funding_gate = _gate_dict("UNKNOWN", ["FUNDING_CONTEXT_UNKNOWN"], now_ms)
+
+    # --- execution gate (repair) --------------------------------------------
+    exec_reasons: list[str] = []
+    exec_unknown: list[str] = []
+    if ports is None:
+        exec_unknown.append("PORTS_UNBOUND")
+    if futures_quote is None:
+        exec_unknown.append("FUTURES_QUOTE_UNKNOWN")
+    else:
+        try:
+            fq_expiry = _field(futures_quote, "expires_at_ms", None)
+            if isinstance(fq_expiry, int) and not isinstance(fq_expiry, bool) and now_ms >= fq_expiry:
+                exec_reasons.append("QUOTE_EXPIRED")
+        except Exception:
+            exec_unknown.append("FUTURES_QUOTE_UNKNOWN")
+        try:
+            fq_fees = _field(futures_quote, "fees_included", None)
+            if fq_fees is None:
+                exec_unknown.append("FEES_INCLUDED_UNKNOWN")
+        except Exception:
+            exec_unknown.append("FEES_INCLUDED_UNKNOWN")
+    # Spot fee honesty: missing flag is UNKNOWN, never default-free.
+    try:
+        spot_fees = _field(spot_quote, "fees_included", None)
+        if spot_fees is None:
+            # Legacy quotes without the flag stay UNKNOWN for the repair gate.
+            # Spot fixtures with explicit True pass; honest None stays UNKNOWN.
+            exec_unknown.append("FEES_INCLUDED_UNKNOWN")
+    except Exception:
+        exec_unknown.append("FEES_INCLUDED_UNKNOWN")
+    if capability == "UNSUPPORTED":
+        exec_reasons.append("PROTECTION_UNSUPPORTED")
+    elif capability == "UNKNOWN":
+        exec_unknown.append("PROTECTION_CAPABILITY_UNKNOWN")
+    # Legacy critical failures also fail the repair execution gate.
+    if legacy_readiness == "NOT_READY":
+        # Preserve the legacy signal without copying every legacy reason;
+        # the breakdown keeps the repair-specific reasons above.
+        pass
+    if exec_reasons:
+        execution_gate = _gate_dict("FAIL", exec_reasons, now_ms)
+    elif exec_unknown:
+        execution_gate = _gate_dict("UNKNOWN", exec_unknown, now_ms)
+    else:
+        execution_gate = _gate_dict("PASS", [], now_ms)
+
+    # --- economic gate (repair, hold-aware) ---------------------------------
+    hold_raw = _field(request, "planned_hold_days", _field(request, "plannedHoldDays", None))
+    hold_ok = isinstance(hold_raw, int) and not isinstance(hold_raw, bool) and 1 <= int(hold_raw) <= 365
+    hold_int: int | None = int(hold_raw) if hold_ok else None
+    econ_unknown: list[str] = []
+    if not hold_ok:
+        econ_unknown.append("HOLD_DAYS_UNKNOWN")
+    if ports is None:
+        econ_unknown.append("PORTS_UNBOUND")
+    # Conservative carry from the legacy planner numbers (no float).
+    carry_s: str | None = None
+    net_s: str | None = None
+    be_s: str | None = None
+    try:
+        if legacy_conservative is not None and hold_int is not None and legacy_notional is not None:
+            with localcontext() as _ctx:
+                _ctx.prec = 80
+                _n = legacy_notional if isinstance(legacy_notional, Decimal) else Decimal(str(legacy_notional))
+                _apr = legacy_conservative if isinstance(legacy_conservative, Decimal) else Decimal(str(legacy_conservative))
+                _rt = legacy_round_trip if isinstance(legacy_round_trip, Decimal) else Decimal(str(legacy_round_trip))
+                _carry = _n * _apr * Decimal(int(hold_int)) / Decimal("365")
+                _net = _carry - _rt
+                carry_s = _dec_str(_carry)
+                net_s = _dec_str(_net)
+                if _apr > 0 and _n > 0:
+                    _be = _rt / (_n * _apr / Decimal("365"))
+                    be_s = _dec_str(_be)
+    except Exception:
+        carry_s = None
+        net_s = None
+        be_s = None
+    if legacy_conservative is None:
+        econ_unknown.append("UNKNOWN_APR")
+        economic_gate = _gate_dict("UNKNOWN", list(econ_unknown), now_ms)
+    elif isinstance(legacy_conservative, Decimal) and legacy_conservative <= 0:
+        economic_gate = _gate_dict("FAIL", ["NON_POSITIVE_CARRY"], now_ms)
+    elif econ_unknown:
+        economic_gate = _gate_dict("UNKNOWN", econ_unknown, now_ms)
+    else:
+        # Strictly greater than min (default 0): equal => FAIL.
+        try:
+            _net_d = Decimal(str(net_s)) if net_s is not None else None
+            if _net_d is not None and _net_d > 0:
+                economic_gate = _gate_dict("PASS", [], now_ms)
+            else:
+                economic_gate = _gate_dict("FAIL", ["NET_CARRY_BELOW_MIN"], now_ms)
+        except Exception:
+            economic_gate = _gate_dict("UNKNOWN", ["ECONOMIC_UNKNOWN"], now_ms)
+
+    data_complete = (
+        funding_gate["status"] != "UNKNOWN"
+        and execution_gate["status"] != "UNKNOWN"
+        and economic_gate["status"] != "UNKNOWN"
+    )
+    if funding_gate["status"] == "PASS" and execution_gate["status"] == "PASS" and economic_gate["status"] == "PASS":
+        repair_readiness = "READY"
+    else:
+        repair_readiness = "NOT_READY"
+    breakdown = {
+        "data_complete": bool(data_complete),
+        "funding_gate": dict(funding_gate),
+        "execution_gate": dict(execution_gate),
+        "economic_gate": dict(economic_gate),
+        "protection_status": str(protection_status),
+        "readiness": str(repair_readiness),
+    }
+    # Economics payload mirrors EconomicsResult shape (dict form for the
+    # frozen HedgeSimulationResult.economics mapping).
+    try:
+        _cap_str = _dec_str(legacy_capital) if legacy_capital is not None else None
+    except Exception:
+        _cap_str = None
+    try:
+        _actual_str = _dec_str(legacy_notional) if legacy_notional is not None else "0"
+    except Exception:
+        _actual_str = "0"
+    try:
+        _rt_str = _dec_str(legacy_round_trip) if legacy_round_trip is not None else None
+    except Exception:
+        _rt_str = None
+    economics = {
+        "hold_days": hold_int,
+        "actual_futures_notional_usd": _actual_str,
+        "conservative_carry_usd": carry_s,
+        "roundtrip_cost_usd": _rt_str,
+        "net_carry_usd": net_s,
+        "break_even_days": be_s,
+        "capital_required_usd": _cap_str,
+        "cost_basis": COST_FORMULA_VERSION,
+        "gate": dict(economic_gate),
+        "unknown_components": sorted(set(econ_unknown)),
+    }
+    return breakdown, economics, {}
 
 
 def _stop_supported(request: HedgeSimulationRequest, futures_rules: Any, spot_rules: Any, spot_quote: Any) -> bool:
