@@ -1,4 +1,11 @@
-"""Historical evidence reads; frozen quotes are never replaced by live quotes."""
+"""Historical evidence reads; frozen quotes are never replaced by live quotes.
+
+R14b/D14.2/D18.1: TRADE bars (``/fapi/v1/klines``) never masquerade as MARK.
+MARK history flows only through the optional ``mark_price_bars_fn``
+(injected by R10b with the R03 ``fetch_mark_klines_range``); unbound MARK
+paths stay UNKNOWN/empty. No top-level import of the not-yet-merged MARK
+fetcher (injection only).
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -10,6 +17,9 @@ from ...data.binance_klines import fetch_klines_range
 from ..hedge.models import HistoricalPriceBar, HistoricalFundingEvent, HistoricalLifecycle
 
 
+_MARK_SOURCE = "binance:fapi/markPriceKlines:1h"
+
+
 class RepositoryHistoricalMarketProvider:
     """Historical protocol adapter with explicit FX provenance.
 
@@ -17,11 +27,17 @@ class RepositoryHistoricalMarketProvider:
     before the event. An optional ``fx_fn(asset, at_ms)`` can override this
     with another archived source. Missing FX is never guessed from current FX.
     Price reads use bounded historical ranges, not latest-ticker calls.
+
+    R14b: optional ``mark_price_bars_fn`` carries true MARK OHLC
+    (``fetch_mark_klines_range`` shape). When unbound, ``read_mark_price_bars``
+    returns ``()`` (UNKNOWN) and callers must not fall back to TRADE bars.
     """
+
     def __init__(self, repository: Any, *, price_bars_fn=fetch_klines_range,
-                 fx_fn=None, clock_ms=None):
+                 mark_price_bars_fn=None, fx_fn=None, clock_ms=None):
         self.repository = repository
         self.price_bars_fn = price_bars_fn
+        self.mark_price_bars_fn = mark_price_bars_fn
         self.fx_fn = fx_fn
         self.clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.completed_at_ms = 0
@@ -91,7 +107,76 @@ class RepositoryHistoricalMarketProvider:
             result.append(HistoricalPriceBar(
                 symbol, opened, closed, *(str(row[k]) for k in ('o','h','l','c')),
                 'USDT', await self._fx('USDT', closed),
-                'binance:fapi/klines:1h', completed))
+                'binance:fapi/klines:1h', completed,
+                price_basis="TRADE"))
+        return tuple(result)
+
+    async def read_mark_price_bars(self, symbol, start_ms, end_ms, request_context=None):
+        """True MARK 1h bars (R14b/D18.1, price_basis=MARK).
+
+        Injected ``mark_price_bars_fn`` (R03 ``fetch_mark_klines_range`` shape:
+        ``(symbol, interval, start_ms, end_ms, *, request_context)`` returning
+        ``Observed[list[dict]]`` or a plain list) supplies genuine Mark OHLC +
+        close time. Unbound (``None``) returns ``()`` (UNKNOWN); callers must
+        never substitute TRADE bars as MARK. Missing legs stay null, never 0.
+        """
+        if self.mark_price_bars_fn is None:
+            # UNKNOWN: no MARK history bound; never TRADE-as-MARK.
+            return ()
+        context = request_context if request_context is not None else get_current_request_context()
+        self.retryable_history_unavailable = False
+        try:
+            with scoped_request_context(context):
+                try:
+                    observed = await self.mark_price_bars_fn(
+                        symbol, '1h', int(start_ms), int(end_ms),
+                        request_context=context,
+                    )
+                except TypeError:
+                    observed = await self.mark_price_bars_fn(
+                        symbol, '1h', int(start_ms), int(end_ms)
+                    )
+        except Exception:
+            self.retryable_history_unavailable = True
+            raise
+        # Unwrap Observed (R03) or plain list (fakes).
+        rows: Any = getattr(observed, "value", observed)
+        if rows is None:
+            rows = []
+        completed = self.clock_ms()
+        self.completed_at_ms = max(self.completed_at_ms, completed)
+        # Observed receipt proves MARK provenance (real close time).
+        observed_meta = getattr(observed, "meta", None)
+        _ = observed_meta
+        result = []
+        for row in list(rows or ()):
+            if not isinstance(row, dict):
+                continue
+            try:
+                if "openTime" in row:
+                    opened = int(row["openTime"])
+                    closed = int(row["closeTime"])
+                else:
+                    timestamp = int(row["t"])
+                    opened = timestamp // 1000000 if timestamp > 10**15 else timestamp
+                    closed = opened + 3600000 - 1
+            except (TypeError, ValueError, KeyError):
+                continue
+            if opened < int(start_ms) or closed > int(end_ms):
+                continue
+            try:
+                o = str(row["o"])
+                h = str(row["h"])
+                l = str(row["l"])
+                c = str(row["c"])
+            except KeyError:
+                continue
+            result.append(HistoricalPriceBar(
+                symbol, opened, closed, o, h, l, c,
+                'USDT', await self._fx('USDT', closed),
+                _MARK_SOURCE, completed,
+                price_basis="MARK"))
+        result.sort(key=lambda b: (b.open_ms, b.close_ms))
         return tuple(result)
 
     async def read_settled_funding(self, symbol, start_ms, end_ms, request_context=None):

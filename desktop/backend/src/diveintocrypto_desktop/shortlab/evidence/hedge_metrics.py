@@ -45,7 +45,28 @@ import time
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Mapping
 
-__all__ = ["hedge_summary", "parse_hedge_filters"]
+__all__ = ["hedge_summary", "paired_baseline_summary", "parse_hedge_filters"]
+
+
+def paired_baseline_summary(
+    system: Any | None = None,
+    baseline: Any | None = None,
+    pairs: Any | None = None,
+) -> dict[str, Any]:
+    """R14b paired baseline for hedge (identical FCS snapshot only).
+
+    SYSTEM_POLICY and fixed ratios compare only the same (decision_id /
+    fcs_snapshot_id, horizon) samples; missing legs stay missing, never
+    market averages or cross-day substitution.
+    """
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+        paired_baseline_diff as _paired,
+        paired_baseline_summary as _summary,
+    )
+
+    if pairs is not None:
+        return dict(_paired(list(pairs)))
+    return dict(_summary(list(system or ()), list(baseline or ())))
 
 
 def _now_ms() -> int:
@@ -241,8 +262,12 @@ async def hedge_summary(
     sel = parse_hedge_filters(filters)
     # Unknown strategy enum matches nothing (H08 surfaces 422); the DTO
     # still requires a valid strategy, so short-circuit to an empty bucket.
+    # R14b/D15: R00 current only (no fallback literal).
     if sel["_unknown_strategy"]:
-        from diveintocrypto_desktop.shortlab.hedge import HEDGE_EVIDENCE_VERSION as _EV
+        from diveintocrypto_desktop.shortlab.hedge import (
+            HEDGE_EVIDENCE_VERSION_CURRENT as _EV,
+        )
+
         return HedgeEvidenceSummary(
             strategy="ABSOLUTE_100",  # type: ignore[arg-type]
             horizon_days=sel["horizon_days"],  # type: ignore[arg-type]
@@ -273,13 +298,12 @@ async def hedge_summary(
                 cost_hash = None
     evidence_version = sel["evidence_version"]
     if evidence_version is None:
-        try:
-            from diveintocrypto_desktop.shortlab.hedge import (
-                HEDGE_EVIDENCE_VERSION as _EV2,
-            )
-            evidence_version = str(_EV2)
-        except Exception:
-            evidence_version = "hedge_evidence_v2"
+        # R14b/D15: R00 current only (no fallback literal).
+        from diveintocrypto_desktop.shortlab.hedge import (
+            HEDGE_EVIDENCE_VERSION_CURRENT as _EV2,
+        )
+
+        evidence_version = str(_EV2)
 
     now_ms = sel["now_ms"] if sel["now_ms"] is not None else _now_ms()
 

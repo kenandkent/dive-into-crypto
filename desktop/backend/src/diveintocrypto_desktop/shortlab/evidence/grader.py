@@ -23,9 +23,10 @@ Contract (design sections 21.1-21.3, plan Task 16):
   slippage and ``cost_config_hash`` are stored on every outcome; changing any
   cost only writes another outcome row (the table key includes the cost hash),
   never overwrites history.
-- ``MAE / MFE`` use only completed 1h bars with
-  ``entry_ts < close_ts <= exit_ts`` (the entry bar is included, the exit bar
-  -- open at ``exit_ts`` -- is excluded because it closes after the exit).
+- ``MAE / MFE`` use only fully-contained closed 1h bars with
+  ``open_ms >= entry_ts`` and ``close <= exit_ts`` (R14b/D14.2: straddling
+  head/tail hours never contribute their full-hour extremes; without finer
+  MARK the path is PARTIAL).
 - Before the horizon is due the outcome is ``PENDING``. After it is due,
   missing bars give ``UNAVAILABLE`` and a delisted/expired contract gives
   ``CENSORED`` with the last evidenced tradable time/price. A missing or
@@ -169,6 +170,20 @@ def resolve_cost(
         except Exception:
             pass
     return DEFAULT_FEE_ASSUMPTION, DEFAULT_SLIPPAGE_ASSUMPTION, default_cost_hash()
+
+
+def settle_fees_usd(entry_price: Any, exit_price: Any, qty: Any, fee_rate: Any) -> dict[str, str]:
+    """R14b exit-follows-exit fee helper (FX1, no VWAP).
+
+    Delegates to the frozen ``evaluation.settle_fees_usd`` so the directional
+    and hedge paths share one notional-based definition: entry uses entry
+    notional, exit uses exit notional.
+    """
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+        settle_fees_usd as _settle,
+    )
+
+    return _settle(entry_price, exit_price, qty, fee_rate)
 
 
 def horizon_due_ms(score_as_of_ms: int, horizon: str) -> int:
@@ -360,12 +375,21 @@ def _mae_mfe(
     exit_ts_ms: int,
     entry_price: float,
 ) -> tuple[float | None, float | None]:
-    """Short MAE/MFE over bars with ``entry_ts < close <= exit_ts``."""
+    """Short MAE/MFE over fully-contained bars (R14b/D14.2).
+
+    Only bars with ``open_ms >= entry_ts`` and ``close <= exit_ts`` count.
+    A straddling head/tail hour never contributes its full-hour extremes;
+    without finer MARK the path is PARTIAL (see ``evaluation.path_coverage``).
+    """
     worst_high: float | None = None
     best_low: float | None = None
     for bar in bars:
-        close_ms = bar["open_ms"] + HOUR_MS
-        if not (entry_ts_ms < close_ms <= exit_ts_ms):
+        try:
+            open_ms = int(bar["open_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        close_ms = open_ms + HOUR_MS
+        if not (open_ms >= int(entry_ts_ms) and close_ms <= int(exit_ts_ms)):
             continue
         high, low = bar["h"], bar["l"]
         if high is not None and (worst_high is None or high > worst_high):
@@ -377,6 +401,19 @@ def _mae_mfe(
     mae = max(0.0, (worst_high - entry_price) / entry_price)
     mfe = max(0.0, (entry_price - best_low) / entry_price)
     return mae, mfe
+
+
+def complete_bars_in_window(
+    bars: list[dict[str, Any]],
+    entry_ts_ms: int,
+    exit_ts_ms: int,
+) -> list[dict[str, Any]]:
+    """R14b helper: fully-contained bars (open >= entry, close <= exit)."""
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+        filter_complete_bars as _filter,
+    )
+
+    return list(_filter(bars, entry_ts_ms, exit_ts_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -668,13 +705,16 @@ async def _finish_with_exit(
     if bad_marks:
         complete, fraction, _ = _funding_coverage(window, entry_ts, exit_ts)
         _ = complete
+        # R14b/D14.2: missing Mark lowers priced funding coverage (never 0-fill).
+        priced = ((len(window) - len(bad_marks)) / len(window)) if window else 0.0
+        priced_coverage = min(float(fraction), float(priced))
         return await persist(
             store(
                 **{
                     **common,
                     "outcome_status": "CENSORED" if censored else "UNAVAILABLE",
                     "reason_code": FUNDING_MARK_MISSING,
-                    "funding_coverage": float(fraction),
+                    "funding_coverage": float(priced_coverage),
                     "funding_carry": None,
                     "net_short_return": None,
                 }

@@ -125,21 +125,41 @@ def _resolve_sample_policy(config: Any | None) -> str:
 
 
 def _current_feature_version() -> str:
-    try:
-        from diveintocrypto_desktop.shortlab.scoring.versions import FEATURE_VERSION
+    # R14b/D15: R00 current only (no local fallback literal).
+    from diveintocrypto_desktop.shortlab.scoring.versions import (
+        FEATURE_VERSION_CURRENT as _FEATURE_CURRENT,
+    )
 
-        return str(FEATURE_VERSION)
-    except Exception:  # noqa: BLE001 - never blocks the report
-        return "features-v2"
+    return str(_FEATURE_CURRENT)
 
 
 def _current_entry_version() -> str | None:
-    try:
-        from diveintocrypto_desktop.shortlab.scoring.versions import ENTRY_VERSION
+    # R14b/D15: R00 current only (no local fallback literal).
+    from diveintocrypto_desktop.shortlab.scoring.versions import (
+        ENTRY_VERSION_CURRENT as _ENTRY_CURRENT,
+    )
 
-        return str(ENTRY_VERSION)
-    except Exception:  # noqa: BLE001 - never blocks the report
-        return None
+    return str(_ENTRY_CURRENT)
+
+
+def paired_baseline_summary(
+    system: Any | None = None,
+    baseline: Any | None = None,
+    pairs: Any | None = None,
+) -> dict[str, Any]:
+    """R14b paired baseline (identical samples only, never market average).
+
+    Delegates to ``evaluation.paired_baseline_diff`` so directional and
+    hedge metrics share one definition.
+    """
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+        paired_baseline_diff as _paired,
+        paired_baseline_summary as _summary,
+    )
+
+    if pairs is not None:
+        return dict(_paired(list(pairs)))
+    return dict(_summary(list(system or ()), list(baseline or ())))
 
 
 def _empty_bucket() -> dict[str, Any]:
@@ -157,6 +177,11 @@ def _empty_bucket() -> dict[str, Any]:
         "notGradedDue": 0,
         "sampled": 0,
         "rawTotal": 0,
+        # R14b extras (paired baseline / coverage / bootstrap; additive).
+        "pairedBaselineDiff": None,
+        "coverage": None,
+        "censoredCount": 0,
+        "bootstrapStatus": None,
     }
 
 
@@ -535,6 +560,7 @@ __all__ = [
     "NOT_GRADED_DUE",
     "OUTCOME_STATUSES",
     "build_metrics_provider",
+    "paired_baseline_summary",
     "parse_horizons",
     "summary",
 ]

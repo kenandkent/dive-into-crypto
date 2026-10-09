@@ -5,6 +5,13 @@ The runtime (F06b) registers this callback via
 starts a second service and never imports ``scan/symbol_builder`` -- grading
 reads only archived score snapshots plus post-score market data.
 
+R14b/D14: exit fees follow exit notionals, MAE/MFE use only fully-contained
+bars, delisted stays CENSORED (never 0-fill); metrics pair baselines on
+identical samples with bootstrap INSUFFICIENT marking. Runtime wiring for
+``build_metrics_provider`` is the normal Runtime injection (R10b接线):
+``service._metrics_provider = build_metrics_provider(repository, config,
+clock)`` -- no test alias in production.
+
 Behaviour:
 
 - scans the default 180d ``SUCCEEDED`` history (``list_scores_for_evidence``)
@@ -237,4 +244,18 @@ async def run_due(
     )
 
 
-__all__ = ["run_due"]
+def runtime_wiring_notes() -> dict[str, str]:
+    """R14b normal Runtime injection for ``build_metrics_provider`` (R10b接线).
+
+    Production wires ``service._metrics_provider =
+    build_metrics_provider(repository, config, clock)``; tests assign the
+    same provider directly. No alias/fallback in production builds.
+    """
+    return {
+        "provider": "diveintocrypto_desktop.shortlab.evidence.metrics.build_metrics_provider",
+        "wiring": "service._metrics_provider = build_metrics_provider(repository, config, clock)",
+        "owner": "R10b",
+    }
+
+
+__all__ = ["run_due", "runtime_wiring_notes"]

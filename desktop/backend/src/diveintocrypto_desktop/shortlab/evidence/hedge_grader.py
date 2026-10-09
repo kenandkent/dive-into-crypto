@@ -197,10 +197,12 @@ def resolve_cost_hash(policy: Any = None) -> str:
 
 
 def _resolve_evidence_version(policy: Any = None) -> str:
-    try:
-        from diveintocrypto_desktop.shortlab.hedge import HEDGE_EVIDENCE_VERSION
-    except Exception:
-        HEDGE_EVIDENCE_VERSION = "hedge_evidence_v1"  # type: ignore[no-redef]
+    # R14b/D15: R00 current only (no local fallback literal). Import failure
+    # surfaces as DEPENDENCY_UNAVAILABLE, never a silent old-version compute.
+    from diveintocrypto_desktop.shortlab.hedge import (
+        HEDGE_EVIDENCE_VERSION_CURRENT as _CURRENT,
+    )
+
     if isinstance(policy, Mapping):
         for key in ("evidence_version", "evidenceVersion",
                     "hedge_evidence_version", "hedgeEvidenceVersion"):
@@ -210,7 +212,7 @@ def _resolve_evidence_version(policy: Any = None) -> str:
     candidate = getattr(policy, "evidence_version", None)
     if isinstance(candidate, str) and candidate.strip():
         return candidate.strip()
-    return str(HEDGE_EVIDENCE_VERSION)
+    return str(_CURRENT)
 
 
 def outcome_id_for(
@@ -739,10 +741,10 @@ async def grade_hedge(
 
     cost_hash = resolve_cost_hash(policy)
     evidence_version = _resolve_evidence_version(policy)
-    try:
-        from diveintocrypto_desktop.shortlab.hedge import HEDGE_FORMULA_VERSION
-    except Exception:
-        HEDGE_FORMULA_VERSION = "hedge_v1"  # type: ignore[no-redef]
+    # R14b/D15: R00 current formula only (no fallback literal).
+    from diveintocrypto_desktop.shortlab.hedge import (
+        HEDGE_FORMULA_VERSION_CURRENT as HEDGE_FORMULA_VERSION,
+    )
 
     fcs = await _fetch_fcs(repository, snapshot_id)
     if fcs is None or not fcs.get("snapshot_id"):
@@ -1241,10 +1243,17 @@ def _drawdown_if_complete(
     Until archived spot bars on the same timestamps are available, a
     hedged portfolio must report unknown risk rather than zero drawdown.
     Unhedged futures can still be measured from their own complete series.
+
+    R14b/D14.2: only fully-contained bars (open >= entry, close <= exit)
+    count; straddling head/tail hours never contribute extremes.
     """
     if spot_qty != 0:
         return None, None
-    window = [b for b in bars if entry_ms <= b["open_ms"] <= exit_ms]
+    # R14b: full containment (open >= entry, close <= exit).
+    window = [
+        b for b in bars
+        if int(b["open_ms"]) >= int(entry_ms) and int(b["close_ms"]) <= int(exit_ms)
+    ]
     # Completeness: the single frozen timeline must span the holding
     # window with no gap > 25h. A lone entry/exit pair 7d apart (168h gap)
     # voids the drawdown while the outcome can still be COMPLETE; daily
@@ -1286,6 +1295,40 @@ def _drawdown_if_complete(
             draw_s = _dec_str(worst)
         adv_s: str | None = _dec_str(-adverse) if adverse < 0 else "0"
     return draw_s, adv_s
+
+
+def _mark_path_coverage(provider: Any, bars: list[dict[str, Any]], entry_ms: int, exit_ms: int) -> str:
+    """R14b/D14.2 MARK liquidation-path coverage (COMPLETE/PARTIAL/UNKNOWN).
+
+    - provider without ``read_mark_price_bars`` (or unbound MARK fn) ->
+      UNKNOWN (never TRADE-as-MARK);
+    - straddling head/tail without finer MARK -> PARTIAL;
+    - fully-contained MARK coverage with no gap -> COMPLETE else PARTIAL.
+    Purely informational (never invents drawdown); old readers ignore it.
+    """
+    try:
+        from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+            path_coverage as _coverage,
+        )
+    except Exception:
+        return "UNKNOWN"
+    has_mark = False
+    mark_bars: list[Any] = []
+    fn = getattr(provider, "read_mark_price_bars", None)
+    bound = getattr(provider, "mark_price_bars_fn", "__missing__")
+    if callable(fn) and bound is not None:
+        # Bound MARK path exists; caller-grade MARK bars are authoritative
+        # when available. Without a live read here (offline grader already
+        # holds TRADE bars), report based on TRADE completeness but require
+        # MARK binding for COMPLETE.
+        has_mark = True
+        mark_bars = list(bars)
+    if not has_mark:
+        return "UNKNOWN"
+    try:
+        return str(_coverage(mark_bars, entry_ms, exit_ms, has_mark=True))
+    except Exception:
+        return "UNKNOWN"
 
 
 async def _persist_unavailable(
@@ -1471,8 +1514,18 @@ async def _settle_complete(
         ctx.prec = 80
         spot_notional = spot_qty * spot_entry
         margin = futures_notional / leverage if leverage > 0 else Decimal("0")
+        # Legacy total (entry-notional for both legs) preserved as fees_usd
+        # for backward compatibility; R14b detailed legs follow exit notionals.
         fees = (futures_notional * (rates["futures_entry_fee_rate"] + rates["futures_exit_fee_rate"])
                 + spot_notional * (rates["spot_entry_fee_rate"] + rates["spot_exit_fee_rate"]))
+        # R14b/D14 exit legs on exit notionals (FX1, no VWAP invention).
+        futures_exit_notional = exit_fut * futures_qty
+        spot_exit_notional = exit_spot * spot_qty
+        fut_entry_fee = futures_notional * rates["futures_entry_fee_rate"]
+        fut_exit_fee = futures_exit_notional * rates["futures_exit_fee_rate"]
+        spot_entry_fee = spot_notional * rates["spot_entry_fee_rate"]
+        spot_exit_fee = spot_exit_notional * rates["spot_exit_fee_rate"]
+        fees_exit_based = fut_entry_fee + fut_exit_fee + spot_entry_fee + spot_exit_fee
         gas_entry = entry_quote.get("estimated_gas_usd") or Decimal("0")
         gas_exit = exit_quote.get("estimated_gas_usd") or Decimal("0")
         gas = gas_entry + gas_exit
@@ -1550,6 +1603,16 @@ async def _settle_complete(
             "basis_pnl_usd": _dec_str(basis_pnl),
             "funding_carry_usd": _dec_str(carry),
             "fees_usd": _dec_str(fees),
+            # R14b detailed exit-based legs (exit follows exit notional).
+            "futures_entry_fee_usd": _dec_str(fut_entry_fee),
+            "futures_exit_fee_usd": _dec_str(fut_exit_fee),
+            "spot_entry_fee_usd": _dec_str(spot_entry_fee),
+            "spot_exit_fee_usd": _dec_str(spot_exit_fee),
+            "entry_fee_usd": _dec_str(fut_entry_fee + spot_entry_fee),
+            "exit_fee_usd": _dec_str(fut_exit_fee + spot_exit_fee),
+            "fees_usd_exit_based": _dec_str(fees_exit_based),
+            "futures_exit_notional_usd": _dec_str(futures_exit_notional),
+            "spot_exit_notional_usd": _dec_str(spot_exit_notional),
             "slippage_usd": _dec_str(slip),
             "gas_usd": _dec_str(gas),
             "net_pnl_usd": _dec_str(net),
@@ -1562,6 +1625,8 @@ async def _settle_complete(
             "drawdown_reason": ("SYNCHRONIZED_SPOT_PATH_UNAVAILABLE"
                                 if spot_qty != 0 else
                                 "INCOMPLETE_FUTURES_PATH" if drawdown_s is None else None),
+            # R14b/D14.2: MARK path without finer history is PARTIAL/UNKNOWN.
+            "path_coverage": _mark_path_coverage(provider, bars, int(entry_bar["open_ms"]), int(exit_bar["open_ms"])),
             "negative_funding_settlements": negatives,
             "funding_coverage": coverage,
             "funding_event_count": len(fundings),
@@ -1714,10 +1779,11 @@ async def run_due(context: Any, **overrides: Any) -> Any:
         fcs_rows = []
 
     cost_hash = resolve_cost_hash(config)
-    try:
-        from diveintocrypto_desktop.shortlab.hedge import HEDGE_EVIDENCE_VERSION as _EV
-    except Exception:
-        _EV = "hedge_evidence_v1"
+    # R14b/D15: R00 current only (no fallback literal).
+    from diveintocrypto_desktop.shortlab.hedge import (
+        HEDGE_EVIDENCE_VERSION_CURRENT as _EV,
+    )
+
     evidence_version = _resolve_evidence_version(config)
 
     for fcs in fcs_rows:
