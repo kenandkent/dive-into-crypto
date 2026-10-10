@@ -28,6 +28,7 @@ from diveintocrypto_desktop.shortlab.scoring.ltss import (
 from diveintocrypto_desktop.shortlab.scoring.profiles import Profile, select_profile
 from diveintocrypto_desktop.shortlab.scoring.versions import (
     FEATURE_VERSION,
+    FEATURE_VERSION_CURRENT,
     SCORE_VERSION_FULL,
     SCORE_VERSION_LITE,
 )
@@ -577,7 +578,7 @@ class TestScoreLite:
         assert breakdown.ltss == 100.0
         assert breakdown.profile == profile
         assert breakdown.score_version == SCORE_VERSION_LITE
-        assert breakdown.feature_version == FEATURE_VERSION
+        assert breakdown.feature_version == FEATURE_VERSION_CURRENT
         assert breakdown.config_hash == config_hash(config)
         assert sum(breakdown.module_scores.values()) == pytest.approx(100.0)
 
@@ -797,3 +798,38 @@ class TestPurityAndContract:
             assert score.ltss == first_score.ltss
             assert score.module_scores == first_score.module_scores
             assert score.reasons == first_score.reasons
+
+
+# ---------------------------------------------------------------------------
+# CR10: v3 production bucket, legacy v2 replay preserved (D03/D14/D15)
+# ---------------------------------------------------------------------------
+
+
+class TestCR10Versions:
+    def test_new_snapshot_is_v3(self):
+        snap = extract_features(_max_inputs(), ASOF_MS)
+        assert snap.feature_version == FEATURE_VERSION_CURRENT == "features-v3"
+        assert snap.snapshot_id == f"TESTUSDT:{ASOF_MS}:features-v3"
+        assert snap.source_meta["feature_version"] == "features-v3"
+
+    def test_score_preserves_legacy_v2_bucket(self, config):
+        from dataclasses import replace
+
+        snap = extract_features(_max_inputs(), ASOF_MS)
+        legacy = replace(
+            snap,
+            snapshot_id=f"{snap.symbol}:{snap.as_of_ms}:{FEATURE_VERSION}",
+            feature_version=FEATURE_VERSION,
+            source_meta={**dict(snap.source_meta), "feature_version": FEATURE_VERSION},
+        )
+        assert legacy.snapshot_id != snap.snapshot_id
+        lite = score_lite(legacy, "GENERAL_LITE", config)
+        assert lite.feature_version == "features-v2"
+        assert lite.ltss == score_lite(snap, "GENERAL_LITE", config).ltss
+        full = score_full(legacy, "GENERAL_FULL", config)
+        assert full.feature_version == "features-v2"
+
+    def test_new_score_stamps_v3(self, config):
+        snap = extract_features(_max_inputs(), ASOF_MS)
+        assert score_lite(snap, "GENERAL_LITE", config).feature_version == "features-v3"
+        assert score_full(snap, "GENERAL_FULL", config).feature_version == "features-v3"

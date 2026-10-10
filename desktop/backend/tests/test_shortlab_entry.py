@@ -70,7 +70,10 @@ from diveintocrypto_desktop.shortlab.repository import (
     ScoreSnapshotRecord,
     ShortLabRepository,
 )
-from diveintocrypto_desktop.shortlab.scoring.versions import ENTRY_VERSION
+from diveintocrypto_desktop.shortlab.scoring.versions import (
+    ENTRY_VERSION,
+    ENTRY_VERSION_CURRENT,
+)
 
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
@@ -805,7 +808,7 @@ class TestEntryPersistence:
         result = await build_entry_snapshot(
             "BTCUSDT", budget=EntryBudget(), as_of_ms=ASOF_MS, now_ms=FETCHED_MS
         )
-        assert result.snapshot_id == f"entry-BTCUSDT-{ASOF_MS}-{ENTRY_VERSION}"
+        assert result.snapshot_id == f"entry-BTCUSDT-{ASOF_MS}-{ENTRY_VERSION_CURRENT}"
         assert set(result.source_meta) == set(REQUIRED_ENTRY_META_BLOCKS)
         assert set(result.inputs) == set(REQUIRED_ENTRY_META_BLOCKS) | {"_meta"}
         for block, meta in result.source_meta.items():
@@ -826,7 +829,7 @@ class TestEntryPersistence:
             assert await repo.entry_source_status(snapshot_id) == "OK"
             stored = await repo.get_entry(snapshot_id)
             assert stored is not None
-            assert stored.entry_version == ENTRY_VERSION
+            assert stored.entry_version == ENTRY_VERSION_CURRENT
             assert stored.primary_tf == "1h"
             assert stored.symbol == "BTCUSDT"
             assert stored.as_of_ms == ASOF_MS
@@ -887,7 +890,7 @@ class TestEntryPersistence:
                 analysis_tier="LITE",
                 profile="GENERAL_LITE",
                 score_version="ltss-lite-v1",
-                entry_version=ENTRY_VERSION,
+                entry_version=ENTRY_VERSION_CURRENT,
                 feature_version="features-v1",
                 config_hash=config_hash(load_shortlab_config()),
                 ltss=81.0,
@@ -998,9 +1001,57 @@ class TestEntryPersistence:
         result = await build_entry_snapshot(
             "BTCUSDT", budget=EntryBudget(), as_of_ms=ASOF_MS, now_ms=FETCHED_MS
         )
-        assert result.snapshot_id == f"entry-BTCUSDT-{ASOF_MS}-{ENTRY_VERSION}"
+        assert result.snapshot_id == f"entry-BTCUSDT-{ASOF_MS}-{ENTRY_VERSION_CURRENT}"
         assert set(result.source_meta) == set(REQUIRED_ENTRY_META_BLOCKS)
         assert result.dive_weights_hash and result.dive_config_hash
         assert result.dive_engine_version
         replayed = recompute_entry_from_record(result.to_record())
         assert replayed["entry_score"] == result.entry_score
+
+
+class TestCR10Versions:
+    def test_legacy_v2_record_replays_without_upgrade(self):
+        from diveintocrypto_desktop.shortlab.entry import ENTRY_VERSIONS_ALL
+        from diveintocrypto_desktop.shortlab.repository import EntrySnapshotRecord
+
+        assert set(ENTRY_VERSIONS_ALL) == {"entry-v2", "entry-v3"}
+        legacy_inputs = {
+            "consensus": {"finalSignal": "SELL", "confidence": 80},
+            "mtf": {"score": -80, "direction": -1, "gate": True},
+            "micro": {"score": -70, "active": 3},
+            "regime": {"regime": "TREND", "adaptive_score": -10},
+            "failed_bounce": {"triggered": True},
+            "funding": {"positive_ratio_30d": 0.8, "complete": True},
+        }
+        legacy = EntrySnapshotRecord(
+            snapshot_id=f"entry-BTCUSDT-{ASOF_MS}-{ENTRY_VERSION}",
+            symbol="BTCUSDT",
+            as_of_ms=ASOF_MS,
+            entry_version=ENTRY_VERSION,
+            dive_weights_hash="w",
+            dive_engine_version="e",
+            dive_config_hash="c",
+            primary_tf="1h",
+            inputs=dict(legacy_inputs),
+            components={},
+            source_meta={},
+            entry_score=80.0,
+            created_at_ms=ASOF_MS,
+        )
+        replayed = recompute_entry_from_record(legacy)
+        assert replayed["entry_score"] is not None
+        assert legacy.snapshot_id != legacy.snapshot_id.replace("entry-v2", "entry-v3")
+        assert legacy.entry_version == "entry-v2"
+
+    @pytest.mark.asyncio
+    async def test_new_snapshot_and_record_are_v3(self, monkeypatch):
+        calls = _CallLog()
+        _install_fakes(monkeypatch, calls, assembled=_canned_assembled())
+        result = await build_entry_snapshot(
+            "BTCUSDT", budget=EntryBudget(), as_of_ms=ASOF_MS, now_ms=FETCHED_MS
+        )
+        assert result.snapshot_id.endswith("-entry-v3")
+        assert result.inputs["_meta"]["entry_version"] == ENTRY_VERSION_CURRENT
+        record = result.to_record()
+        assert record.entry_version == "entry-v3"
+        assert record.snapshot_id == result.snapshot_id

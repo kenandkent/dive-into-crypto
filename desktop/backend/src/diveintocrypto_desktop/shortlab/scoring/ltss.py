@@ -39,12 +39,15 @@ from diveintocrypto_desktop.shortlab.models import FeatureSnapshot
 from diveintocrypto_desktop.shortlab.scoring.profiles import Profile, select_profile
 from diveintocrypto_desktop.shortlab.scoring.versions import (
     FEATURE_VERSION,
+    FEATURE_VERSION_CURRENT,
     SCORE_VERSION_FULL,
     SCORE_VERSION_LITE,
 )
 
 __all__ = [
     "FEATURE_VERSION",
+    "FEATURE_VERSION_CURRENT",
+    "FEATURE_VERSIONS_ALL",
     "SCORE_VERSION_FULL",
     "SCORE_VERSION_LITE",
     "FULL_MODULE_MAX",
@@ -73,6 +76,26 @@ FULL_MODULE_MAX: dict[str, int] = {
     "narrative": 15,
     "tradeability": 10,
 }
+
+#: Readable feature buckets (CR10/D15): new computation emits CURRENT/v3;
+#: legacy v2 snapshots stay decodable and are never rewritten on replay.
+FEATURE_VERSIONS_ALL = frozenset({FEATURE_VERSION, FEATURE_VERSION_CURRENT})
+
+
+def _echo_feature_version(features: FeatureSnapshot) -> str:
+    """Preserve a known input bucket on replay, else stamp CURRENT.
+
+    New snapshots from :func:`extract_features` already carry CURRENT/v3.
+    Re-scoring a stored v2 snapshot keeps v2 so old rows/buckets are never
+    silently upgraded; unknown/missing versions fall back to CURRENT.
+    """
+    try:
+        ver = getattr(features, "feature_version", None)
+    except Exception:  # noqa: BLE001 - defensive
+        ver = None
+    if isinstance(ver, str) and ver in FEATURE_VERSIONS_ALL:
+        return ver
+    return str(FEATURE_VERSION_CURRENT)
 
 
 def round_half_up_1(value: float) -> float:
@@ -373,7 +396,7 @@ def extract_features(inputs: Mapping[str, Any], as_of_ms: int) -> FeatureSnapsho
 
     source_meta: dict[str, Any] = {
         "as_of_ms": as_of,
-        "feature_version": FEATURE_VERSION,
+        "feature_version": FEATURE_VERSION_CURRENT,
         "critical_missing": sorted(critical_missing),
         "null_reasons": null_reasons,
         "spot_applicable": spot_applicable,
@@ -381,12 +404,12 @@ def extract_features(inputs: Mapping[str, Any], as_of_ms: int) -> FeatureSnapsho
         "funding_90d_complete": bool(funding_90d_complete),
     }
 
-    snapshot_id = f"{symbol}:{as_of}:{FEATURE_VERSION}"
+    snapshot_id = f"{symbol}:{as_of}:{FEATURE_VERSION_CURRENT}"
     return FeatureSnapshot(
         snapshot_id=snapshot_id,
         symbol=symbol,
         as_of_ms=as_of,
-        feature_version=FEATURE_VERSION,
+        feature_version=FEATURE_VERSION_CURRENT,
         features=features,
         source_meta=source_meta,
         data_quality=None,
@@ -503,7 +526,7 @@ def score_lite(
         ltss=ltss,
         profile=profile_key,
         score_version=SCORE_VERSION_LITE,
-        feature_version=FEATURE_VERSION,
+        feature_version=_echo_feature_version(features),
         config_hash=config_hash(config),
         module_scores=dict(module_scores),
         module_raws=dict(module_raws),
@@ -593,7 +616,7 @@ def score_full(
         ltss=ltss,
         profile=full_key,
         score_version=SCORE_VERSION_FULL,
-        feature_version=FEATURE_VERSION,
+        feature_version=_echo_feature_version(features),
         config_hash=config_hash(config),
         module_scores=dict(module_scores),
         module_raws=dict(module_raws),

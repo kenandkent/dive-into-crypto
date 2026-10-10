@@ -41,7 +41,8 @@ Contract fixes vs the legacy ``service._build_inputs`` path (A5.1):
 LTSS/Entry bin math and rounding are untouched: :meth:`to_ltss_inputs`
 emits exactly the keys ``scoring.ltss.extract_features`` reads, and the
 math versions stay ``ltss-lite-v1`` / ``ltss-full-v1`` while the input
-contract itself is ``features-v2``.
+contract itself is ``features-v3`` (CR10/D15: new production bucket;
+legacy ``features-v2`` rows remain readable and are never rewritten).
 """
 
 from __future__ import annotations
@@ -58,10 +59,15 @@ from diveintocrypto_desktop.shortlab.observations import (
     validate_observation,
 )
 from diveintocrypto_desktop.shortlab.quality import FieldState, QualityPolicy
-from diveintocrypto_desktop.shortlab.scoring.versions import FEATURE_VERSION
+from diveintocrypto_desktop.shortlab.scoring.versions import (
+    FEATURE_VERSION,
+    FEATURE_VERSION_CURRENT,
+)
 
 __all__ = [
     "FEATURE_INPUTS_VERSION",
+    "FEATURE_INPUTS_VERSION_V2",
+    "FEATURE_INPUTS_VERSIONS_ALL",
     "REPLAY_CONFIG_UNAVAILABLE",
     "FUNDING_HISTORY_INCOMPLETE",
     "DATA_MISSING",
@@ -72,8 +78,16 @@ __all__ = [
     "build_field_states",
 ]
 
-#: Input-contract version stamped on every :class:`FeatureInputs`.
-FEATURE_INPUTS_VERSION = FEATURE_VERSION
+#: Input-contract version stamped on every new :class:`FeatureInputs`
+#: (CR10/D15: CURRENT/v3 production bucket).
+FEATURE_INPUTS_VERSION = FEATURE_VERSION_CURRENT
+
+#: Legacy input-contract bucket, frozen for history decode/replay only.
+#: Old ``features-v2`` JSON stays readable and is never rewritten.
+FEATURE_INPUTS_VERSION_V2 = FEATURE_VERSION
+
+#: All readable input-contract buckets (new writes use CURRENT/v3).
+FEATURE_INPUTS_VERSIONS_ALL = frozenset({FEATURE_VERSION, FEATURE_VERSION_CURRENT})
 
 #: Raised (as ``ValueError``) when history is replayed without its policy.
 REPLAY_CONFIG_UNAVAILABLE = "REPLAY_CONFIG_UNAVAILABLE"

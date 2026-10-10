@@ -1,5 +1,6 @@
 """F05: frozen production inputs, policy DQ/risk and version markers.
 
+CR10: new production bucket is v3 (CURRENT); legacy v2 rows stay readable.
 Offline fixture suite (no network, no DB). Covers the F05 scenario table:
 
 - complete funding sequence is no longer None; the 7D risk view reuses the
@@ -9,8 +10,9 @@ Offline fixture suite (no network, no DB). Covers the F05 scenario table:
 - a successful book is real DQ (never NOT_WIRED) and a single-sided book
   is PARTIAL, never a faked double-sided OK;
 - the legacy ``4909ffe7...`` scoring hash and the LTSS/Entry bin math stay
-  golden; the fixed input contract is told apart by ``features-v2`` /
-  ``entry-v2`` (math versions stay ``ltss-lite-v1`` / ``ltss-full-v1``).
+  golden; the fixed input contract is told apart by ``features-v3`` /
+  ``entry-v3`` (legacy ``features-v2`` / ``entry-v2`` readable, math
+  versions stay ``ltss-lite-v1`` / ``ltss-full-v1``).
 
 Plus the F05.4 guard (missing legacy policy must not recompute history
 with today's config), the R07 future-timestamp rule (v2 invalid, v1
@@ -55,7 +57,9 @@ from diveintocrypto_desktop.shortlab.risk.veto import (
 from diveintocrypto_desktop.shortlab.scoring.ltss import extract_features, score_lite
 from diveintocrypto_desktop.shortlab.scoring.versions import (
     ENTRY_VERSION,
+    ENTRY_VERSION_CURRENT,
     FEATURE_VERSION,
+    FEATURE_VERSION_CURRENT,
     SCORE_VERSION_FULL,
     SCORE_VERSION_LITE,
 )
@@ -221,7 +225,7 @@ def inputs(config):
 class TestCompleteFundingAndShared7D:
     def test_rates_30d_complete_ascending(self, inputs):
         assert isinstance(inputs, FeatureInputs)
-        assert inputs.version == "features-v2"
+        assert inputs.version == "features-v3"
         assert len(inputs.funding_rates_30d) == 90
         assert inputs.funding_rates_30d == tuple([0.0001] * 90)
         assert inputs.funding_30d_complete is True
@@ -376,6 +380,8 @@ class TestGoldensAndVersions:
     def test_versions(self):
         assert FEATURE_VERSION == "features-v2"
         assert ENTRY_VERSION == "entry-v2"
+        assert FEATURE_VERSION_CURRENT == "features-v3"
+        assert ENTRY_VERSION_CURRENT == "entry-v3"
         assert SCORE_VERSION_LITE == "ltss-lite-v1"
         assert SCORE_VERSION_FULL == "ltss-full-v1"
 
@@ -387,9 +393,10 @@ class TestGoldensAndVersions:
         assert carry_mod.score_funding_stability([0.0001] * 90)[0] == 2
         assert life_mod.score_ath_drawdown((31.96 - 100.0) / 100.0)[0] == 7
 
-    def test_snapshot_carries_v2_with_v1_math(self, config, inputs):
+    def test_snapshot_carries_v3_with_v1_math(self, config, inputs):
         snap = extract_features(inputs.to_ltss_inputs(), ASOF_MS)
-        assert snap.feature_version == "features-v2"
+        assert snap.feature_version == "features-v3"
+        assert snap.snapshot_id.endswith(":features-v3")
         breakdown = score_lite(snap, "GENERAL_LITE", config)
         assert breakdown.score_version == "ltss-lite-v1"
         assert breakdown.config_hash == GOLDEN_SCORING_HASH
@@ -533,3 +540,33 @@ def test_oi_quote_nominal_uses_fx_without_contract_multiplier(config):
     missing_fx = build_feature_inputs("TESTUSDT", observations, _identity(1000), ASOF_MS, config)
     assert missing_fx.oi_value_usd is None
     assert missing_fx.oi_change_7d == ratio
+
+
+# ---------------------------------------------------------------------------
+# CR10: v3 production bucket, legacy v2 readable (D03/D14/D15)
+# ---------------------------------------------------------------------------
+
+
+class TestCR10Versions:
+    def test_new_inputs_stamp_v3(self, config):
+        from diveintocrypto_desktop.shortlab.inputs import (
+            FEATURE_INPUTS_VERSION,
+            FEATURE_INPUTS_VERSION_V2,
+            FEATURE_INPUTS_VERSIONS_ALL,
+        )
+
+        assert FEATURE_INPUTS_VERSION == "features-v3" == FEATURE_VERSION_CURRENT
+        assert FEATURE_INPUTS_VERSION_V2 == "features-v2" == FEATURE_VERSION
+        assert set(FEATURE_INPUTS_VERSIONS_ALL) == {"features-v2", "features-v3"}
+        fresh = build_feature_inputs(
+            "TESTUSDT", _full_observations(), _identity(), ASOF_MS, config
+        )
+        assert fresh.version == "features-v3"
+
+    def test_legacy_v2_bucket_readable(self):
+        from dataclasses import replace
+
+        from diveintocrypto_desktop.shortlab.inputs import FEATURE_INPUTS_VERSIONS_ALL
+
+        assert "features-v2" in FEATURE_INPUTS_VERSIONS_ALL
+        assert "features-v3" in FEATURE_INPUTS_VERSIONS_ALL

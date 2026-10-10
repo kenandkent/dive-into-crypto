@@ -55,10 +55,15 @@ from diveintocrypto_desktop.shortlab.config import load_shortlab_config
 from diveintocrypto_desktop.shortlab.features import lifecycle as lifecycle_mod
 from diveintocrypto_desktop.shortlab.repository import EntrySnapshotRecord
 from diveintocrypto_desktop.shortlab.scoring.ltss import round_half_up_1
-from diveintocrypto_desktop.shortlab.scoring.versions import ENTRY_VERSION
+from diveintocrypto_desktop.shortlab.scoring.versions import (
+    ENTRY_VERSION,
+    ENTRY_VERSION_CURRENT,
+)
 
 __all__ = [
     "ENTRY_VERSION",
+    "ENTRY_VERSION_CURRENT",
+    "ENTRY_VERSIONS_ALL",
     "ENTRY_REQUIRED_BLOCKS",
     "ENTRY_BUDGET_EXHAUSTED",
     "BudgetExhausted",
@@ -118,6 +123,36 @@ _MTF_BLOCK_MISSING = "MTF_BLOCK_MISSING"
 _MICRO_BLOCK_MISSING = "MICRO_BLOCK_MISSING"
 _MICROSTRUCTURE_INACTIVE = "MICROSTRUCTURE_INACTIVE"
 _REGIME_BLOCK_MISSING = "REGIME_BLOCK_MISSING"
+
+#: Readable Entry buckets (CR10/D15): new snapshots emit CURRENT/v3
+#: (Snapshot ID +落库 entry_version + Evidence分桶同步); legacy v2 rows
+#: stay decodable via ``recompute_entry_from_record`` and are never rewritten.
+ENTRY_VERSIONS_ALL = frozenset({ENTRY_VERSION, ENTRY_VERSION_CURRENT})
+
+
+def _result_entry_version(result: Any) -> str:
+    """Version bucket carried by an :class:`EntryResult` (preserve on replay).
+
+    New results carry CURRENT/v3 in ``inputs._meta.entry_version`` (and in
+    the ``snapshot_id`` suffix). Replays/``to_record`` preserve a known
+    bucket so old v2 rows are never silently upgraded; unknown falls back
+    to CURRENT.
+    """
+    try:
+        inputs = getattr(result, "inputs", None)
+        if isinstance(inputs, Mapping):
+            meta = inputs.get("_meta")
+            if isinstance(meta, Mapping):
+                ver = meta.get("entry_version")
+                if isinstance(ver, str) and ver in ENTRY_VERSIONS_ALL:
+                    return ver
+        sid = str(getattr(result, "snapshot_id", "") or "")
+        for cand in (ENTRY_VERSION_CURRENT, ENTRY_VERSION):
+            if sid.endswith(f"-{cand}"):
+                return cand
+    except Exception:  # noqa: BLE001 - defensive, default to CURRENT
+        pass
+    return str(ENTRY_VERSION_CURRENT)
 
 
 class BudgetExhausted(RuntimeError):
@@ -596,12 +631,16 @@ class EntryResult:
     created_at_ms: int
 
     def to_record(self) -> EntrySnapshotRecord:
-        """Render the repository row Task 13 references via ``save_score``."""
+        """Render the repository row Task 13 references via ``save_score``.
+
+        The stored ``entry_version`` bucket follows the result itself (new
+        v3, legacy v2 preserved) so old rows are never upgraded on replay.
+        """
         return EntrySnapshotRecord(
             snapshot_id=self.snapshot_id,
             symbol=self.symbol,
             as_of_ms=self.as_of_ms,
-            entry_version=ENTRY_VERSION,
+            entry_version=_result_entry_version(self),
             dive_weights_hash=self.dive_weights_hash,
             dive_engine_version=self.dive_engine_version,
             dive_config_hash=self.dive_config_hash,
@@ -946,7 +985,7 @@ async def build_entry_snapshot(
                 "primary_tf": primary_tf,
                 "as_of_ms": observed_ms,
                 "shortlab_config_hash": shortlab_hash,
-                "entry_version": ENTRY_VERSION,
+                "entry_version": ENTRY_VERSION_CURRENT,
             },
         )
         null_components = {block: None for block in ENTRY_REQUIRED_BLOCKS}
@@ -965,7 +1004,7 @@ async def build_entry_snapshot(
             dive_engine_version=dive_engine_version,
             dive_config_hash=dive_config_hash_value,
             shortlab_config_hash=shortlab_hash,
-            snapshot_id=f"entry-{name}-{observed_ms}-{ENTRY_VERSION}",
+            snapshot_id=f"entry-{name}-{observed_ms}-{ENTRY_VERSION_CURRENT}",
             fetched_at_ms=clock_ms,
             created_at_ms=own_budget.now_ms(),
         )
@@ -1067,7 +1106,7 @@ async def build_entry_snapshot(
             "primary_tf": primary_tf,
             "as_of_ms": observed_ms,
             "shortlab_config_hash": shortlab_hash,
-            "entry_version": ENTRY_VERSION,
+            "entry_version": ENTRY_VERSION_CURRENT,
             "leaf_observations": [
                 {"key": list(key), "fetched_at_ms": times[0], "known_at_ms": times[1]}
                 for key, times in own_budget.observation_times.items()
@@ -1128,7 +1167,7 @@ async def build_entry_snapshot(
         dive_engine_version=dive_engine_version,
         dive_config_hash=dive_config_hash_value,
         shortlab_config_hash=shortlab_hash,
-        snapshot_id=f"entry-{name}-{observed_ms}-{ENTRY_VERSION}",
+        snapshot_id=f"entry-{name}-{observed_ms}-{ENTRY_VERSION_CURRENT}",
         fetched_at_ms=fetched_completed_ms,
         created_at_ms=own_budget.now_ms(),
     )
@@ -1150,8 +1189,9 @@ def finalize_entry_snapshot(result: EntryResult, cutoff_ms: int) -> EntryResult:
     inputs = dict(result.inputs)
     inputs["_meta"] = {**inputs.get("_meta", {}), "as_of_ms": cutoff}
     changed_day = cutoff // 86400000 != result.as_of_ms // 86400000
+    frozen_version = _result_entry_version(result)
     result = replace(result, as_of_ms=cutoff, inputs=inputs,
-                     snapshot_id=f"entry-{result.symbol}-{cutoff}-{ENTRY_VERSION}")
+                     snapshot_id=f"entry-{result.symbol}-{cutoff}-{frozen_version}")
     if changed_day:
         inputs["consensus"] = {"reason": "ENTRY_WINDOW_ROLLOVER"}
         return replace(result, entry_score=None, reason_code="ENTRY_WINDOW_ROLLOVER",
@@ -1178,7 +1218,9 @@ def recompute_entry_from_record(
     """Recompute an Entry score from a stored snapshot without any network.
 
     Reads only the frozen ``inputs`` (six blocks); every data-client call in
-    the test harness may raise and the result is unchanged. Returns
+    the test harness may raise and the result is unchanged. Accepts both
+    legacy ``entry-v2`` and current ``entry-v3`` rows (bucket-agnostic math);
+    replay never upgrades the stored version. Returns
     ``{symbol, as_of_ms, entry_score, components, missing_blocks}``.
     """
     inputs = dict(record.inputs or {})
