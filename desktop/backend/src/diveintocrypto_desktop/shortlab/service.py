@@ -2708,7 +2708,12 @@ class ShortLabService:
     async def _fetch_funding(
         self, symbol: str, exchange_meta: Mapping[str, Any], as_of_ms: int, now_ms: int
     ) -> dict[str, Any]:
-        """Settled 7/30/90D funding sums + coverage (design 10.1).
+        """Settled 7/30/90D funding sums + coverage (design 10.1, CR07 D04/D05).
+
+        CR07: windows freeze Inputs/Carry/DQ with Hedge sharing the R05
+        receipt/schedule coverage (compute_schedule_coverage); the old max24h
+        rule alone never grants completeness for new decisions (AND-gated,
+        missing/UNKNOWN schedule => incomplete, no 30D credit).
 
         Symbols beyond the 80-per-5min batch are *deferred* (not fetched);
         their windows stay null with a batch reason and are retried on a
@@ -2762,23 +2767,119 @@ class ShortLabService:
         out["events"] = sorted(events, key=lambda e: int(e["t"]))
         onboard = exchange_meta.get("onboard_at_ms")
         onboard_ms = onboard if isinstance(onboard, int) and onboard > 0 else None
+        # CR07 D05: freeze with Hedge R05 schedule coverage. Only when the real
+        # repair port is bound (new decisions, R10b boundary) does the old
+        # max24h result lose sole authority (AND-gated). Unbound/fake ports or
+        # legacy stubs without the schedule interface keep the old result
+        # (back-compat, no new READY via old rule alone).
+        _r05_schedules: Any = None
+        _has_r05_interface = False
+        _r05_fn: Any = None
+        try:
+            _candidate_fn = self._require_repair_port("compute_schedule_coverage")
+            if is_real_repair_callback(_candidate_fn):
+                _r05_fn = _candidate_fn
+                _has_r05_interface = bool(
+                    self._repository is not None
+                    and hasattr(self._repository, "list_funding_schedules")
+                )
+        except Exception:
+            _has_r05_interface = False
+            _r05_fn = None
+        if _has_r05_interface:
+            try:
+                _r05_schedules = list(
+                    await self._repository.list_funding_schedules(str(symbol).upper(), int(as_of_ms)) or ()
+                )
+            except Exception:
+                # Schedule fetch failure => UNKNOWN (no credit), never old-only.
+                _r05_schedules = []
         for days in (7, 30, 90):
             window_start = as_of_ms - _LOOKBACK_MS[days]
             try:
                 coverage = self._funding_coverage_fn(out["events"], window_start, as_of_ms, onboard_ms)
             except Exception:
                 coverage = None
+            old_complete = bool(coverage is not None and coverage.complete)
+            # CR07: R05 gate (shared receipt/schedule result with Hedge).
+            _r05_complete: bool | None = None
+            _r05_reason: str | None = None
+            if _has_r05_interface:
+                try:
+                    from diveintocrypto_desktop.shortlab.funding_schedule import (
+                        compute_schedule_coverage as _r05_fn,
+                    )
+
+                    # Normalise repo rows (schedule_json nested) + segments.
+                    _norm_scheds: list[Any] = []
+                    for _s in (_r05_schedules or ()):
+                        try:
+                            if isinstance(_s, Mapping):
+                                _sj = _s.get("schedule_json")
+                                if isinstance(_sj, Mapping):
+                                    _merged = dict(_s)
+                                    for _k, _v in dict(_sj).items():
+                                        _merged.setdefault(_k, _v)
+                                    _norm_scheds.append(_merged)
+                                else:
+                                    _norm_scheds.append(_s)
+                            else:
+                                _norm_scheds.append(_s)
+                        except Exception:
+                            continue
+                    _r05_cov = _r05_fn(
+                        list(out["events"] or ()),
+                        _norm_scheds,
+                        int(window_start),
+                        int(as_of_ms),
+                        int(as_of_ms),
+                    )
+                    _cov_frac = getattr(_r05_cov, "coverage_fraction", None)
+                    _exp = getattr(_r05_cov, "expected_count", None)
+                    _reasons = tuple(getattr(_r05_cov, "reasons", ()) or ())
+                    if (
+                        _cov_frac is not None
+                        and str(_cov_frac) == "1"
+                        and _exp is not None
+                        and "FUNDING_SCHEDULE_UNKNOWN" not in _reasons
+                    ):
+                        _r05_complete = True
+                    else:
+                        _r05_complete = False
+                        _r05_reason = "FUNDING_SCHEDULE_UNKNOWN" if "FUNDING_SCHEDULE_UNKNOWN" in _reasons else "COVERAGE_GAP"
+                except Exception:
+                    _r05_complete = False
+                    _r05_reason = "FUNDING_SCHEDULE_UNKNOWN"
+            if _r05_complete is None:
+                eff_complete = old_complete
+                eff_reason = None if old_complete else (coverage.reason_code if coverage is not None else "FUNDING_HISTORY_INCOMPLETE")
+                eff_fraction = float(coverage.coverage_fraction) if coverage is not None else 0.0
+            else:
+                # Old rule removed as sole authority: both must hold.
+                eff_complete = bool(old_complete and _r05_complete)
+                if eff_complete:
+                    eff_reason = None
+                    eff_fraction = 1.0
+                else:
+                    eff_reason = _r05_reason or (coverage.reason_code if coverage is not None else "FUNDING_HISTORY_INCOMPLETE")
+                    # R05 incomplete never carries old fraction as full credit.
+                    try:
+                        eff_fraction = float(coverage.coverage_fraction) if coverage is not None else 0.0
+                        if not _r05_complete:
+                            eff_fraction = min(float(eff_fraction), 0.0) if eff_fraction else 0.0
+                    except Exception:
+                        eff_fraction = 0.0
             window_events = [e for e in out["events"]
                              if isinstance(e.get("t"), int) and e["t"] >= window_start]
             rates = [float(e["funding_rate"]) for e in window_events
                      if _finite(e.get("funding_rate")) is not None]
-            total = sum(rates) if (coverage is not None and coverage.complete) else None
-            if coverage is not None and coverage.complete and rates:
+            total = sum(rates) if eff_complete else None
+            if eff_complete and rates:
                 positive = sum(1 for r in rates if r > 0) / len(rates)
             else:
                 positive = None
             stability = None
-            if days == 30 and coverage is not None and coverage.complete and len(rates) >= 2:
+            if days == 30 and eff_complete and len(rates) >= 2:
                 try:
                     stability = statistics.pstdev(rates)
                 except statistics.StatisticsError:
@@ -2787,11 +2888,13 @@ class ShortLabService:
                 "sum": total,
                 "positive_ratio": positive,
                 "stability": stability,
-                "complete": bool(coverage is not None and coverage.complete),
-                "coverage_fraction": float(coverage.coverage_fraction) if coverage is not None else 0.0,
+                "complete": bool(eff_complete),
+                "coverage_fraction": float(eff_fraction),
                 "event_count": len(window_events),
-                "reason_code": None if (coverage is not None and coverage.complete)
-                else (coverage.reason_code if coverage is not None else "FUNDING_HISTORY_INCOMPLETE"),
+                "reason_code": eff_reason,
+                # CR07: R05 freeze provenance (Hedge-shared result).
+                "r05_complete": _r05_complete,
+                "r05_reason": _r05_reason,
             }
         return out
 
@@ -3101,10 +3204,33 @@ class ShortLabService:
         for days, key in ((30, "funding_history"), (90, "funding_history_90d")):
             events = [e for e in funding.get("events", ()) if midnight-days*DAY_MS <= e["t"] < midnight]
             coverage = self._funding_coverage_fn(events, midnight-days*DAY_MS, midnight, meta.get("onboard_at_ms"))
+            # CR07 D05: freeze Inputs with Hedge R05 (shared receipt/schedule).
+            # funding["windows"] already AND-gates old max24h with R05 in
+            # _fetch_funding; reuse its r05 verdict so midnight-observed legs
+            # cannot regain credit the frozen windows denied. Legacy funding
+            # dicts without r05 info keep the old result (back-compat).
+            _r05_gate: bool | None = None
+            try:
+                _win = (funding.get("windows") or {}).get(days) if isinstance(funding, Mapping) else None
+                if isinstance(_win, Mapping) and "r05_complete" in _win:
+                    _r05_gate = bool(_win.get("r05_complete"))
+            except Exception:
+                _r05_gate = None
+            _old_complete = bool(getattr(coverage, "complete", False))
+            try:
+                _old_frac = float(getattr(coverage, "coverage_fraction", 0.0) or 0.0)
+            except Exception:
+                _old_frac = 0.0
+            if _r05_gate is False:
+                _eff_complete = False
+                _eff_frac = 0.0
+            else:
+                _eff_complete = _old_complete
+                _eff_frac = _old_frac
             observations[key] = observed(events, "binance-funding", funding.get("fetched_at_ms"),
                 window_start_ms=midnight-days*DAY_MS, window_end_ms=midnight,
                 source_as_of_ms=max((e["t"] for e in events), default=None),
-                complete=coverage.complete, coverage_fraction=coverage.coverage_fraction)
+                complete=_eff_complete, coverage_fraction=_eff_frac)
         observations["quote_asset"] = "USDT"
         market["observations"] = observations
 
@@ -3864,10 +3990,12 @@ class ShortLabService:
             raise HedgeValidationError("min_positive_ratio_30d must be a number", reason_code="HEDGE_INPUT_INVALID")
         if min_positive_f is not None and not 0 <= min_positive_f <= 1:
             raise HedgeValidationError("min_positive_ratio_30d must be in 0..1", reason_code="HEDGE_INPUT_INVALID")
-        # R10b D08: current query is latest-per-symbol via
+        # CR04 D08 (R01/R09/R10b): current query is latest-per-symbol via
         # list_current_funding_opportunities (ROW_NUMBER, no 200-row cap, no
-        # READY pre-filter). Legacy rows without projection_v2 fall back to
-        # the old column parsing so old snapshots stay readonly-visible.
+        # READY pre-filter). When the interface exists, zero is final (never
+        # auto-fallback to history 200); compat history lives in the independent
+        # funding_opportunities_history entry. Legacy rows without projection_v2
+        # stay readonly-visible via the current view as LEGACY/NOT_READY.
         # When the new query yields v2 rows, project via the real
         # project_opportunity port when bound (never Fake).
         try:
@@ -3896,6 +4024,8 @@ class ShortLabService:
                     raise HedgeValidationError(f"invalid opportunity query: {exc}"[:200], reason_code="HEDGE_INPUT_INVALID") from exc
                 try:
                     page = await repo.list_current_funding_opportunities(_oq, self._now())
+                except (HedgeBusy, HedgeValidationError):
+                    raise
                 except Exception as exc:
                     try:
                         from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _BusyN
@@ -3906,15 +4036,19 @@ class ShortLabService:
                         raise
                     except Exception:
                         pass
-                    page = None
+                    # CR04 D08: current query failure never auto-revives old READY;
+                    # history stays independent via funding_opportunities_history.
+                    raise
                 if page is not None:
                     items_raw = list(getattr(page, "items", []) or ())
                     total_new = int(getattr(page, "total", len(items_raw)) or len(items_raw))
-                    # Detect v2 vs legacy: v2 items carry projection_v2-derived
-                    # readiness_breakdown or explicit fcs_config_hash.
+                    # CR04 D08: current query authoritative; has_v2 kept only for
+                    # legacy probe below, never to gate empty as not-wired.
                     has_v2 = any(isinstance(it, Mapping) and (it.get("readiness_breakdown") is not None or it.get("fcs_config_hash") is not None) for it in items_raw)
-                    # When v2 rows exist, use the new wire (with optional real projection).
-                    if has_v2 or total_new > 0:
+                    # CR04: always build current wire when the interface is present;
+                    # zero is final when v2 data exists (probe below separates
+                    # legacy-only compat). D08 R01/R09/R10b.
+                    if True:
                         # Optionally re-project via real port for freshness (best-effort).
                         wire_items: list[dict[str, Any]] = []
                         try:
@@ -3966,26 +4100,59 @@ class ShortLabService:
                                 "funding_30d": d.get("funding_30d"),
                                 "best_venue": d.get("best_venue"),
                             })
-                        # If new query returned rows, serve them (even when legacy
-                        # fallback would also have rows; v2 wins for current view).
-                        if wire_items or total_new == 0:
+                        # CR04 D08: current view wins; non-empty serves directly.
+                        # Empty (total 0) is final when v2 data exists; legacy-only
+                        # DBs (no v2 at all) delegate to the explicit history entry
+                        # for compat (D08 independent entry, R01/R09/R10b).
+                        if wire_items or total_new > 0:
                             try:
                                 asof = getattr(page, "as_of_ms", None)
                             except Exception:
-                                asof = self._now()
-                            return {"asOf": asof if asof is not None else self._now(), "items": wire_items, "total": int(total_new)}
-                        # total>0 but wire empty (filter mismatch) -> fall through to legacy? No, return empty new view.
-                        if total_new == 0:
-                            try:
-                                asof2 = getattr(page, "as_of_ms", None)
-                            except Exception:
-                                asof2 = self._now()
-                            return {"asOf": asof2, "items": [], "total": 0}
-                    # No v2 and empty new view but legacy rows may exist -> fall through to legacy parsing below.
-                    pass
+                                asof = None
+                            return {"asOf": asof, "items": wire_items, "total": int(total_new)}
+                        # Empty current view: probe for any v2 latest row.
+                        try:
+                            from diveintocrypto_desktop.shortlab.repair_contracts import OpportunityQuery as _OQProbe
+
+                            _probe_q = _OQProbe(include_stale=True, limit=1, offset=0)
+                            _probe_page = await repo.list_current_funding_opportunities(_probe_q, self._now())
+                            _probe_items = list(getattr(_probe_page, "items", []) or ())
+                            # CR04: v2 means a real projection breakdown (LEGACY rows
+                            # carry fcs_config_hash but breakdown None + LEGACY reason).
+                            def _is_v2(_it: Any) -> bool:
+                                if not isinstance(_it, Mapping):
+                                    return False
+                                if _it.get("readiness_breakdown") is None:
+                                    return False
+                                try:
+                                    _rs = list(_it.get("reasons") or [])
+                                except Exception:
+                                    _rs = []
+                                return "LEGACY" not in [str(_r) for _r in _rs]
+
+                            _has_any_v2 = any(_is_v2(_it) for _it in _probe_items)
+                        except (HedgeBusy, HedgeValidationError):
+                            raise
+                        except Exception:
+                            # Probe failed: never revive old READY; treat as v2 (strict).
+                            _has_any_v2 = True
+                        if not _has_any_v2:
+                            # No v2 data at all (pure legacy or empty DB): explicit
+                            # history entry for compat (never auto-revive v2 READY).
+                            return await self.funding_opportunities_history(filters)
+                        try:
+                            asof = getattr(page, "as_of_ms", None)
+                        except Exception:
+                            asof = None
+                        # D08: empty result asOf is None (never now).
+                        return {"asOf": asof, "items": [], "total": 0}
         except (HedgeBusy, HedgeValidationError):
             raise
         except Exception:
+            # CR04 D08: current failure never auto-revives old READY; when the
+            # interface exists the error propagates (history via explicit entry).
+            if hasattr(repo, "list_current_funding_opportunities"):
+                raise
             pass
         try:
             rows = await repo.list_funding_opportunities(limit=200, offset=0)
@@ -4113,6 +4280,189 @@ class ShortLabService:
         total = len(ordered)
         page = ordered[offset: offset + limit]
         return {"asOf": self._now(), "items": page, "total": total}
+
+    # -- B32.1b funding history (D08 independent entry, CR04) -----------------
+    async def funding_opportunities_history(self, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Explicit compat history entry (D08, CR04).
+
+        Independent from the current latest-per-symbol view: reads the raw
+        ``sl_funding_capture_snapshot`` history (200-row cap, no ROW_NUMBER,
+        no READY pre-filter) with the same filter/sort/page semantics as the
+        legacy fallback. Never called automatically for v2 DBs; only used
+        explicitly for compat or via the legacy-only probe in
+        :meth:`funding_opportunities` (pure legacy DBs without any v2 data).
+        New v2 READY must never be revived through this path.
+        """
+        repo = await self._ensure_hedge_available()
+        filt = dict(filters or {})
+
+        def _pick(*names: str, default: Any = None) -> Any:
+            for name in names:
+                if filt.get(name) is not None:
+                    return filt[name]
+            return default
+
+        min_fcs = _pick("min_fcs", "minFcs")
+        min_funding_30d = _pick("min_funding_30d", "minFunding30d")
+        min_positive = _pick("min_positive_ratio_30d", "minPositiveRatio30d")
+        venue = _pick("venue")
+        readiness = _pick("readiness")
+        sort = str(_pick("sort", default="fcs") or "fcs")
+        order = str(_pick("order", default="desc") or "desc")
+        try:
+            limit = int(_pick("limit", default=50))
+        except (TypeError, ValueError):
+            raise HedgeValidationError("limit must be an int", reason_code="HEDGE_INPUT_INVALID")
+        try:
+            offset = int(_pick("offset", default=0))
+        except (TypeError, ValueError):
+            raise HedgeValidationError("offset must be an int", reason_code="HEDGE_INPUT_INVALID")
+        if not 1 <= limit <= 200:
+            raise HedgeValidationError("limit must be in 1..200", reason_code="HEDGE_INPUT_INVALID")
+        if offset < 0:
+            raise HedgeValidationError("offset must be >= 0", reason_code="HEDGE_INPUT_INVALID")
+        if sort not in ("fcs", "funding30d", "funding_30d", "breakEvenDays", "break_even_days", "positiveRatio30d", "positive_ratio_30d"):
+            raise HedgeValidationError(f"unknown sort {sort!r}", reason_code="HEDGE_INPUT_INVALID")
+        if order not in ("asc", "desc"):
+            raise HedgeValidationError(f"unknown order {order!r}", reason_code="HEDGE_INPUT_INVALID")
+        if venue is not None and str(venue) not in ("BINANCE_SPOT", "BINANCE_ALPHA", "ONCHAIN_DEX"):
+            raise HedgeValidationError(f"unknown venue {venue!r}", reason_code="HEDGE_INPUT_INVALID")
+        if readiness is not None and str(readiness) not in ("READY", "NOT_READY", "BLOCKED"):
+            raise HedgeValidationError(f"unknown readiness {readiness!r}", reason_code="HEDGE_INPUT_INVALID")
+        try:
+            min_fcs_f = float(min_fcs) if min_fcs is not None else None
+        except (TypeError, ValueError):
+            raise HedgeValidationError("min_fcs must be a number", reason_code="HEDGE_INPUT_INVALID")
+        if min_fcs_f is not None and not 0 <= min_fcs_f <= 100:
+            raise HedgeValidationError("min_fcs must be in 0..100", reason_code="HEDGE_INPUT_INVALID")
+        try:
+            min_funding_f = float(str(min_funding_30d)) if min_funding_30d is not None else None
+        except (TypeError, ValueError):
+            raise HedgeValidationError("min_funding_30d must be a number", reason_code="HEDGE_INPUT_INVALID")
+        try:
+            min_positive_f = float(str(min_positive)) if min_positive is not None else None
+        except (TypeError, ValueError):
+            raise HedgeValidationError("min_positive_ratio_30d must be a number", reason_code="HEDGE_INPUT_INVALID")
+        if min_positive_f is not None and not 0 <= min_positive_f <= 1:
+            raise HedgeValidationError("min_positive_ratio_30d must be in 0..1", reason_code="HEDGE_INPUT_INVALID")
+        try:
+            rows = await repo.list_funding_opportunities(limit=200, offset=0)
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy
+
+                if isinstance(exc, _Busy):
+                    raise HedgeBusy(str(exc)) from exc
+            except HedgeBusy:
+                raise
+            except Exception:
+                pass
+            raise
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                import json as _json
+
+                def _parse(value: Any) -> Any:
+                    if isinstance(value, (dict, list)):
+                        return value
+                    if isinstance(value, str):
+                        try:
+                            return _json.loads(value)
+                        except Exception:
+                            return {}
+                    return value or {}
+
+                funding_metrics = _parse(row.get("funding_metrics_json"))
+                venue_summary = _parse(row.get("venue_summary_json"))
+                risk = _parse(row.get("risk_json"))
+                reasons_raw = _parse(row.get("reasons_json"))
+                reasons = list(reasons_raw) if isinstance(reasons_raw, list) else []
+                fcs_val = row.get("fcs")
+                try:
+                    fcs_f = float(fcs_val) if fcs_val is not None else None
+                except (TypeError, ValueError):
+                    fcs_f = None
+
+                def _num(mapping: Any, *keys: str) -> float | None:
+                    if not isinstance(mapping, Mapping):
+                        return None
+                    for key in keys:
+                        if mapping.get(key) is not None:
+                            try:
+                                return float(str(mapping[key]))
+                            except (TypeError, ValueError):
+                                continue
+                    return None
+
+                funding30d = _num(funding_metrics, "funding_30d", "funding30d")
+                funding90d = _num(funding_metrics, "funding_90d", "funding90d")
+                positive30d = _num(funding_metrics, "positive_ratio_30d", "positiveRatio30d")
+                positive90d = _num(funding_metrics, "positive_ratio_90d", "positiveRatio90d")
+                best_venue = None
+                if isinstance(venue_summary, Mapping):
+                    best_venue = venue_summary.get("best_venue") or venue_summary.get("bestVenue")
+                reference_notional = row.get("reference_notional_usd")
+                try:
+                    ref_notion = float(reference_notional) if reference_notional is not None else 10000.0
+                except (TypeError, ValueError):
+                    ref_notion = 10000.0
+                round_trip = _num(venue_summary, "round_trip_cost_pct", "roundTripCostPct", "roundtrip_cost_pct")
+                break_even = _num(risk, "break_even_days", "breakEvenDays", "breakeven_days")
+                if break_even is None:
+                    break_even = _num(venue_summary, "break_even_days", "breakEvenDays")
+                if min_fcs_f is not None and (fcs_f is None or fcs_f < min_fcs_f):
+                    continue
+                if min_funding_f is not None and (funding30d is None or funding30d < min_funding_f):
+                    continue
+                if min_positive_f is not None and (positive30d is None or positive30d < min_positive_f):
+                    continue
+                if venue is not None and str(best_venue) != str(venue):
+                    continue
+                if readiness is not None and str(row.get("readiness")) != str(readiness):
+                    continue
+                items.append({
+                    "symbol": str(row.get("symbol")),
+                    "canonicalId": str(row.get("canonical_id") or str(row.get("symbol")).lower()),
+                    "fcs": fcs_f,
+                    "fcsVersion": str(row.get("fcs_version") or "fcs_v1"),
+                    "funding30d": funding30d,
+                    "funding90d": funding90d,
+                    "positiveRatio30d": positive30d,
+                    "positiveRatio90d": positive90d,
+                    "bestVenue": best_venue,
+                    "referenceNotionalUsd": ref_notion,
+                    "roundTripCostPct": round_trip,
+                    "breakEvenDays": break_even,
+                    "readiness": str(row.get("readiness") or "NOT_READY"),
+                    "reasons": [str(r) for r in reasons if isinstance(r, str)],
+                })
+            except Exception:
+                continue
+        sort_norm = {"funding30d": "funding30d", "funding_30d": "funding30d",
+                     "breakEvenDays": "breakEvenDays", "break_even_days": "breakEvenDays",
+                     "positiveRatio30d": "positiveRatio30d",
+                     "positive_ratio_30d": "positiveRatio30d"}.get(sort, "fcs")
+
+        def _sort_val(item: dict[str, Any]) -> float | None:
+            value = item.get(sort_norm if sort_norm != "fcs" else "fcs")
+            if value is None:
+                return None
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                return None
+            if result != result or result in (float("inf"), float("-inf")):
+                return None
+            return result
+
+        decorated = [((_sort_val(it) is None, _sort_val(it) or 0.0, str(it.get("symbol") or "")), it) for it in items]
+        decorated.sort(key=lambda pair: (pair[0][0], pair[0][1] if order == "asc" else -pair[0][1] if pair[0][1] else 0.0, pair[0][2]))
+        sorted_all = [it for _, it in decorated]
+        ordered = sorted_all
+        total = len(ordered)
+        page_items = ordered[offset: offset + limit]
+        return {"asOf": self._now(), "items": page_items, "total": total}
 
     # -- B32.2 venues -----------------------------------------------------
     async def hedge_venues(self, symbol: str, notional_usd: Any = None) -> dict[str, Any]:

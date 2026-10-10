@@ -789,3 +789,209 @@ async def test_r10b_directional_metrics_and_h10_mark_history_wired(tmp_path) -> 
             await rt.stop()
     finally:
         await repo.close()
+
+
+# ---------------------------------------------------------------------------
+# CR04 (D08): current zero is final; history via independent entry.
+# ---------------------------------------------------------------------------
+
+
+def _cr04_inputs(sid: str, asof: int, readiness: str) -> dict[str, Any]:
+    return {
+        "snapshot_id": sid,
+        "symbol": "PEPEUSDT",
+        "canonical_id": "pepe",
+        "as_of_ms": asof,
+        "fcs": 80.0,
+        "fcs_config_hash": "h" * 64,
+        "funding_7d": "0.004",
+        "funding_30d": "0.018",
+        "positive_ratio_30d": "0.85",
+        "conservative_apr": "0.25",
+        "break_even_days": "12.5",
+        "readiness_breakdown": {
+            "data_complete": True,
+            "funding_gate": {"status": "PASS", "reasons": [], "checked_at_ms": asof, "input_refs": {}},
+            "execution_gate": {"status": "PASS" if readiness == "READY" else "FAIL", "reasons": [] if readiness == "READY" else ["EXEC_FAIL"], "checked_at_ms": asof, "input_refs": {}},
+            "economic_gate": {"status": "PASS", "reasons": [], "checked_at_ms": asof, "input_refs": {}},
+            "protection_status": "UNKNOWN",
+            "readiness": readiness,
+        },
+        "reasons": [],
+        "reference_notional_usd": "10000",
+        "best_venue": "BINANCE_SPOT",
+        "expires_at_ms": asof + 1_800_000,
+    }
+
+
+async def _cr04_seed_two(repo: Any) -> None:
+    from diveintocrypto_desktop.shortlab.hedge.projection import project_opportunity
+
+    old_in = _cr04_inputs("fcs-old-cr04", NOW - 10_000, "READY")
+    new_in = _cr04_inputs("fcs-new-cr04", NOW, "NOT_READY")
+    old_proj = project_opportunity(old_in, NOW - 9_000)
+    new_proj = project_opportunity(new_in, NOW + 1_000)
+
+    async def _seed(sid: str, asof: int, created: int, proj: Any) -> None:
+        await repo.save_funding_capture_snapshot({
+            "snapshot_id": sid,
+            "symbol": "PEPEUSDT",
+            "canonical_id": "pepe",
+            "as_of_ms": asof,
+            "fcs_version": "fcs_v2",
+            "fcs_config_hash": "h" * 64,
+            "reference_notional_usd": 10000.0,
+            "fcs": 80.0,
+            "module_scores_json": {},
+            "funding_metrics_json": {"funding_30d": "0.018", "positive_ratio_30d": "0.85"},
+            "venue_summary_json": {"best_venue": "BINANCE_SPOT"},
+            "risk_json": {"projection_v2": proj, "break_even_days": "12.5"},
+            "readiness": proj.get("readiness", "NOT_READY"),
+            "reasons_json": list(proj.get("reasons", [])),
+            "created_at_ms": created,
+        })
+
+    await _seed("fcs-old-cr04", NOW - 10_000, NOW - 9_000, old_proj)
+    await _seed("fcs-new-cr04", NOW, NOW, new_proj)
+
+
+@pytest.mark.asyncio
+async def test_cr04_ready_filter_empty_stays_empty_not_old_ready(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, "cr04-ready.duckdb")
+    try:
+        svc = _make_service(repo, clock)
+        await _cr04_seed_two(repo)
+        page = await svc.funding_opportunities({"readiness": "READY"})
+        assert page["total"] == 0 and page["items"] == []
+        assert page["asOf"] is None
+        # Explicit history still exposes both rows (independent entry).
+        hist = await svc.funding_opportunities_history({})
+        assert hist["total"] == 2
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr04_all_expired_venue_empty_overpage_stay_empty(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, "cr04-exp.duckdb")
+    try:
+        svc = _make_service(repo, clock)
+        await _cr04_seed_two(repo)
+        # All expired: advance beyond both expires (1800s) without stale.
+        clock.advance(2_000_000)
+        exp_page = await svc.funding_opportunities({"symbol": "PEPEUSDT"})
+        assert exp_page["total"] == 0 and exp_page["items"] == []
+        assert exp_page["asOf"] is None
+        # Stale research view still shows NOT_READY (never READY).
+        stale = await svc.funding_opportunities({"symbol": "PEPEUSDT", "include_stale": True})
+        assert stale["total"] == 1
+        assert stale["items"][0]["readiness"] == "NOT_READY"
+        # Venue/target filter empty stays empty (no fallback to other venue).
+        clock.ms = NOW
+        svc2 = _make_service(repo, clock)
+        venue_page = await svc2.funding_opportunities({"venue": "BINANCE_ALPHA"})
+        assert venue_page["total"] == 0 and venue_page["items"] == []
+        # Over-page keeps total but empty items (no history revive).
+        over = await svc2.funding_opportunities({"limit": 1, "offset": 10})
+        assert over["total"] == 1 and over["items"] == []
+    finally:
+        await repo.close()
+
+
+# ---------------------------------------------------------------------------
+# CR07 (D04/D05): default short Carry frozen with Hedge R05; old max24h alone
+# never grants completeness. Missing schedule / deleted slots => no 30D credit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cr07_missing_schedule_no_30d_credit(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, "cr07-missing.duckdb")
+    try:
+        sym = "TESTUSDT"
+        as_of = NOW
+        day = 86_400_000
+        # 30 daily events: old max24h says complete (gaps exactly 24h).
+        await repo.upsert_funding_events([
+            {"symbol": sym, "funding_time_ms": as_of - (30 - i) * day, "funding_rate": 0.0005}
+            for i in range(30)
+        ])
+        svc = _make_service(repo, clock)
+        res = await svc._fetch_funding(sym, {}, as_of, as_of)
+        assert res["windows"][30]["complete"] is False
+        assert res["windows"][30]["reason_code"] in ("FUNDING_SCHEDULE_UNKNOWN", "COVERAGE_GAP")
+        assert res["windows"][30].get("r05_complete") is False
+        # Inputs/Carry/DQ share the same frozen verdict (no 30D credit).
+        from types import SimpleNamespace
+
+        from diveintocrypto_desktop.shortlab.models import ProviderResult
+        from diveintocrypto_desktop.shortlab.scoring.ltss import extract_features
+
+        ident = SimpleNamespace(contract_multiplier=1.0, multiplier_source="EXCHANGE", mapping_confidence="VERIFIED")
+        spot = ProviderResult(status="UNAVAILABLE", source="spot", fetched_at_ms=as_of, as_of_ms=None, data=None, stale=False, reason_code=None, error_message=None)
+        inputs = svc._build_inputs(sym, {"price": 100}, ident, {}, None, spot, {}, res, as_of)
+        assert inputs["funding_30d_complete"] is False and inputs["funding_30d"] is None
+        feats = extract_features(inputs, as_of)
+        assert feats.features["carry"]["factors"]["funding_30d"]["score"] is None
+        states = svc._build_field_states(ident, {}, ProviderResult(status="UNAVAILABLE", source="coingecko", fetched_at_ms=as_of, as_of_ms=None, data=None, stale=False, reason_code=None, error_message=None), spot, {}, res, as_of, as_of)
+        f30 = next(s for s in states if s.field_id == "funding_30d")
+        assert f30.status != "OK"
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr07_deleted_slots_no_30d_credit_but_full_passes(tmp_path) -> None:
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, "cr07-gap.duckdb")
+    try:
+        h8 = 8 * 3_600_000
+        start = NOW - 30 * 86_400_000
+        slots: list[int] = []
+        cur = start + h8
+        while cur <= NOW:
+            slots.append(cur)
+            cur += h8
+        assert len(slots) == 90
+        sym_full = "FULLUSDT"
+        await repo.upsert_funding_events([
+            {"symbol": sym_full, "funding_time_ms": s, "funding_rate": 0.0005} for s in slots
+        ])
+        await repo.save_funding_schedule({
+            "schedule_id": "sched-full", "symbol": sym_full,
+            "effective_from_ms": start, "effective_to_ms": None, "known_at_ms": start,
+            "schedule_json": {
+                "schedule_id": "sched-full", "symbol": sym_full,
+                "effective_from_ms": start, "effective_to_ms": None,
+                "interval_hours": 8, "anchor_ms": slots[0], "known_at_ms": start,
+                "source": "binance:fapi/fundingInfo", "evidence_ref": "ev-full",
+                "verification": "CONFIRMED",
+            },
+        })
+        svc = _make_service(repo, clock)
+        full = await svc._fetch_funding(sym_full, {}, NOW, NOW)
+        assert full["windows"][30]["complete"] is True
+        # Deleted slots: same schedule but missing every 9th event.
+        sym_gap = "GAPUSDT"
+        gap_slots = [s for i, s in enumerate(slots) if i % 9 != 0][:80]
+        await repo.upsert_funding_events([
+            {"symbol": sym_gap, "funding_time_ms": s, "funding_rate": 0.0005} for s in gap_slots
+        ])
+        await repo.save_funding_schedule({
+            "schedule_id": "sched-gap", "symbol": sym_gap,
+            "effective_from_ms": start, "effective_to_ms": None, "known_at_ms": start,
+            "schedule_json": {
+                "schedule_id": "sched-gap", "symbol": sym_gap,
+                "effective_from_ms": start, "effective_to_ms": None,
+                "interval_hours": 8, "anchor_ms": slots[0], "known_at_ms": start,
+                "source": "binance:fapi/fundingInfo", "evidence_ref": "ev-gap",
+                "verification": "CONFIRMED",
+            },
+        })
+        gap = await svc._fetch_funding(sym_gap, {}, NOW, NOW)
+        assert gap["windows"][30]["complete"] is False
+    finally:
+        await repo.close()
