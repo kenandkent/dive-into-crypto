@@ -842,7 +842,7 @@ def create_repair_acceptance_app(
                         pass
                     _raw_mkt_mod.ProductionHedgeMarket._cr20_fx_patched = True  # type: ignore[attr-defined]
 
-                async def _cr20_raw_fx(self: Any, currency: str) -> str:
+                async def _cr20_raw_fx(self: Any, currency: str, request_context: Any = None) -> str:
                     cur = str(currency).upper()
                     if cur in ("USD", "USDT", "USDC", "FDUSD"):
                         now = _raw_now()
