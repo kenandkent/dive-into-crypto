@@ -6551,9 +6551,29 @@ class ShortLabService:
         # (jobs.monitor with ledger_pnl/protection); this read always runs
         # the ledger freeze so a newly committed fill is visible even before
         # the next tick persists it.
+        # Memory-path contract (regression: monitor must never wait on a
+        # busy/failing DB): when the fresh read fails but a mirror snapshot
+        # exists, return it (explicitly last-known, never fabricated).
         try:
             plan_row = await repo.get_hedge_plan(pid)
         except Exception as exc:
+            try:
+                _owner_fb = getattr(self, "_hedge_jobs", None)
+                _mir_fb = _owner_fb.mirror.get(pid, {}) if _owner_fb is not None else {}
+                _prev_fb = _mir_fb.get("previous") if isinstance(_mir_fb, Mapping) else None
+            except Exception:
+                _prev_fb = None
+            if _prev_fb is not None:
+                try:
+                    import dataclasses as _dcfb
+
+                    _out_fb = _dcfb.asdict(_prev_fb) if _dcfb.is_dataclass(_prev_fb) else dict(_prev_fb)
+                except Exception:
+                    _out_fb = dict(_prev_fb) if isinstance(_prev_fb, Mapping) else {"status": "MONITOR_DEGRADED"}
+                try:
+                    return _monitor_wire(pid, dict(_out_fb), (), ())
+                except Exception:
+                    return dict(_out_fb)
             try:
                 from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _Busy
 
