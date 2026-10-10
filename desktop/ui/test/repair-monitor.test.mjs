@@ -320,3 +320,159 @@ test("R12 component: activate/close use loadedPlanId + expectedVersion (never dr
     globalThis.fetch = realFetch;
   }
 });
+
+/* ── CR19 写守卫: 新鲜计划允许一切写入 ─────────────────────────────── */
+test("CR19 component: fresh loaded plan enables activate/close/apply-leg", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: {
+      planId: "plan-a",
+      plan: mkPlan({ status: "ACTIVE", planVersion: 2 }),
+      monitor: mkMonitor({ asOf: Date.now() - 5000 }),
+    },
+  }));
+  assert.ok(html.includes('data-testid="hedge-monitor"'), "monitor renders");
+  const disabled = html.match(/disabled=""/g) || [];
+  assert.equal(disabled.length, 0, "fresh plan: no write button disabled");
+});
+
+/* ── CR19 写守卫: STALE 禁用一切写入 ───────────────────────────────── */
+test("CR19 component: STALE source age disables every write", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: {
+      planId: "plan-a",
+      plan: mkPlan({ status: "ACTIVE", planVersion: 2 }),
+      monitor: mkMonitor({ asOf: Date.now() - 60000 }),
+    },
+  }));
+  assert.ok(html.includes('data-testid="hedge-monitor-stale"'), "STALE banner shown");
+  const disabled = html.match(/disabled=""/g) || [];
+  assert.equal(disabled.length, 3, "activate + close + apply-leg all disabled on STALE");
+});
+
+/* ── CR19 写守卫: 保留旧值 + monitor 失败同样禁写 ──────────────────── */
+test("CR19 component: kept plan with monitor error disables every write", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: {
+      planId: "plan-a",
+      plan: mkPlan({ status: "ACTIVE", planVersion: 2 }),
+      monitor: mkMonitor({ asOf: Date.now() - 5000 }),
+      monitorError: "monitor 503",
+    },
+  }));
+  assert.ok(html.includes('data-testid="hedge-monitor-kept-stale"'), "kept-STALE banner shown");
+  const disabled = html.match(/disabled=""/g) || [];
+  assert.equal(disabled.length, 3, "activate + close + apply-leg all disabled on monitor error");
+});
+
+/* ── CR19 写守卫: 过期指导 (D10) 禁用一切写入 ──────────────────────── */
+test("CR19 component: expired exit guidance disables every write", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: {
+      planId: "plan-a",
+      plan: mkPlan({ status: "ACTIVE", planVersion: 2 }),
+      monitor: mkMonitor({ asOf: Date.now() - 5000 }),
+      exitGuidance: {
+        expired: true,
+        rules: { FUTURES_SHORT: { side: "BUY" }, SPOT_LONG: { side: "SELL" } },
+      },
+    },
+  }));
+  assert.ok(html.includes('data-testid="hedge-monitor-expired"'), "EXPIRED banner shown");
+  const disabled = html.match(/disabled=""/g) || [];
+  assert.equal(disabled.length, 3, "activate + close + apply-leg all disabled on expiry");
+});
+
+/* ── CR19 写守卫: 无有效版本禁用一切写入 ──────────────────────────── */
+test("CR19 component: missing planVersion disables every write", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: {
+      planId: "plan-a",
+      plan: mkPlan({ status: "ACTIVE", planVersion: undefined }),
+      monitor: mkMonitor({ asOf: Date.now() - 5000 }),
+    },
+  }));
+  assert.ok(html.includes('data-testid="hedge-monitor"'), "monitor still renders");
+  const disabled = html.match(/disabled=""/g) || [];
+  assert.equal(disabled.length, 3, "activate + close + apply-leg all disabled without a version");
+});
+
+/* ── CR19 写守卫: 加载失败无任何写按钮 ─────────────────────────────── */
+test("CR19 component: load failure renders no write buttons at all", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, {
+    initial: { planError: "/api/short/hedge/plans/plan-x → 503 · IMPLEMENTATION_UNAVAILABLE" },
+  }));
+  assert.ok(!html.includes('data-testid="hedge-monitor"'), "no monitor body on load failure");
+  assert.ok(!html.includes("disabled"), "no disabled write buttons — none rendered");
+});
+
+/* ── CR19 写守卫: 切换中 (loading) 无任何写按钮 ────────────────────── */
+test("CR19 component: switching/loading renders no write buttons at all", async () => {
+  const app = await loadApp();
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const html = renderToStaticMarkup(React.createElement(app.HedgeMonitor, { planId: "plan-a" }));
+  assert.ok(html.includes('data-testid="hedge-monitor-loading"'), "loading state renders");
+  assert.ok(!html.includes('data-testid="hedge-monitor"'), "no monitor body while switching");
+});
+
+/* ── CR19 写守卫纯函数矩阵 ─────────────────────────────────────────── */
+test("CR19 write guard: loaded object / error / stale / in-flight / version / expiry matrix", async () => {
+  await loadApp();
+  const guard = globalThis.HEDGE_MONITOR_WRITE_GUARD;
+  assert.ok(guard && typeof guard.resolveWrite === "function", "guard exposed for tests");
+  const base = {
+    loadedPlanId: "plan-a", plan: { planId: "plan-a" },
+    planErr: null, monErr: null, stale: false, expired: false,
+    loading: false, writing: false, versionOk: true,
+  };
+  const R = (over) => guard.resolveWrite({ ...base, ...(over || {}) });
+  assert.equal(R().disabled, false, "fresh loaded plan with version enables writes");
+  assert.equal(R().reason, "", "enabled carries no reason");
+  const denials = [
+    [{ loadedPlanId: "" }, "empty loadedPlanId"],
+    [{ loadedPlanId: null }, "null loadedPlanId"],
+    [{ plan: null }, "missing loaded object"],
+    [{ loading: true }, "switching/loading"],
+    [{ writing: true }, "write in flight"],
+    [{ planErr: "boom" }, "plan load failure"],
+    [{ monErr: "503" }, "monitor failure"],
+    [{ stale: true }, "STALE"],
+    [{ expired: true }, "expired"],
+    [{ versionOk: false }, "missing/invalid version"],
+  ];
+  for (const [over, label] of denials) {
+    const r = R(over);
+    assert.equal(r.disabled, true, `${label} disables writes`);
+    assert.ok(typeof r.reason === "string" && r.reason.length > 0, `${label} carries a button title`);
+  }
+});
+
+/* ── CR19: 所有请求携带已构造的 AbortSignal opts, 不再传 {} ────────── */
+test("CR19: every hedge-monitor request carries the constructed AbortSignal opts (never {})", async () => {
+  const src = readFileSync(join(APP, "shortlab", "hedge-monitor.jsx"), "utf8");
+  for (const re of [
+    /window\.DIVE\.hedgeMonitor\(pid,\s*\{\}\)/,
+    /window\.DIVE\.hedgeExitGuidance\(pid,\s*\{\}\)/,
+    /applyHedgeLegEvent\(pid,\s*ev,\s*\{\}\)/,
+    /activateHedgePlan\(pid,\s*\{[^}]*\},\s*\{\}\)/,
+    /closeHedgePlan\(pid,\s*\{[^}]*\},\s*\{\}\)/,
+  ]) {
+    assert.ok(!re.test(src), `no literal {{}} opts: ${re}`);
+  }
+  assert.ok(/window\.DIVE\.hedgeMonitor\(pid,\s*opts\)/.test(src), "poll monitor carries opts");
+  assert.ok(/window\.DIVE\.hedgeExitGuidance\(pid,\s*opts\)/.test(src), "poll guidance carries opts");
+  assert.ok(/applyHedgeLegEvent\(pid,\s*ev,\s*wOpts\)/.test(src), "leg write carries signal opts");
+  assert.ok(/activateHedgePlan\(pid,\s*\{[^}]*\},\s*wOpts\)/.test(src), "activate carries signal opts");
+  assert.ok(/closeHedgePlan\(pid,\s*\{[^}]*\},\s*wOpts\)/.test(src), "close carries signal opts");
+});

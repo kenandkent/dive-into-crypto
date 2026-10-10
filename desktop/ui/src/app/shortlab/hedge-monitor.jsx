@@ -96,8 +96,35 @@ function _pickField(obj, keys) {
   return undefined;
 }
 
+/* CR19 write guard (D12.1/D10): every write button shares one permission
+ * computed from the loaded object + error + stale + in-flight + version +
+ * expiry state. Load failure, STALE, expired/beyond-grace, switching/loading
+ * or a write already in flight disables ALL writes; only a fresh loaded plan
+ * with a service-returned integer planVersion>=1 enables them. Pure so
+ * node --test can pin the matrix without a DOM. */
+function resolveHedgeMonitorWrite(s) {
+  const o = (s && typeof s === "object") ? s : {};
+  const deny = (reason) => ({ disabled: true, reason });
+  const pid = (typeof o.loadedPlanId === "string" ? o.loadedPlanId : String(o.loadedPlanId || "")).trim();
+  if (!pid) return deny("load a plan first");
+  if (!o.plan) return deny("load a plan first");
+  if (o.loading) return deny("switching plan — writes paused");
+  if (o.writing) return deny("write in flight — please wait");
+  if (o.planErr || o.monErr) return deny("data error — writes paused until refresh");
+  if (o.stale) return deny("stale data — writes paused until refresh");
+  if (o.expired) return deny("expired — writes paused until refresh");
+  if (!o.versionOk) return deny("missing plan version — reload first");
+  return { disabled: false, reason: "" };
+}
+
+try {
+  if (typeof window !== "undefined" && !window.HEDGE_MONITOR_WRITE_GUARD) {
+    window.HEDGE_MONITOR_WRITE_GUARD = { resolveWrite: resolveHedgeMonitorWrite };
+  }
+} catch (e) {}
+
 /* ============================================================================
-   short-lab — Desktop · Hedge Monitor page (R12 · D12.1/D18.3)
+   short-lab — Desktop · Hedge Monitor page (R12 · D12.1/D18.3; CR19 write guard)
 
    R12 bindings:
    - planInput (text field) vs loadedPlanId (actually loaded) are separate.
@@ -111,6 +138,12 @@ function _pickField(obj, keys) {
    - foreground 10s poll, background (document.hidden) paused, visible
      recovery refetches immediately. sourceAge/STALE from Mark/Quote TTL
      (20s); beyond grace risk is UNKNOWN (served by backend status).
+   - CR19: activate/close/apply-leg share resolveHedgeMonitorWrite — load
+     failure, STALE, expired/beyond-grace, switching/loading or a write in
+     flight disables every write (not just a missing loadedPlanId), and an
+     invalid planVersion keeps them disabled too. Every request (load, poll,
+     writes) carries the current AbortSignal; switching plans or unmounting
+     aborts the previous controller so old requests never write.
    - activate/close send {expectedVersion} via (planId, body, opts) and never
      drop it. Manual leg currency/fees/execution time come from the frozen
      legs (no hardcoded USDT; unknown stays null, zero is explicit input).
@@ -134,6 +167,7 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
   const [loading, setLoading] = React.useState(Boolean(planIdProp || (initial && initial.planId)) && !(initial && (initial.plan || initial.planError)));
   const [nowMs, setNowMs] = React.useState(() => Date.now());
   const [legMsg, setLegMsg] = React.useState(null);
+  const [writing, setWriting] = React.useState(false);
   const [legForm, setLegForm] = React.useState({ legType: "FUTURES_SHORT", eventType: "OPEN", nativeQty: "", nativePrice: "", clientEventId: "", expectedPlanVersion: "", executedAtMs: "", amount: "", feeCurrency: "", feeAmount: "", gasUsd: "" });
   const seqRef = React.useRef(0);
   const abortRef = React.useRef(null);
@@ -226,14 +260,18 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
     // Reuse the load generation; late full-load responses still win over poll.
     const opts = ctrl && ctrl.signal ? { signal: ctrl.signal } : {};
     // Poll must not clear: single in-flight flag only for the duration.
+    // CR19: the poll carries the current AbortSignal (never {}) so a plan
+    // switch or unmount cancels it like every other request.
     inFlightRef.current = true;
-    window.DIVE.hedgeMonitor(pid, {}).then((m) => {
+    window.DIVE.hedgeMonitor(pid, opts).then((m) => {
+      if (ctrl && ctrl.signal && ctrl.signal.aborted) { inFlightRef.current = false; return; }
       if (seq !== seqRef.current || !mountedRef.current) { inFlightRef.current = false; return; }
       setMonitor(m.monitor || m);
       setMonErr(null);
       setNowMs(Date.now());
       inFlightRef.current = false;
     }).catch((e) => {
+      if (ctrl && ctrl.signal && ctrl.signal.aborted) { inFlightRef.current = false; return; }
       if (seq !== seqRef.current || !mountedRef.current) { inFlightRef.current = false; return; }
       const msg = String((e && e.message) || e);
       if (/abort/i.test(msg)) { inFlightRef.current = false; return; }
@@ -242,7 +280,8 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
       inFlightRef.current = false;
     });
     if (typeof window.DIVE.hedgeExitGuidance === "function") {
-      window.DIVE.hedgeExitGuidance(pid, {}).then((g) => {
+      window.DIVE.hedgeExitGuidance(pid, opts).then((g) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
         if (seq !== seqRef.current || !mountedRef.current) return;
         setExitGuide(g.guidance || g.exitGuidance || g);
       }).catch(() => {});
@@ -285,36 +324,94 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
     };
   }, [pollOnce, initialBypass]);
 
+  /* CR19: every write re-checks the unified guard (writeDisabled is computed
+   * below from loaded object / error / stale / in-flight / version / expiry
+   * but, as a render-local const, is already initialized by click time),
+   * carries the current AbortSignal so a plan switch or unmount cancels it,
+   * and ignores late/aborted responses by generation. */
+  const currentWriteOpts = () => {
+    const c = abortRef.current;
+    return (c && c.signal) ? { signal: c.signal } : {};
+  };
+
   const doLeg = () => {
+    if (writeDisabled) { setLegMsg(writeReason || "请先加载计划的当前版本"); return; }
     const pid = String(loadedPlanId || "").trim();
     if (!pid) { setLegMsg("请先加载计划的当前版本"); return; }
     let ev;
     try { ev = buildHedgeLegPayload(legForm, plan || {}, Date.now()); }
     catch (e) { setLegMsg(e.message); return; }
     const seq = ++seqRef.current;
+    const ctrl = abortRef.current;
+    const wOpts = currentWriteOpts();
     setLegMsg(null);
-    window.DIVE.applyHedgeLegEvent(pid, ev, {})
-      .then((res) => { if (seq === seqRef.current && mountedRef.current) { setLegMsg(`OK · ${JSON.stringify(res).slice(0, 160)}`); load(pid); } })
-      .catch((e) => { if (seq === seqRef.current && mountedRef.current) setLegMsg(String((e && e.message) || e)); });
+    setWriting(true);
+    window.DIVE.applyHedgeLegEvent(pid, ev, wOpts)
+      .then((res) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        setLegMsg(`OK · ${JSON.stringify(res).slice(0, 160)}`);
+        load(pid);
+      })
+      .catch((e) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        const msg = String((e && e.message) || e);
+        if (/abort/i.test(msg)) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        setLegMsg(msg);
+      })
+      .finally(() => { if (mountedRef.current) setWriting(false); });
   };
 
   const doActivate = () => {
+    if (writeDisabled) { setLegMsg(writeReason || "请先加载计划的当前版本"); return; }
     const pid = String(loadedPlanId || "").trim();
     if (!pid) { setLegMsg("请先加载计划的当前版本"); return; }
     const ver = Number(plan && (plan.planVersion != null ? plan.planVersion : plan.plan_version));
     if (!Number.isInteger(ver) || ver < 1) { setLegMsg("请先加载计划的当前版本"); return; }
-    window.DIVE.activateHedgePlan(pid, { expectedVersion: ver }, {})
-      .then(() => load(pid))
-      .catch((e) => setLegMsg(String((e && e.message) || e)));
+    const seq = ++seqRef.current;
+    const ctrl = abortRef.current;
+    const wOpts = currentWriteOpts();
+    setWriting(true);
+    window.DIVE.activateHedgePlan(pid, { expectedVersion: ver }, wOpts)
+      .then(() => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        load(pid);
+      })
+      .catch((e) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        const msg = String((e && e.message) || e);
+        if (/abort/i.test(msg)) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        setLegMsg(msg);
+      })
+      .finally(() => { if (mountedRef.current) setWriting(false); });
   };
   const doClose = () => {
+    if (writeDisabled) { setLegMsg(writeReason || "请先加载计划的当前版本"); return; }
     const pid = String(loadedPlanId || "").trim();
     if (!pid) { setLegMsg("请先加载计划的当前版本"); return; }
     const ver = Number(plan && (plan.planVersion != null ? plan.planVersion : plan.plan_version));
     if (!Number.isInteger(ver) || ver < 1) { setLegMsg("请先加载计划的当前版本"); return; }
-    window.DIVE.closeHedgePlan(pid, { expectedVersion: ver }, {})
-      .then(() => load(pid))
-      .catch((e) => setLegMsg(String((e && e.message) || e)));
+    const seq = ++seqRef.current;
+    const ctrl = abortRef.current;
+    const wOpts = currentWriteOpts();
+    setWriting(true);
+    window.DIVE.closeHedgePlan(pid, { expectedVersion: ver }, wOpts)
+      .then(() => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        load(pid);
+      })
+      .catch((e) => {
+        if (ctrl && ctrl.signal && ctrl.signal.aborted) return;
+        const msg = String((e && e.message) || e);
+        if (/abort/i.test(msg)) return;
+        if (seq !== seqRef.current || !mountedRef.current) return;
+        setLegMsg(msg);
+      })
+      .finally(() => { if (mountedRef.current) setWriting(false); });
   };
 
   if (loading) {
@@ -392,7 +489,32 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
   const guideFut = guideRules && typeof guideRules === "object" && !Array.isArray(guideRules) ? (guideRules.FUTURES_SHORT != null ? guideRules.FUTURES_SHORT : (guideRules.futures_short != null ? guideRules.futures_short : null)) : null;
   const guideSpot = guideRules && typeof guideRules === "object" && !Array.isArray(guideRules) ? (guideRules.SPOT_LONG != null ? guideRules.SPOT_LONG : (guideRules.spot_long != null ? guideRules.spot_long : null)) : null;
   const inputDiffers = String(planInput || "").trim() !== String(loadedPlanId || "").trim();
-  const writeDisabled = !loadedPlanId;
+  /* CR19 unified write permission: loaded object + error + stale + in-flight
+   * + version + expiry. Load failure, STALE, expired/beyond-grace, switching
+   * (loading) or a write in flight disables every write — never just the
+   * presence of loadedPlanId. */
+  const planVerRaw = plan ? (plan.planVersion != null ? plan.planVersion : plan.plan_version) : null;
+  const planVerNum = Number(planVerRaw);
+  const versionOk = Number.isInteger(planVerNum) && planVerNum >= 1;
+  const beyondGrace = sourceAge != null && sourceAge > 60000;
+  let guideExpired = false;
+  let planExpired = false;
+  try {
+    const fmt = (typeof window !== "undefined" && window.HEDGE_FORMAT) ? window.HEDGE_FORMAT : null;
+    if (fmt && typeof fmt.isExpired === "function") {
+      if (guideRaw) guideExpired = fmt.isExpired(guideRaw, nowMs) === true;
+      if (plan) planExpired = fmt.isExpired(plan, nowMs) === true;
+    }
+  } catch (e) { guideExpired = false; planExpired = false; }
+  const expiredView = beyondGrace || guideExpired || planExpired;
+  const writeEval = resolveHedgeMonitorWrite({
+    loadedPlanId, plan, planErr, monErr,
+    stale: showStale, expired: expiredView,
+    loading, writing, versionOk,
+  });
+  const writeDisabled = writeEval.disabled;
+  const writeReason = writeEval.reason || "load a plan first";
+  const writeTitle = writeDisabled ? writeReason : "";
 
   return (
     <div data-testid="hedge-monitor">
@@ -401,8 +523,8 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
       <div className="scanbar sl-filters">
         <input className="pname" aria-label="plan id" placeholder="planId" value={planInput} onChange={(e) => setPlanInput(e.target.value)} />
         <button className="cta" onClick={() => load(planInput)}>{L("sl_retry")}</button>
-        <button className="chip" disabled={writeDisabled} title={writeDisabled ? "load a plan first" : ""} onClick={doActivate}>{L("hedge_activate_btn")}</button>
-        <button className="chip" disabled={writeDisabled} title={writeDisabled ? "load a plan first" : ""} onClick={doClose}>{L("hedge_close_btn")}</button>
+        <button className="chip" disabled={writeDisabled} title={writeTitle} onClick={doActivate}>{L("hedge_activate_btn")}</button>
+        <button className="chip" disabled={writeDisabled} title={writeTitle} onClick={doClose}>{L("hedge_close_btn")}</button>
       </div>
       {inputDiffers && loadedPlanId && (
         <div className="provline" data-testid="hedge-monitor-input-differs">
@@ -414,6 +536,11 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
           <span className="tag hot">STALE</span><span>{L("hedge_stale_kept")}</span>
           {sourceAge != null && <span data-testid="hedge-monitor-source-age">sourceAge {Math.round(sourceAge / 1000)}s</span>}
           {(planErr || monErr) && <span className="sd-err">{String(planErr || monErr).slice(0, 200)}</span>}
+        </div>
+      )}
+      {expiredView && !showStale && (
+        <div className="provline" data-testid="hedge-monitor-expired" role="alert">
+          <span className="tag hot">EXPIRED</span><span>expired — writes paused until fresh data loads</span>
         </div>
       )}
       {!showStale && sourceAge != null && (
@@ -524,7 +651,7 @@ function HedgeMonitor({ planId: planIdProp, initial }) {
             {legForm.eventType === "FUNDING_RECEIPT" && <input className="pname" aria-label="funding amount" placeholder="实际收到资金费" value={legForm.amount} onChange={(e) => setLegForm((f) => ({ ...f, amount: e.target.value }))} />}
             <input className="pname" aria-label="client event id" placeholder="clientEventId" value={legForm.clientEventId} onChange={(e) => setLegForm((f) => ({ ...f, clientEventId: e.target.value }))} />
             <input className="pname" aria-label="expected version" placeholder="expectedPlanVersion" inputMode="numeric" value={legForm.expectedPlanVersion} onChange={(e) => setLegForm((f) => ({ ...f, expectedPlanVersion: e.target.value }))} />
-            <button className="cta" disabled={writeDisabled} onClick={doLeg}>{L("hedge_apply_leg_btn")}</button>
+            <button className="cta" disabled={writeDisabled} title={writeTitle} onClick={doLeg}>{L("hedge_apply_leg_btn")}</button>
           </div>
           <div className="gcap">{L("hedge_qty_string_hint")}</div>
           {legMsg && <div className="reason" data-testid="hedge-leg-msg">{String(legMsg).slice(0, 400)}</div>}
