@@ -586,3 +586,85 @@ def test_metrics_paired_baseline_and_coverage_present() -> None:
     import diveintocrypto_desktop.shortlab.evidence.hedge_metrics as hm
 
     assert hasattr(hm, "hedge_summary")
+
+
+# ---------------------------------------------------------------------------
+# CR17: execution-window head/tail + 1h continuity (D14.2).
+# ---------------------------------------------------------------------------
+
+
+def _cr17_bars(start_ms: int, count: int, *, inclusive: bool = False) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for k in range(count):
+        open_ms = start_ms + k * 3_600_000
+        close_ms = open_ms + 3_600_000 - (1 if inclusive else 0)
+        out.append({"open_ms": open_ms, "close_ms": close_ms, "h": 100.0, "l": 100.0})
+    return out
+
+
+def test_cr17_missing_head_is_partial() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    entry = 0
+    exit = 4 * 3_600_000
+    bars = _cr17_bars(3_600_000, 3)
+    assert path_coverage(bars, entry, exit, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_missing_tail_is_partial_single_bar_for_168h() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    entry = 0
+    exit = 168 * 3_600_000
+    bars = _cr17_bars(0, 1)
+    assert path_coverage(bars, entry, exit, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_missing_middle_is_partial() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    entry = 0
+    exit = 4 * 3_600_000
+    bars = _cr17_bars(0, 1) + _cr17_bars(2 * 3_600_000, 2)
+    assert path_coverage(bars, entry, exit, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_25h_gap_rejected() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    entry = 0
+    exit = 26 * 3_600_000
+    bars = [
+        {"open_ms": 0, "close_ms": 3_600_000, "h": 100.0, "l": 100.0},
+        {"open_ms": 25 * 3_600_000, "close_ms": 26 * 3_600_000, "h": 100.0, "l": 100.0},
+    ]
+    assert path_coverage(bars, entry, exit, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_hour_crossing_edge_is_partial() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    # Window head sits mid-hour; grid bars cannot tile the edge exactly.
+    assert path_coverage(_cr17_bars(0, 4), 1_800_000, 4 * 3_600_000, has_mark=True) == "PARTIAL"
+    # Straddling head hour without finer MARK is PARTIAL.
+    straddle = [
+        {"open_ms": -1_800_000, "close_ms": 1_800_000, "h": 100.0, "l": 100.0},
+        {"open_ms": 0, "close_ms": 3_600_000, "h": 100.0, "l": 100.0},
+    ]
+    assert path_coverage(straddle, 0, 3_600_000, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_lone_head_bar_is_partial() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    assert path_coverage(_cr17_bars(0, 1), 0, 4 * 3_600_000, has_mark=True) == "PARTIAL"
+
+
+def test_cr17_complete_continuous_only() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import path_coverage
+
+    assert path_coverage(_cr17_bars(0, 4), 0, 4 * 3_600_000, has_mark=True) == "COMPLETE"
+    # Inclusive closeTime (open + 1h - 1) tiles the same window.
+    assert path_coverage(_cr17_bars(0, 4, inclusive=True), 0, 4 * 3_600_000, has_mark=True) == "COMPLETE"
+    # Single 1h bar exactly covering a 1h window is COMPLETE.
+    assert path_coverage(_cr17_bars(0, 1), 0, 3_600_000, has_mark=True) == "COMPLETE"

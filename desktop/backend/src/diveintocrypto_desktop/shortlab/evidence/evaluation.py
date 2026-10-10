@@ -354,12 +354,19 @@ def path_coverage(
 
     - no MARK history -> UNKNOWN (never Spot/last_price as proof);
     - straddling head/tail without finer MARK -> PARTIAL;
-    - fully-contained coverage with no interior gap -> COMPLETE, else PARTIAL.
+    - missing head / missing tail / interior gap / lone head bar for a
+      multi-hour window / hour-crossing edge without finer MARK -> PARTIAL;
+    - only a fully-tiled run of 1h bars (open == entry, last close ==
+      exit for exclusive closes or exit-1 for inclusive closeTime, every
+      bar HOUR or HOUR-1 long, consecutive opens exactly 1h apart) is
+      COMPLETE. Any 25h hole (indeed any hole > 1h) is PARTIAL.
     """
     if not has_mark:
         return PATH_UNKNOWN
     entry_i = int(entry_ts_ms)
     exit_i = int(exit_ts_ms)
+    if exit_i <= entry_i:
+        return PATH_PARTIAL
     items = list(bars or ())
     if not items:
         return PATH_PARTIAL
@@ -375,20 +382,45 @@ def path_coverage(
     complete = filter_complete_bars(items, entry_i, exit_i)
     if not complete:
         return PATH_PARTIAL
-    # Gap check: complete timeline must span the window without >25h holes.
+    # Precise window check: the complete 1h timeline must tile
+    # [entry, exit] without head/tail/middle holes (D14.2).
     ordered = sorted(
         (_bar_open_close(b) for b in complete),
         key=lambda pair: (pair[0] or 0, pair[1] or 0),
     )
-    opens = [o for o, _ in ordered if o is not None]
-    closes = [c for _, c in ordered if c is not None]
-    if not opens or not closes:
+    pairs = [(o, c) for o, c in ordered if o is not None and c is not None]
+    if not pairs:
         return PATH_PARTIAL
-    # Edge coverage: first open must be at entry, last close at/before exit.
-    if min(opens) > entry_i or max(closes) > exit_i:
+    opens = [o for o, _ in pairs]
+    closes = [c for _, c in pairs]
+    # Head: first 1h open must exactly meet the execution-window head.
+    # Any missing head (including a sub-hour edge gap) is PARTIAL.
+    if min(opens) != entry_i:
         return PATH_PARTIAL
-    times = sorted(o for o in opens if o is not None)
-    if any(b - a > 25 * _HOUR_MS for a, b in zip(times, times[1:])):
+    # Tail: last close must exactly meet the window tail. Accept both the
+    # exclusive form (close == exit, i.e. open + 1h) and the inclusive
+    # closeTime form (close == exit - 1, i.e. open + 1h - 1) for
+    # hour-multiple windows. Any missing tail is PARTIAL.
+    max_close = max(closes)
+    if max_close == exit_i:
+        pass
+    elif max_close == exit_i - 1 and (exit_i - entry_i) % _HOUR_MS == 0:
+        pass
+    else:
+        return PATH_PARTIAL
+    # Every bar must be a 1h bar (tolerate inclusive closeTime - 1ms).
+    for open_i, close_i in pairs:
+        if (close_i - open_i) not in (_HOUR_MS, _HOUR_MS - 1):
+            return PATH_PARTIAL
+    # Continuity: consecutive 1h opens must be exactly 1h apart. Any
+    # interior hole (2h, 25h, ...) is PARTIAL; duplicates/overlaps too.
+    times = sorted(opens)
+    if any(b - a != _HOUR_MS for a, b in zip(times, times[1:])):
+        return PATH_PARTIAL
+    # Count: an hour-multiple window needs exactly span/1h bars. A lone
+    # head bar for a 168h window is PARTIAL, never COMPLETE.
+    span = exit_i - entry_i
+    if span % _HOUR_MS == 0 and len(pairs) != span // _HOUR_MS:
         return PATH_PARTIAL
     return PATH_COMPLETE
 
