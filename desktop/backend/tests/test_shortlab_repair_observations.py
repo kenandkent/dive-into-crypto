@@ -605,3 +605,398 @@ def test_legacy_missing_receipt_marked_unverified():
     with pytest.raises(ValueError):
         obs.validate_observation(restored, T0)
 
+
+# ---------------------------------------------------------------------------
+# 14. CR03 funding schedule collection (D05.1/D05.2, empty DB -> archive ->
+#     only post-receipt coverage; default-8h CONFIRMED predicate; no backfill).
+# ---------------------------------------------------------------------------
+
+H8_MS = 8 * 3_600_000
+H4_MS = 4 * 3_600_000
+
+
+class _FakeScheduleRepo:
+    """In-memory schedule + market store (same read shape as real repo)."""
+
+    def __init__(self) -> None:
+        self.schedules: dict[str, dict] = {}
+        self.markets: dict[str, dict] = {}
+
+    async def save_funding_schedule(self, record: dict) -> str:
+        sid = str(record["schedule_id"])
+        if sid not in self.schedules:
+            self.schedules[sid] = dict(record)
+        return sid
+
+    async def list_funding_schedules(self, symbol, known_by_ms):
+        out = [
+            r for r in self.schedules.values()
+            if r.get("symbol") == symbol and int(r.get("known_at_ms", 0)) <= int(known_by_ms)
+        ]
+        out.sort(key=lambda r: (int(r["effective_from_ms"]), int(r["known_at_ms"]), str(r["schedule_id"])))
+        return tuple(out)
+
+    async def save_market_observation(self, record: dict) -> str:
+        oid = str(record["observation_id"])
+        if oid not in self.markets:
+            self.markets[oid] = dict(record)
+        return oid
+
+
+def _valid_default_regime(known_at: int = T0) -> dict:
+    return {
+        "interval_hours": 8,
+        "version": "official-default-v2026-10-01",
+        "known_at_ms": known_at,
+        "source": "binance:fapi/fundingInfo:default",
+    }
+
+
+def _slots_from(anchor: int, interval_ms: int, start_exclusive: int, end_inclusive: int) -> list[int]:
+    """Slots ``anchor + k*interval`` inside ``(start, end]`` (D05.2 left-open)."""
+    import math as _math
+
+    k_min = _math.ceil((start_exclusive + 1 - anchor) / interval_ms)
+    k_max = _math.floor((end_inclusive - anchor) / interval_ms)
+    out = []
+    for k in range(k_min, k_max + 1):
+        t = anchor + k * interval_ms
+        if t > start_exclusive and t <= end_inclusive:
+            out.append(t)
+    return sorted(out)
+
+
+def _funding_event_for(t: int, known_at: int, rate: str = "0.0005") -> dict:
+    return {"symbol": "BTCUSDT", "funding_time_ms": t, "rate": rate, "known_at_ms": known_at}
+
+
+def test_cr03_default_8h_predicate_requires_all_conditions():
+    from diveintocrypto_desktop.data import funding as fm
+
+    regime = _valid_default_regime(T0)
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols={"BTCUSDT"}, default_regime=regime,
+    ) is True
+    # (a) incomplete/error response keeps UNKNOWN.
+    assert fm.is_default_8h_confirmed(
+        response_ok=False, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols=set(), default_regime=regime,
+    ) is False
+    # (b) non-TRADING / missing status never confirms.
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="SETTLING",
+        adjusted_symbols=set(), default_regime=regime,
+    ) is False
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status=None,
+        adjusted_symbols=set(), default_regime=regime,
+    ) is False
+    # (b) adjusted symbol never takes the default path.
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="BTCUSDT", symbol_status="TRADING",
+        adjusted_symbols={"BTCUSDT"}, default_regime=regime,
+    ) is False
+    # (c) absence alone never confirms: no regime / wrong interval / no version / no receipt.
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols=set(), default_regime=None,
+    ) is False
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols=set(), default_regime={**regime, "interval_hours": 4},
+    ) is False
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols=set(), default_regime={k: v for k, v in regime.items() if k != "version"},
+    ) is False
+    assert fm.is_default_8h_confirmed(
+        response_ok=True, symbol="ETHUSDT", symbol_status="TRADING",
+        adjusted_symbols=set(), default_regime={k: v for k, v in regime.items() if k != "known_at_ms"},
+    ) is False
+    ok, reason = fm.validate_default_regime(None)
+    assert ok is False and reason is not None
+    ok2, _ = fm.validate_default_regime(regime)
+    assert ok2 is True
+
+
+def test_cr03_adjusted_segments_never_backfill():
+    from diveintocrypto_desktop.data import funding as fm
+
+    rows = [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}]
+    segs = fm.funding_info_to_schedule_segments(rows, observed_at_ms=T0, known_at_ms=T0)
+    assert len(segs) == 1
+    seg = segs[0]
+    assert int(getattr(seg, "effective_from_ms")) == T0
+    assert getattr(seg, "effective_to_ms") is None
+    assert int(getattr(seg, "anchor_ms")) == T0
+    assert int(getattr(seg, "known_at_ms")) == T0
+    assert getattr(seg, "verification") == "CONFIRMED"
+    # Missing interval stays UNKNOWN (never assumed 8h CONFIRMED).
+    segs2 = fm.funding_info_to_schedule_segments(
+        [{"symbol": "BTCUSDT"}], observed_at_ms=T0, known_at_ms=T0
+    )
+    assert getattr(segs2[0], "verification") == "UNKNOWN"
+    # Absent symbol yields no segment (no inference).
+    assert fm.funding_info_to_schedule_segments([], observed_at_ms=T0, known_at_ms=T0) == ()
+
+
+@pytest.mark.asyncio
+async def test_cr03_collect_empty_db_writes_and_covers_only_post_receipt():
+    from diveintocrypto_desktop.data import funding as fm
+
+    repo = _FakeScheduleRepo()
+    # Empty start: no archive -> HISTORY_BOOTSTRAPPING expected on first write.
+    assert await repo.list_funding_schedules("BTCUSDT", T0 - 1) == ()
+    assert await repo.list_funding_schedules("ETHUSDT", T0 - 1) == ()
+
+    adjusted_rows = [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}]
+    statuses = {"BTCUSDT": "TRADING", "ETHUSDT": "TRADING"}
+    regime = _valid_default_regime(T0)
+
+    async def _fake_fetch_info(*, request_context=None):
+        return list(adjusted_rows)
+
+    with patch.object(fm, "fetch_funding_info", _fake_fetch_info):
+        res = await fm.collect_and_archive_funding_schedules(
+            repository=repo,
+            symbols=["BTCUSDT", "ETHUSDT"],
+            symbol_statuses=statuses,
+            default_regime=regime,
+            now_ms=T0,
+        )
+    assert res["response_ok"] is True
+    assert res["observed_at_ms"] == T0 and res["known_at_ms"] == T0
+    assert set(res["adjusted_symbols"]) == {"BTCUSDT"}
+    # Both symbols archived as CONFIRMED (adjusted 8h + default 8h with valid predicate).
+    saved = res["saved_ids"]
+    assert len(saved) == 2
+    assert res["reasons"] == ("HISTORY_BOOTSTRAPPING",)
+    assert res["raw_observation_id"] is not None
+
+    # Receipt preserved: effective_from == observation boundary, known_at == receipt.
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        rows = await repo.list_funding_schedules(sym, T0)
+        assert len(rows) == 1
+        rec = rows[0]
+        assert int(rec["effective_from_ms"]) == T0
+        assert rec["effective_to_ms"] is None
+        assert int(rec["known_at_ms"]) == T0
+        sched = rec["schedule_json"]
+        assert sched["verification"] == "CONFIRMED"
+        assert int(sched["interval_hours"]) == 8
+        assert int(sched["anchor_ms"]) == T0
+    # Default evidence references the official version (audit trail).
+    eth_sched = (await repo.list_funding_schedules("ETHUSDT", T0))[0]["schedule_json"]
+    assert "official-default-v2026-10-01" in str(eth_sched["evidence_ref"])
+
+    # Coverage: Collector read-only path (same repo read + unwrap, market.py untouched).
+    from diveintocrypto_desktop.shortlab.funding_schedule import compute_schedule_coverage
+
+    # Pre-receipt window stays UNKNOWN even with dense 8h events (no backfill).
+    pre_start, pre_end = T0 - 30 * DAY_MS, T0
+    pre_slots = _slots_from(T0 - 30 * DAY_MS, H8_MS, pre_start - 1, pre_end)
+    # Build dense pre events aligned to their own grid (they cannot match post anchor).
+    pre_events = [_funding_event_for(t, T0 - 1_000) for t in pre_slots]
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        raw = await repo.list_funding_schedules(sym, pre_end)
+        cov_pre = compute_schedule_coverage(
+            pre_events, fm.unwrap_repo_schedules_for_coverage(raw), pre_start, pre_end, pre_end
+        )
+        assert cov_pre.coverage_fraction is None
+        assert "FUNDING_SCHEDULE_UNKNOWN" in cov_pre.reasons
+
+    # Post-receipt 7d window with anchor-aligned events grants coverage.
+    post_start, post_end = T0, T0 + 7 * DAY_MS
+    post_slots = _slots_from(T0, H8_MS, post_start, post_end)
+    assert len(post_slots) == 21
+    post_events = [_funding_event_for(t, T0 + 1_000) for t in post_slots]
+    for sym in ("BTCUSDT", "ETHUSDT"):
+        raw = await repo.list_funding_schedules(sym, post_end)
+        cov = compute_schedule_coverage(
+            post_events, fm.unwrap_repo_schedules_for_coverage(raw), post_start, post_end, post_end
+        )
+        assert cov.expected_count == 21
+        assert cov.received_count == 21
+        assert cov.coverage_fraction == "1"
+        assert cov.reasons == ()
+
+
+@pytest.mark.asyncio
+async def test_cr03_default_without_valid_regime_stays_unknown():
+    from diveintocrypto_desktop.data import funding as fm
+    from diveintocrypto_desktop.shortlab.funding_schedule import compute_schedule_coverage
+
+    repo = _FakeScheduleRepo()
+
+    async def _fake_fetch_info(*, request_context=None):
+        return []
+
+    # No official default archive: unadjusted TRADING symbol must stay UNKNOWN.
+    with patch.object(fm, "fetch_funding_info", _fake_fetch_info):
+        res = await fm.collect_and_archive_funding_schedules(
+            repository=repo,
+            symbols=["ETHUSDT"],
+            symbol_statuses={"ETHUSDT": "TRADING"},
+            default_regime=None,
+            now_ms=T0,
+        )
+    assert res["saved_ids"] == ()
+    assert len(res["segments"]) == 1
+    assert getattr(res["segments"][0], "verification") == "UNKNOWN"
+    raw = await repo.list_funding_schedules("ETHUSDT", T0)
+    assert raw == ()
+    cov = compute_schedule_coverage([], fm.unwrap_repo_schedules_for_coverage(raw), T0, T0 + 7 * DAY_MS, T0 + 7 * DAY_MS)
+    assert cov.coverage_fraction is None
+    assert "FUNDING_SCHEDULE_UNKNOWN" in cov.reasons
+
+
+@pytest.mark.asyncio
+async def test_cr03_incomplete_response_writes_nothing():
+    from diveintocrypto_desktop.data import funding as fm
+
+    repo = _FakeScheduleRepo()
+
+    async def _boom(*, request_context=None):
+        raise RuntimeError("fapi down")
+
+    with patch.object(fm, "fetch_funding_info", _boom):
+        res = await fm.collect_and_archive_funding_schedules(
+            repository=repo, symbols=["BTCUSDT"],
+            symbol_statuses={"BTCUSDT": "TRADING"},
+            default_regime=_valid_default_regime(T0), now_ms=T0,
+        )
+    assert res["response_ok"] is False
+    assert res["saved_ids"] == () and res["closed_ids"] == ()
+    assert "FUNDING_SCHEDULE_UNKNOWN" in res["reasons"]
+    assert await repo.list_funding_schedules("BTCUSDT", T0) == ()
+
+
+@pytest.mark.asyncio
+async def test_cr03_continuous_collect_is_idempotent():
+    from diveintocrypto_desktop.data import funding as fm
+
+    repo = _FakeScheduleRepo()
+    rows = [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}]
+    statuses = {"BTCUSDT": "TRADING"}
+    regime = _valid_default_regime(T0)
+
+    async def _fake_fetch_info(*, request_context=None):
+        return list(rows)
+
+    with patch.object(fm, "fetch_funding_info", _fake_fetch_info):
+        first = await fm.collect_and_archive_funding_schedules(
+            repository=repo, symbols=["BTCUSDT"], symbol_statuses=statuses,
+            default_regime=regime, now_ms=T0,
+        )
+        second = await fm.collect_and_archive_funding_schedules(
+            repository=repo, symbols=["BTCUSDT"], symbol_statuses=statuses,
+            default_regime={**regime, "known_at_ms": T0 + 3_600_000},
+            now_ms=T0 + 3_600_000,
+        )
+    assert len(first["saved_ids"]) == 1
+    # Stable regime: second tick writes nothing (no overlapping duplicates).
+    assert second["saved_ids"] == () and second["closed_ids"] == ()
+    rows_now = await repo.list_funding_schedules("BTCUSDT", T0 + 3_600_000)
+    assert len(rows_now) == 1
+
+
+@pytest.mark.asyncio
+async def test_cr03_regime_change_closes_stale_and_covers_new():
+    from diveintocrypto_desktop.data import funding as fm
+    from diveintocrypto_desktop.shortlab.funding_schedule import compute_schedule_coverage
+
+    repo = _FakeScheduleRepo()
+    statuses = {"BTCUSDT": "TRADING"}
+    regime = _valid_default_regime(T0)
+    t1 = T0 + 7 * DAY_MS
+
+    async def _fetch_8h(*, request_context=None):
+        return [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}]
+
+    async def _fetch_4h(*, request_context=None):
+        return [{"symbol": "BTCUSDT", "fundingIntervalHours": 4}]
+
+    with patch.object(fm, "fetch_funding_info", _fetch_8h):
+        r1 = await fm.collect_and_archive_funding_schedules(
+            repository=repo, symbols=["BTCUSDT"], symbol_statuses=statuses,
+            default_regime=regime, now_ms=T0,
+        )
+    assert len(r1["saved_ids"]) == 1
+    with patch.object(fm, "fetch_funding_info", _fetch_4h):
+        r2 = await fm.collect_and_archive_funding_schedules(
+            repository=repo, symbols=["BTCUSDT"], symbol_statuses=statuses,
+            default_regime=regime, now_ms=t1,
+        )
+    assert len(r2["saved_ids"]) == 1
+    assert len(r2["closed_ids"]) == 1
+    # Old 8h window still covered by the closed [T0, t1) revision.
+    old_slots = _slots_from(T0, H8_MS, T0, t1)
+    old_events = [_funding_event_for(t, t1) for t in old_slots]
+    raw = await repo.list_funding_schedules("BTCUSDT", t1)
+    cov_old = compute_schedule_coverage(
+        old_events, fm.unwrap_repo_schedules_for_coverage(raw), T0, t1, t1
+    )
+    assert cov_old.coverage_fraction == "1"
+    # New 4h window covered by the new [t1, None) segment.
+    new_slots = _slots_from(t1, H4_MS, t1, t1 + 7 * DAY_MS)
+    assert len(new_slots) == 42
+    new_events = [_funding_event_for(t, t1 + 1_000) for t in new_slots]
+    cov_new = compute_schedule_coverage(
+        new_events, fm.unwrap_repo_schedules_for_coverage(raw), t1, t1 + 7 * DAY_MS, t1 + 7 * DAY_MS
+    )
+    assert cov_new.expected_count == 42 and cov_new.received_count == 42
+    assert cov_new.coverage_fraction == "1"
+
+
+@pytest.mark.asyncio
+async def test_cr03_restart_preserves_receipt_and_coverage():
+    import tempfile
+    from pathlib import Path
+
+    from diveintocrypto_desktop.data import funding as fm
+    from diveintocrypto_desktop.shortlab.funding_schedule import compute_schedule_coverage
+    from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
+
+    tmp = tempfile.mkdtemp()
+    db = Path(tmp) / "cr03.duckdb"
+    repo = await ShortLabRepository.open(db)
+    try:
+        await repo.migrate(6)
+        # Empty start.
+        assert await repo.list_funding_schedules("BTCUSDT", T0) == ()
+
+        async def _fake_fetch_info(*, request_context=None):
+            return [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}]
+
+        with patch.object(fm, "fetch_funding_info", _fake_fetch_info):
+            res = await fm.collect_and_archive_funding_schedules(
+                repository=repo, symbols=["BTCUSDT"],
+                symbol_statuses={"BTCUSDT": "TRADING"},
+                default_regime=_valid_default_regime(T0), now_ms=T0,
+            )
+        assert len(res["saved_ids"]) == 1
+    finally:
+        await repo.close()
+    # Restart: reopen the same DB file, receipt must survive verbatim.
+    repo2 = await ShortLabRepository.open(db)
+    try:
+        rows = await repo2.list_funding_schedules("BTCUSDT", T0)
+        assert len(rows) == 1
+        assert int(rows[0]["known_at_ms"]) == T0
+        assert int(rows[0]["effective_from_ms"]) == T0
+        sched = rows[0]["schedule_json"]
+        assert sched["verification"] == "CONFIRMED" and int(sched["interval_hours"]) == 8
+        post_slots = _slots_from(T0, H8_MS, T0, T0 + 7 * DAY_MS)
+        post_events = [
+            {"symbol": "BTCUSDT", "funding_time_ms": t, "rate": "0.0005", "known_at_ms": T0 + 1_000}
+            for t in post_slots
+        ]
+        cov = compute_schedule_coverage(
+            post_events, fm.unwrap_repo_schedules_for_coverage(rows), T0, T0 + 7 * DAY_MS, T0 + 7 * DAY_MS
+        )
+        assert cov.coverage_fraction == "1"
+    finally:
+        await repo2.close()
+
+

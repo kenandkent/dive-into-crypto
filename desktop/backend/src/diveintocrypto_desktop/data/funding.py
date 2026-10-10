@@ -666,3 +666,927 @@ def funding_info_to_schedule_segments(
                 )
             )
     return tuple(segments)
+
+
+# ---------------------------------------------------------------------------
+# CR03 funding schedule collection (D05.1/D05.2/D18.2).
+#
+# CR03 gap: ``fetch_funding_info_observed`` /
+# ``funding_info_to_schedule_segments`` had definitions only, ``save_funding_schedule``
+# had no business caller, and the Collector only read the archive. A fresh
+# install therefore stayed UNKNOWN even after 30/90d of event collection.
+#
+# This section provides the single production collection task
+# (:func:`collect_and_archive_funding_schedules`) that wires the four D05.1
+# requirements together:
+#
+# 1.制度响应 (fundingInfo document, adjusted symbols only);
+# 2.原始 receipt (``Observed`` known_at/fetched_at preserved verbatim);
+# 3.有效区间 (``[effective_from, effective_to)`` with ``effective_from`` equal
+#   to the observation boundary, never extended into unverified history);
+# 4.档案保存 (``save_funding_schedule`` rows + optional raw ``FUNDING_INFO``
+#   market observation for audit).
+#
+# Default-8h rule (D05.1): a symbol absent from fundingInfo proves nothing by
+# itself. It may be archived as CONFIRMED 8h only when ALL of the following
+# hold (otherwise UNKNOWN, never inferred):
+#
+# - (a) the fundingInfo fetch is a complete HTTP200 business success;
+# - (b) the symbol status is TRADING and the symbol is not in the adjusted list;
+# - (c) the referenced official current default regime is explicitly 8h AND
+#   carries a recorded version + receipt (known_at/source).
+#
+# History rule: ``effective_from`` is always the current observation boundary.
+# No backfill into pre-receipt windows is ever written, so
+# ``compute_schedule_coverage`` stays UNKNOWN (``FUNDING_SCHEDULE_UNKNOWN``)
+# for windows before the first CONFIRMED receipt and only grants coverage for
+# post-receipt intervals. Revisions use a new ``schedule_id`` and never mutate
+# old rows (D05.2); stable regimes are idempotent (no duplicate open rows);
+# regime changes close stale open CONFIRMED rows with a same-``effective_from``
+# revision whose ``effective_to`` equals the new observation boundary, so the
+# transition does not leave a permanent overlap-UNKNOWN.
+#
+# Read-only Collector use: :func:`unwrap_repo_schedules_for_coverage` converts
+# real ``list_funding_schedules`` rows (which nest the full segment inside
+# ``schedule_json``) into coverage-ready segments without touching
+# ``shortlab/hedge/market.py``. Production wiring may call the collector's
+# existing ``repo.list_funding_schedules`` read plus this helper plus
+# ``funding_schedule.compute_schedule_coverage``.
+# ---------------------------------------------------------------------------
+
+#: CR03 official default interval (D05.1: current default is 8h when proven).
+DEFAULT_FUNDING_INTERVAL_HOURS = 8
+
+#: CR03 TRADING status required for default-8h confirmation (D05.1).
+TRADING_STATUS = "TRADING"
+
+
+def _default_regime_interval_hours(regime: Any) -> int | None:
+    if not isinstance(regime, dict):
+        # Support Mapping-like objects with .get
+        try:
+            get = regime.get  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        if not callable(get):
+            return None
+        raw = None
+        for key in ("interval_hours", "intervalHours", "fundingIntervalHours"):
+            try:
+                raw = get(key)
+            except Exception:
+                raw = None
+            if raw is not None:
+                break
+    else:
+        raw = None
+        for key in ("interval_hours", "intervalHours", "fundingIntervalHours"):
+            if regime.get(key) is not None:
+                raw = regime.get(key)
+                break
+    if raw is None:
+        return None
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _default_regime_version(regime: Any) -> str | None:
+    try:
+        get = regime.get  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if not callable(get):
+        return None
+    for key in ("version", "regime_version", "revision", "default_version", "regimeVersion"):
+        try:
+            raw = get(key)
+        except Exception:
+            continue
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _default_regime_known_at_ms(regime: Any) -> int | None:
+    try:
+        get = regime.get  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if not callable(get):
+        return None
+    for key in ("known_at_ms", "knownAt", "known_at", "fetched_at_ms", "receipt_known_at_ms"):
+        try:
+            raw = get(key)
+        except Exception:
+            continue
+        if raw is None:
+            continue
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _default_regime_source(regime: Any) -> str | None:
+    try:
+        get = regime.get  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if not callable(get):
+        return None
+    for key in ("source", "origin", "official_source"):
+        try:
+            raw = get(key)
+        except Exception:
+            continue
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def validate_default_regime(regime: Any) -> tuple[bool, str | None]:
+    """Check an archived official current-default regime (D05.1 predicate c).
+
+    ``True`` only when the regime explicitly states 8h AND carries a recorded
+    version + receipt (``known_at`` + ``source``). Returns ``(ok, reason)``
+    where ``reason`` is ``None`` on success, else a machine string
+    (``DEFAULT_REGIME_*``) for honest UNKNOWN reporting. ``None``/malformed
+    regimes are never treated as 8h proof.
+    """
+    if regime is None:
+        return False, "DEFAULT_REGIME_MISSING"
+    interval = _default_regime_interval_hours(regime)
+    if interval is None:
+        return False, "DEFAULT_REGIME_INTERVAL_UNKNOWN"
+    if interval != DEFAULT_FUNDING_INTERVAL_HOURS:
+        return False, "DEFAULT_REGIME_NOT_8H"
+    if _default_regime_version(regime) is None:
+        return False, "DEFAULT_REGIME_VERSION_MISSING"
+    if _default_regime_known_at_ms(regime) is None:
+        return False, "DEFAULT_REGIME_RECEIPT_MISSING"
+    if _default_regime_source(regime) is None:
+        return False, "DEFAULT_REGIME_SOURCE_MISSING"
+    return True, None
+
+
+def is_default_8h_confirmed(
+    *,
+    response_ok: bool,
+    symbol: str,
+    symbol_status: str | None,
+    adjusted_symbols: Any,
+    default_regime: Any,
+) -> bool:
+    """D05.1 default-8h CONFIRMED predicate (all four conditions).
+
+    - ``response_ok``: complete HTTP200 business success for this fundingInfo
+      fetch (``False`` on any transport/business failure keeps UNKNOWN).
+    - ``symbol`` non-empty, ``symbol_status`` exactly ``"TRADING"``.
+    - ``symbol`` not in ``adjusted_symbols`` (the fundingInfo adjusted list).
+    - ``default_regime`` validates via :func:`validate_default_regime`
+      (explicit 8h + recorded version/receipt).
+
+    Missing any predicate returns ``False`` (UNKNOWN). Absence from the
+    adjusted list alone never confirms 8h.
+    """
+    if not response_ok:
+        return False
+    if not isinstance(symbol, str) or not symbol:
+        return False
+    if symbol_status != TRADING_STATUS:
+        return False
+    try:
+        if symbol in (adjusted_symbols or ()):  # type: ignore[operator]
+            return False
+    except TypeError:
+        # Un hahable adjusted container: be conservative (UNKNOWN).
+        try:
+            if symbol in list(adjusted_symbols or ()):
+                return False
+        except Exception:
+            return False
+    ok, _ = validate_default_regime(default_regime)
+    return bool(ok)
+
+
+def _adjusted_symbols_of(info_rows: Any) -> set[str]:
+    out: set[str] = set()
+    rows = list(info_rows) if isinstance(info_rows, (list, tuple)) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            out.add(symbol)
+    return out
+
+
+def default_8h_segments(
+    symbols: Any,
+    *,
+    observed_at_ms: int,
+    known_at_ms: int,
+    adjusted_symbols: Any,
+    symbol_statuses: Any | None = None,
+    default_regime: Any | None = None,
+    response_ok: bool = True,
+    source: str = _FUNDING_INFO_SOURCE,
+    evidence_ref_prefix: str = "fundingInfo",
+) -> tuple[Any, ...]:
+    """CONFIRMED/UNKNOWN 8h segments for symbols absent from fundingInfo.
+
+    Each candidate yields one segment with ``effective_from`` equal to the
+    observation boundary (never backfilled) and ``effective_to=None``.
+    ``verification`` is ``CONFIRMED`` only when
+    :func:`is_default_8h_confirmed` holds; otherwise ``UNKNOWN`` (callers
+    persist only CONFIRMED, leaving history UNKNOWN). ``anchor`` mirrors the
+    boundary per R03 (no unverified historical anchor is invented).
+    """
+    try:
+        from diveintocrypto_desktop.shortlab.repair_contracts import (
+            FundingScheduleSegment,
+        )
+    except Exception:  # pragma: no cover - contract import guard
+        FundingScheduleSegment = None  # type: ignore[assignment]
+
+    observed = int(observed_at_ms)
+    known = int(known_at_ms)
+    adjusted: set[str] = set()
+    try:
+        for s in (adjusted_symbols or ()):
+            if isinstance(s, str) and s:
+                adjusted.add(s)
+    except TypeError:
+        pass
+    # Dedupe candidates, keep deterministic order.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for s in (list(symbols) if isinstance(symbols, (list, tuple, set)) else []):
+        if not isinstance(s, str) or not s or s in seen:
+            continue
+        seen.add(s)
+        candidates.append(s)
+    candidates.sort()
+    version = _default_regime_version(default_regime) if default_regime is not None else None
+    segments: list[Any] = []
+    statuses: Any = symbol_statuses if isinstance(symbol_statuses, dict) else {}
+    # Support Mapping-like statuses with .get
+    for symbol in candidates:
+        if symbol in adjusted:
+            continue
+        try:
+            status = statuses.get(symbol) if hasattr(statuses, "get") else None
+        except Exception:
+            status = None
+        confirmed = is_default_8h_confirmed(
+            response_ok=bool(response_ok),
+            symbol=symbol,
+            symbol_status=status,
+            adjusted_symbols=adjusted,
+            default_regime=default_regime,
+        )
+        verification = "CONFIRMED" if confirmed else "UNKNOWN"
+        schedule_id = f"{symbol}:{observed}:{DEFAULT_FUNDING_INTERVAL_HOURS}"
+        if version:
+            evidence_ref = f"{evidence_ref_prefix}:{symbol}:{known}:default:{version}"
+        else:
+            evidence_ref = f"{evidence_ref_prefix}:{symbol}:{known}"
+        if FundingScheduleSegment is None:
+            segments.append(
+                {
+                    "schedule_id": schedule_id,
+                    "symbol": symbol,
+                    "effective_from_ms": observed,
+                    "effective_to_ms": None,
+                    "interval_hours": DEFAULT_FUNDING_INTERVAL_HOURS,
+                    "anchor_ms": observed,
+                    "known_at_ms": known,
+                    "source": source,
+                    "evidence_ref": evidence_ref,
+                    "verification": verification,
+                }
+            )
+        else:
+            segments.append(
+                FundingScheduleSegment(
+                    schedule_id=schedule_id,
+                    symbol=symbol,
+                    effective_from_ms=observed,
+                    effective_to_ms=None,
+                    interval_hours=DEFAULT_FUNDING_INTERVAL_HOURS,
+                    anchor_ms=observed,
+                    known_at_ms=known,
+                    source=source,
+                    evidence_ref=evidence_ref,
+                    verification=verification,
+                )
+            )
+    return tuple(segments)
+
+
+def build_funding_schedule_segments(
+    info_rows: Any,
+    *,
+    observed_at_ms: int,
+    known_at_ms: int,
+    symbols: Any | None = None,
+    symbol_statuses: Any | None = None,
+    default_regime: Any | None = None,
+    response_ok: bool = True,
+    source: str = _FUNDING_INFO_SOURCE,
+    evidence_ref_prefix: str = "fundingInfo",
+) -> tuple[Any, ...]:
+    """Adjusted + default-8h segments for one fundingInfo snapshot (D05.1).
+
+    Calls :func:`funding_info_to_schedule_segments` for adjusted symbols, then
+    :func:`default_8h_segments` for ``symbols`` absent from the snapshot when
+    ``symbols`` is not ``None``. With ``symbols=None`` the result is exactly
+    the legacy adjusted-only tuple (backward compatible). No ``effective_from``
+    is ever earlier than ``observed_at_ms`` (no history backfill).
+    """
+    adjusted = funding_info_to_schedule_segments(
+        info_rows,
+        observed_at_ms=observed_at_ms,
+        known_at_ms=known_at_ms,
+        source=source,
+        evidence_ref_prefix=evidence_ref_prefix,
+    )
+    if symbols is None:
+        return adjusted
+    adjusted_set = _adjusted_symbols_of(info_rows)
+    defaults = default_8h_segments(
+        symbols,
+        observed_at_ms=observed_at_ms,
+        known_at_ms=known_at_ms,
+        adjusted_symbols=adjusted_set,
+        symbol_statuses=symbol_statuses,
+        default_regime=default_regime,
+        response_ok=response_ok,
+        source=source,
+        evidence_ref_prefix=evidence_ref_prefix,
+    )
+    combined = list(adjusted) + list(defaults)
+    # Deterministic order by (symbol, effective_from, schedule_id).
+    def _key(seg: Any) -> tuple[str, int, str]:
+        try:
+            if isinstance(seg, dict):
+                return (str(seg.get("symbol", "")), int(seg.get("effective_from_ms", 0)), str(seg.get("schedule_id", "")))
+            return (str(getattr(seg, "symbol", "")), int(getattr(seg, "effective_from_ms", 0)), str(getattr(seg, "schedule_id", "")))
+        except Exception:
+            return ("", 0, "")
+    combined.sort(key=_key)
+    return tuple(combined)
+
+
+def schedule_segment_to_record(segment: Any) -> dict[str, Any]:
+    """Convert a ``FundingScheduleSegment`` to a ``save_funding_schedule`` record.
+
+    Record shape (R01): ``{schedule_id, symbol, effective_from_ms,
+    effective_to_ms, known_at_ms, schedule_json}`` where ``schedule_json`` is
+    the complete segment (never a lossy column subset, D18.2). Accepts both
+    the dataclass and the fallback dict shape. Raises ``ValueError`` on
+    invalid segments (callers keep UNKNOWN instead of persisting garbage).
+    """
+    if isinstance(segment, dict):
+        data = dict(segment)
+        try:
+            schedule_id = str(data["schedule_id"])
+            symbol = str(data["symbol"])
+            eff_from = int(data["effective_from_ms"])  # type: ignore[arg-type]
+            eff_to = data.get("effective_to_ms")
+            eff_to = None if eff_to is None else int(eff_to)  # type: ignore[arg-type]
+            known = int(data["known_at_ms"])  # type: ignore[arg-type]
+            interval = int(data["interval_hours"])  # type: ignore[arg-type]
+            anchor = int(data["anchor_ms"])  # type: ignore[arg-type]
+            source = str(data["source"])
+            evidence_ref = str(data["evidence_ref"])
+            verification = str(data["verification"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid schedule dict: {exc}") from exc
+        if not schedule_id or not symbol or not source or not evidence_ref:
+            raise ValueError("schedule dict misses required str fields")
+        if eff_from < 0 or known < 0 or anchor < 0:
+            raise ValueError("schedule times must be >= 0")
+        if eff_to is not None and eff_to <= eff_from:
+            raise ValueError("effective_to_ms must be > effective_from_ms")
+        if interval <= 0:
+            raise ValueError("interval_hours must be > 0")
+        if verification not in ("CONFIRMED", "INFERRED", "UNKNOWN"):
+            raise ValueError(f"verification={verification!r} unknown")
+        schedule_json = {
+            "schedule_id": schedule_id,
+            "symbol": symbol,
+            "effective_from_ms": eff_from,
+            "effective_to_ms": eff_to,
+            "interval_hours": interval,
+            "anchor_ms": anchor,
+            "known_at_ms": known,
+            "source": source,
+            "evidence_ref": evidence_ref,
+            "verification": verification,
+        }
+        return {
+            "schedule_id": schedule_id,
+            "symbol": symbol,
+            "effective_from_ms": eff_from,
+            "effective_to_ms": eff_to,
+            "known_at_ms": known,
+            "schedule_json": schedule_json,
+        }
+    # Dataclass (or compatible object with attributes).
+    try:
+        schedule_id = str(getattr(segment, "schedule_id"))
+        symbol = str(getattr(segment, "symbol"))
+        eff_from = int(getattr(segment, "effective_from_ms"))
+        eff_to_raw = getattr(segment, "effective_to_ms")
+        eff_to = None if eff_to_raw is None else int(eff_to_raw)
+        known = int(getattr(segment, "known_at_ms"))
+        interval = int(getattr(segment, "interval_hours"))
+        anchor = int(getattr(segment, "anchor_ms"))
+        source = str(getattr(segment, "source"))
+        evidence_ref = str(getattr(segment, "evidence_ref"))
+        verification = str(getattr(segment, "verification"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid schedule segment: {exc}") from exc
+    if not schedule_id or not symbol or not source or not evidence_ref:
+        raise ValueError("schedule misses required str fields")
+    if eff_from < 0 or known < 0 or anchor < 0:
+        raise ValueError("schedule times must be >= 0")
+    if eff_to is not None and eff_to <= eff_from:
+        raise ValueError("effective_to_ms must be > effective_from_ms")
+    if interval <= 0:
+        raise ValueError("interval_hours must be > 0")
+    if verification not in ("CONFIRMED", "INFERRED", "UNKNOWN"):
+        raise ValueError(f"verification={verification!r} unknown")
+    schedule_json = {
+        "schedule_id": schedule_id,
+        "symbol": symbol,
+        "effective_from_ms": eff_from,
+        "effective_to_ms": eff_to,
+        "interval_hours": interval,
+        "anchor_ms": anchor,
+        "known_at_ms": known,
+        "source": source,
+        "evidence_ref": evidence_ref,
+        "verification": verification,
+    }
+    return {
+        "schedule_id": schedule_id,
+        "symbol": symbol,
+        "effective_from_ms": eff_from,
+        "effective_to_ms": eff_to,
+        "known_at_ms": known,
+        "schedule_json": schedule_json,
+    }
+
+
+def _unwrap_one_repo_schedule(row: Any) -> dict[str, Any] | None:
+    """Unwrap one ``list_funding_schedules`` row to a coverage-ready mapping.
+
+    Real rows nest the full segment inside ``schedule_json``; the top-level
+    columns alone lack ``interval_hours``/``anchor``/``verification`` and are
+    skipped by ``compute_schedule_coverage`` (which stays UNKNOWN). This helper
+    prefers ``schedule_json`` when it is a mapping, else falls back to the
+    top-level columns. Returns ``None`` when neither shape is usable.
+    """
+    if isinstance(row, dict):
+        nested = row.get("schedule_json")
+        if isinstance(nested, dict) and nested.get("schedule_id") and nested.get("symbol"):
+            # Prefer the nested full segment (D18.2 complete JSON).
+            merged = dict(nested)
+            # Fill receipt times from top-level when nested omits them.
+            for key in ("effective_from_ms", "effective_to_ms", "known_at_ms"):
+                if merged.get(key) is None and row.get(key) is not None:
+                    merged[key] = row.get(key)
+            return merged
+        # Fallback: top-level already carries the full DTO keys.
+        if row.get("schedule_id") and row.get("symbol"):
+            return dict(row)
+        return None
+    # FundingScheduleSegment dataclass passes through.
+    try:
+        from diveintocrypto_desktop.shortlab.repair_contracts import FundingScheduleSegment as _Seg
+        if isinstance(row, _Seg):
+            return row  # type: ignore[return-value]
+    except Exception:
+        pass
+    # Generic attribute object: convert to mapping.
+    try:
+        return {
+            "schedule_id": str(getattr(row, "schedule_id")),
+            "symbol": str(getattr(row, "symbol")),
+            "effective_from_ms": int(getattr(row, "effective_from_ms")),
+            "effective_to_ms": None if getattr(row, "effective_to_ms") is None else int(getattr(row, "effective_to_ms")),
+            "interval_hours": int(getattr(row, "interval_hours")),
+            "anchor_ms": int(getattr(row, "anchor_ms")),
+            "known_at_ms": int(getattr(row, "known_at_ms")),
+            "source": str(getattr(row, "source")),
+            "evidence_ref": str(getattr(row, "evidence_ref")),
+            "verification": str(getattr(row, "verification")),
+        }
+    except Exception:
+        return None
+
+
+def unwrap_repo_schedules_for_coverage(rows: Any) -> tuple[Any, ...]:
+    """Convert ``list_funding_schedules`` rows to coverage-ready segments.
+
+    Read-only helper for the Collector path (``market.py`` is not modified):
+    callers keep using ``repo.list_funding_schedules(symbol, as_of)`` for the
+    read, then pass the result through here before
+    ``funding_schedule.compute_schedule_coverage``. Unusable rows are dropped
+    (coverage stays UNKNOWN via absence, never fabricated).
+    """
+    if rows is None:
+        return ()
+    try:
+        items = list(rows)  # type: ignore[arg-type]
+    except TypeError:
+        return ()
+    out: list[Any] = []
+    for row in items:
+        unwrapped = _unwrap_one_repo_schedule(row)
+        if unwrapped is not None:
+            out.append(unwrapped)
+    return tuple(out)
+
+
+def _segment_interval_hours(seg: Any) -> int | None:
+    if isinstance(seg, dict):
+        nested = seg.get("schedule_json") if "schedule_json" in seg else None
+        if isinstance(nested, dict):
+            for key in ("interval_hours", "intervalHours"):
+                if nested.get(key) is not None:
+                    try:
+                        value = int(nested.get(key))  # type: ignore[arg-type]
+                        return value if value > 0 else None
+                    except (TypeError, ValueError):
+                        return None
+        for key in ("interval_hours", "intervalHours"):
+            if seg.get(key) is not None:
+                try:
+                    value = int(seg.get(key))  # type: ignore[arg-type]
+                    return value if value > 0 else None
+                except (TypeError, ValueError):
+                    return None
+        return None
+    try:
+        value = int(getattr(seg, "interval_hours"))
+        return value if value > 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _segment_verification(seg: Any) -> str | None:
+    if isinstance(seg, dict):
+        nested = seg.get("schedule_json") if "schedule_json" in seg else None
+        if isinstance(nested, dict) and isinstance(nested.get("verification"), str):
+            return nested.get("verification")
+        value = seg.get("verification")
+        return value if isinstance(value, str) else None
+    try:
+        value = getattr(seg, "verification")
+        return value if isinstance(value, str) else None
+    except AttributeError:
+        return None
+
+
+def _segment_effective_from(seg: Any) -> int | None:
+    if isinstance(seg, dict):
+        nested = seg.get("schedule_json") if "schedule_json" in seg else None
+        if isinstance(nested, dict) and nested.get("effective_from_ms") is not None:
+            try:
+                return int(nested.get("effective_from_ms"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(seg.get("effective_from_ms"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(getattr(seg, "effective_from_ms"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _segment_effective_to(seg: Any) -> int | None:
+    if isinstance(seg, dict):
+        nested = seg.get("schedule_json") if "schedule_json" in seg else None
+        if isinstance(nested, dict) and "effective_to_ms" in nested:
+            raw = nested.get("effective_to_ms")
+            if raw is None:
+                return None
+            try:
+                return int(raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+        raw = seg.get("effective_to_ms")
+        if raw is None:
+            return None
+        try:
+            return int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    try:
+        raw = getattr(seg, "effective_to_ms")
+        return None if raw is None else int(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+async def collect_and_archive_funding_schedules(
+    *,
+    repository: Any,
+    symbols: Any | None = None,
+    symbol_statuses: Any | None = None,
+    default_regime: Any | None = None,
+    observed_at_ms: int | None = None,
+    now_ms: int | None = None,
+    identity_snapshot_id: str | None = None,
+    request_context: RequestContext | None = None,
+    persist_raw_observation: bool = True,
+    persist_only_confirmed: bool = True,
+    evidence_ref_prefix: str = "fundingInfo",
+) -> dict[str, Any]:
+    """Fetch fundingInfo once and archive CONFIRMED schedule segments (D05.1).
+
+    Production collection task (CR03): the single writer for
+    ``save_funding_schedule``. Steps:
+
+    1. ``fetch_funding_info_observed`` (single ``fundingInfo`` charge, 429/5xx
+       retried via ``data/http.py``). The ``Observed`` receipt
+       (``known_at``/``fetched_at``) is preserved verbatim in every saved
+       segment (never restamped with save time).
+    2. Build adjusted + default-8h segments with ``effective_from`` equal to
+       the observation boundary (``known_at`` unless ``observed_at_ms`` is
+       explicitly injected for tests). History is never backfilled.
+    3. Idempotent archive: a CONFIRMED segment is skipped when a covering
+       CONFIRMED row with the same interval already exists
+       (``effective_from <= observed`` and open). Stale open CONFIRMED rows
+       with a different interval are closed with a same-``effective_from``
+       revision (new ``schedule_id``, ``effective_to=observed``) so the
+       transition does not leave a permanent overlap-UNKNOWN.
+    4. Optionally persist the raw fundingInfo document via
+       ``save_market_observation`` (``kind=FUNDING_INFO``) for audit; failures
+       there never block schedule writes.
+
+    On transport/business failure no schedule is written and the result keeps
+    ``FUNDING_SCHEDULE_UNKNOWN`` (history stays UNKNOWN). Only CONFIRMED
+    segments are persisted when ``persist_only_confirmed`` is true (default);
+    UNKNOWN candidates are reported but not archived.
+
+    Returns ``{observed_at_ms, known_at_ms, response_ok, adjusted_symbols,
+    segments, saved_ids, closed_ids, raw_observation_id, reasons}``.
+    ``segments`` are the built dataclass/dict objects (CONFIRMED + UNKNOWN);
+    ``saved_ids`` are persisted CONFIRMED ids; ``reasons`` carries
+    ``HISTORY_BOOTSTRAPPING`` when no verifiable CONFIRMED archive existed
+    before this collection, else ``()``.
+    """
+    # 1. Fetch (single charge). Failure keeps UNKNOWN without writes.
+    try:
+        observed = await fetch_funding_info_observed(
+            now_ms=now_ms,
+            identity_snapshot_id=identity_snapshot_id,
+            request_context=request_context,
+        )
+    except Exception as exc:
+        reason = str(getattr(exc, "reason_code", None) or type(exc).__name__)
+        return {
+            "observed_at_ms": None,
+            "known_at_ms": None,
+            "response_ok": False,
+            "adjusted_symbols": (),
+            "segments": (),
+            "saved_ids": (),
+            "closed_ids": (),
+            "raw_observation_id": None,
+            "reasons": (FUNDING_SCHEDULE_UNKNOWN,),
+            "error": reason[:200],
+        }
+    try:
+        rows = _obs.to_legacy(observed)
+    except Exception:
+        try:
+            rows = getattr(observed, "value")
+        except Exception:
+            rows = []
+    try:
+        known_at = int(getattr(getattr(observed, "meta", None), "known_at_ms"))
+    except (AttributeError, TypeError, ValueError):
+        known_at = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    observed_at = int(observed_at_ms) if observed_at_ms is not None else int(known_at)
+    adjusted_set = _adjusted_symbols_of(rows)
+
+    # 2. Build (adjusted + defaults). response_ok=True here (fetch succeeded).
+    universe: Any | None = symbols
+    if universe is None and isinstance(symbol_statuses, dict):
+        universe = tuple(symbol_statuses.keys())
+    segments = build_funding_schedule_segments(
+        rows,
+        observed_at_ms=observed_at,
+        known_at_ms=known_at,
+        symbols=universe,
+        symbol_statuses=symbol_statuses,
+        default_regime=default_regime,
+        response_ok=True,
+        evidence_ref_prefix=evidence_ref_prefix,
+    )
+
+    # 3. Archive. Determine pre-existing CONFIRMED cover to report
+    # HISTORY_BOOTSTRAPPING honestly (no verifiable old regime before now).
+    has_archive = False
+    existing_by_symbol: dict[str, list[Any]] = {}
+    if repository is not None and hasattr(repository, "list_funding_schedules"):
+        # Probe each relevant symbol once (best-effort; failures mean no archive).
+        probe_symbols: set[str] = set(adjusted_set)
+        if isinstance(universe, (list, tuple, set)):
+            for s in universe:
+                if isinstance(s, str) and s:
+                    probe_symbols.add(s)
+        for sym in sorted(probe_symbols):
+            try:
+                existing = await repository.list_funding_schedules(sym, int(known_at))
+            except Exception:
+                continue
+            existing_by_symbol[sym] = list(existing or ())
+            for row in existing_by_symbol[sym]:
+                unwrapped = _unwrap_one_repo_schedule(row)
+                if unwrapped is None:
+                    continue
+                ver = _segment_verification(unwrapped)
+                if ver != "CONFIRMED":
+                    continue
+                # Any CONFIRMED known by now counts as a verifiable archive,
+                # even when its window does not yet cover the new boundary
+                # (it proves an old regime was once confirmed).
+                has_archive = True
+                break
+            if has_archive:
+                # Keep probing for idempotency/close decisions below, but the
+                # flag is already set. Continue to fill existing_by_symbol for
+                # symbols we will actually save (lazy: only those with new
+                # CONFIRMED segments).
+                pass
+
+    saved_ids: list[str] = []
+    closed_ids: list[str] = []
+    # 4. Persist raw document for audit (best-effort, never blocks schedules).
+    raw_oid: str | None = None
+    if persist_raw_observation and repository is not None and hasattr(repository, "save_market_observation"):
+        try:
+            record = _obs.observation_to_record(
+                observed, kind="FUNDING_INFO", symbol="FUNDING_INFO",
+            )
+            # Deterministic id for idempotent retries (same known_at => same id).
+            try:
+                record = dict(record)
+                record["observation_id"] = f"FUNDING_INFO:{known_at}"
+            except Exception:
+                pass
+            raw_oid = await repository.save_market_observation(record)
+        except Exception:
+            raw_oid = None
+
+    # 5. Persist CONFIRMED segments (idempotent + close stale opens).
+    for seg in segments:
+        try:
+            ver = seg.get("verification") if isinstance(seg, dict) else getattr(seg, "verification")
+        except (AttributeError, TypeError):
+            continue
+        if persist_only_confirmed and ver != "CONFIRMED":
+            continue
+        try:
+            record = schedule_segment_to_record(seg)
+        except ValueError:
+            continue
+        sym = record["symbol"]
+        # Ensure we have existing rows for this symbol (fetch lazily).
+        if sym not in existing_by_symbol and repository is not None and hasattr(repository, "list_funding_schedules"):
+            try:
+                existing_by_symbol[sym] = list(await repository.list_funding_schedules(sym, int(known_at)) or ())
+            except Exception:
+                existing_by_symbol[sym] = []
+        existing = existing_by_symbol.get(sym, [])
+        # Idempotency: skip when a covering CONFIRMED with the same interval
+        # already exists (stable regime must not create overlapping duplicates
+        # on every tick, otherwise D05.2 overlap would force permanent UNKNOWN).
+        try:
+            new_interval = int(record["schedule_json"]["interval_hours"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        skip = False
+        stale_opens: list[Any] = []
+        for row in existing:
+            unwrapped = _unwrap_one_repo_schedule(row)
+            if unwrapped is None:
+                continue
+            if _segment_verification(unwrapped) != "CONFIRMED":
+                continue
+            try:
+                ex_interval = _segment_interval_hours(unwrapped)
+                ex_from = _segment_effective_from(unwrapped)
+                ex_to = _segment_effective_to(unwrapped)
+            except Exception:
+                continue
+            if ex_interval is None or ex_from is None:
+                continue
+            # Covering open row: [ex_from, ex_to or +inf) contains observed.
+            covers = ex_from <= observed_at and (ex_to is None or ex_to > observed_at)
+            if not covers:
+                continue
+            if ex_interval == new_interval:
+                skip = True
+                break
+            # Different interval but still covering: stale open to close.
+            if ex_to is None:
+                stale_opens.append((row, unwrapped))
+        if skip:
+            continue
+        # Close stale opens with same-effective_from revisions (new ids, never
+        # mutating old rows). The revision keeps the original interval/anchor
+        # but caps the window at the new observation boundary.
+        for _row, unwrapped in stale_opens:
+            try:
+                if isinstance(unwrapped, dict):
+                    ex_from = int(unwrapped.get("effective_from_ms"))  # type: ignore[arg-type]
+                    ex_interval = int(unwrapped.get("interval_hours"))  # type: ignore[arg-type]
+                    ex_anchor = int(unwrapped.get("anchor_ms", ex_from))  # type: ignore[arg-type]
+                    ex_source = str(unwrapped.get("source", _FUNDING_INFO_SOURCE))
+                else:
+                    ex_from = int(getattr(unwrapped, "effective_from_ms"))
+                    ex_interval = int(getattr(unwrapped, "interval_hours"))
+                    ex_anchor = int(getattr(unwrapped, "anchor_ms"))
+                    ex_source = str(getattr(unwrapped, "source"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not (ex_from < observed_at):
+                continue
+            close_id = f"{sym}:{ex_from}:{ex_interval}:close:{observed_at}:{known_at}"
+            close_evidence = f"{evidence_ref_prefix}:{sym}:{known_at}:close:{observed_at}"
+            try:
+                from diveintocrypto_desktop.shortlab.repair_contracts import FundingScheduleSegment as _Seg2
+                close_seg = _Seg2(
+                    schedule_id=close_id,
+                    symbol=sym,
+                    effective_from_ms=ex_from,
+                    effective_to_ms=observed_at,
+                    interval_hours=ex_interval,
+                    anchor_ms=ex_anchor,
+                    known_at_ms=known_at,
+                    source=ex_source,
+                    evidence_ref=close_evidence,
+                    verification="CONFIRMED",
+                )
+            except Exception:
+                close_seg = {
+                    "schedule_id": close_id,
+                    "symbol": sym,
+                    "effective_from_ms": ex_from,
+                    "effective_to_ms": observed_at,
+                    "interval_hours": ex_interval,
+                    "anchor_ms": ex_anchor,
+                    "known_at_ms": known_at,
+                    "source": ex_source,
+                    "evidence_ref": close_evidence,
+                    "verification": "CONFIRMED",
+                }
+            try:
+                close_record = schedule_segment_to_record(close_seg)
+            except ValueError:
+                continue
+            if repository is not None and hasattr(repository, "save_funding_schedule"):
+                try:
+                    cid = await repository.save_funding_schedule(close_record)
+                    closed_ids.append(str(cid))
+                    # Treat the close as now-existing for subsequent segments.
+                    existing_by_symbol.setdefault(sym, []).append(close_record)
+                except Exception:
+                    continue
+        # Save the new segment itself.
+        if repository is not None and hasattr(repository, "save_funding_schedule"):
+            try:
+                sid = await repository.save_funding_schedule(record)
+                saved_ids.append(str(sid))
+                existing_by_symbol.setdefault(sym, []).append(record)
+            except Exception:
+                continue
+
+    reasons = () if has_archive else (HISTORY_BOOTSTRAPPING,)
+    return {
+        "observed_at_ms": observed_at,
+        "known_at_ms": known_at,
+        "response_ok": True,
+        "adjusted_symbols": tuple(sorted(adjusted_set)),
+        "segments": segments,
+        "saved_ids": tuple(saved_ids),
+        "closed_ids": tuple(closed_ids),
+        "raw_observation_id": raw_oid,
+        "reasons": reasons,
+    }
+
