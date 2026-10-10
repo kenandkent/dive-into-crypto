@@ -1,4 +1,4 @@
-import { defineConfig } from './test/.tmp/pw-pkg/node_modules/@playwright/test/index.mjs';
+import { defineConfig } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 

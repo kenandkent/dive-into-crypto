@@ -10,7 +10,7 @@
  *   POST /test/harness/advance (absent from production).
  * - Timeouts: normal cases 30s, load pressure 60s (config timeout is 60s).
  */
-import { test, expect } from '../test/.tmp/pw-pkg/node_modules/@playwright/test/index.mjs';
+import { test, expect } from '@playwright/test';
 
 const ORIGIN = 'http://127.0.0.1:46409';
 
