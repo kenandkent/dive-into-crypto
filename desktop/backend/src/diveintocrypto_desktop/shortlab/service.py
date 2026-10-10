@@ -5244,6 +5244,10 @@ class ShortLabService:
                 if isinstance(exc, _Ver):
                     raise HedgeVersionConflict(str(exc)[:300]) from exc
                 if isinstance(exc, _Ref):
+                    if "is unavailable (migrate to schema" in str(exc):
+                        raise HedgeUnavailable(
+                            "hedge store unavailable (migrate to schema 6)"
+                        ) from exc
                     raise HedgeSimulationNotFound(simulation_id) from exc
                 if isinstance(exc, _Val):
                     msg = str(exc)
@@ -5467,6 +5471,12 @@ class ShortLabService:
                     if isinstance(exc, _Ver):
                         raise HedgeVersionConflict(str(exc)[:300]) from exc
                     if isinstance(exc, _Ref):
+                        # Missing tables are a store-availability problem (503);
+                        # only a genuinely absent plan row is 404.
+                        if "is unavailable (migrate to schema" in str(exc):
+                            raise HedgeUnavailable(
+                                "hedge store unavailable (migrate to schema 6)"
+                            ) from exc
                         raise HedgePlanNotFound(pid) from exc
                     if isinstance(exc, _Val):
                         raise HedgeValidationError(str(exc)[:300], reason_code="HEDGE_INPUT_INVALID") from exc
@@ -6702,10 +6712,87 @@ class ShortLabService:
             msg = str(exc)
             if "451" in msg:
                 events = []
+        # Window stats from persisted events (CR15: read the store first).
+        # Empty store stays unknown (never 0-filled); computed values feed
+        # the metrics DTO and the last-settled observation below.
+        _ev7d: Any = None
+        _ev30d: Any = None
+        _ev90d: Any = None
+        _evpr30: Any = None
+        _evpr90: Any = None
+        _ev_last_t: Any = None
+        _ev_last_rate: Any = None
+        try:
+            from decimal import Decimal as _DC
+
+            def _ev_sum(days: int) -> Any:
+                tot = _DC("0")
+                n = 0
+                for _e in events:
+                    try:
+                        if int(as_of_ms) - int(days) * 86400_000 < int(_e["t"]) <= int(as_of_ms):
+                            tot += _DC(str(_e["funding_rate"]))
+                            n += 1
+                    except Exception:
+                        continue
+                return (tot, n) if n else (None, 0)
+
+            def _ev_pos(days: int) -> Any:
+                pos = 0
+                n = 0
+                for _e in events:
+                    try:
+                        if int(as_of_ms) - int(days) * 86400_000 < int(_e["t"]) <= int(as_of_ms):
+                            n += 1
+                            if _DC(str(_e["funding_rate"])) > 0:
+                                pos += 1
+                    except Exception:
+                        continue
+                return (pos, n) if n else (None, 0)
+
+            _s7, _n7 = _ev_sum(7)
+            _s30, _n30 = _ev_sum(30)
+            _s90, _n90 = _ev_sum(90)
+            _p30, _m30 = _ev_pos(30)
+            _p90, _m90 = _ev_pos(90)
+            if _s7 is not None:
+                _ev7d = str(_s7)
+            if _s30 is not None:
+                _ev30d = str(_s30)
+            if _s90 is not None:
+                _ev90d = str(_s90)
+            if _p30 is not None:
+                _evpr30 = str(_DC(_p30) / _DC(_m30)) if _m30 else None
+            if _p90 is not None:
+                _evpr90 = str(_DC(_p90) / _DC(_m90)) if _m90 else None
+            _ordered = sorted(
+                (int(_e["t"]) for _e in events
+                 if isinstance(_e, dict) and _e.get("t") is not None),
+            )
+            if _ordered:
+                _ev_last_t = _ordered[-1]
+                for _e in events:
+                    try:
+                        if int(_e["t"]) == _ev_last_t:
+                            _ev_last_rate = str(_e["funding_rate"])
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         schedules: list[Any] = []
         try:
             if hasattr(repo, "list_funding_schedules"):
-                schedules = list(await repo.list_funding_schedules(sym, int(as_of_ms)) or ())
+                rows = await repo.list_funding_schedules(sym, int(as_of_ms)) or ()
+                try:
+                    from diveintocrypto_desktop.data.funding import (
+                        unwrap_repo_schedules_for_coverage as _unwrap_sched,
+                    )
+
+                    rows = _unwrap_sched(rows)
+                except Exception:
+                    pass
+                schedules = list(rows)
         except Exception:
             schedules = []
         # Real coverage port (never Fake READY when unbound -> UNKNOWN).
@@ -6755,6 +6842,8 @@ class ShortLabService:
                     current_rate = raw_funding.get("current_rate", raw_funding.get("currentRate"))
                     last_rate = raw_funding.get("last_settled_rate", raw_funding.get("lastSettledRate"))
                     # Build FundingMetrics DTO when possible for downstream gate.
+                    # Fields the injected summary lacks are derived from the
+                    # persisted events above (CR15); absent store stays None.
                     try:
                         from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics as _FM2
 
@@ -6762,7 +6851,11 @@ class ShortLabService:
                             symbol=sym,
                             current_rate=str(current_rate) if current_rate is not None else None,
                             last_settled_rate=str(last_rate) if last_rate is not None else None,
+                            funding_7d=_ev7d,
                             funding_30d=str(raw_funding.get("funding_30d", raw_funding.get("funding30d"))) if raw_funding.get("funding_30d", raw_funding.get("funding30d")) is not None else None,
+                            funding_90d=_ev90d,
+                            positive_ratio_30d=_evpr30,
+                            positive_ratio_90d=_evpr90,
                             conservative_apr=str(raw_funding.get("conservative_apr", raw_funding.get("conservativeApr"))) if raw_funding.get("conservative_apr", raw_funding.get("conservativeApr")) is not None else None,
                         )
                     except Exception:
@@ -6809,7 +6902,9 @@ class ShortLabService:
             last_obs = _obs.make_observation(
                 {"rate": str(last_rate) if last_rate is not None else None},
                 source="binance:fapi/fundingRate" if last_rate is not None else "unknown",
-                source_as_of_ms=int(as_of_ms) - 8 * 3600_000 if last_rate is not None else None,
+                # Real last persisted event time (CR09 slot matching); only
+                # without store history fall back to the 8h heuristic.
+                source_as_of_ms=int(_ev_last_t) if _ev_last_t is not None else (int(as_of_ms) - 8 * 3600_000 if last_rate is not None else None),
                 fetched_at_ms=int(as_of_ms),
                 known_at_ms=int(as_of_ms),
                 status="OK" if last_rate is not None else "UNAVAILABLE",
@@ -8144,7 +8239,12 @@ class ShortLabService:
                 if isinstance(exc, _Ver3):
                     raise HedgeVersionConflict(str(exc)[:300]) from exc
                 if isinstance(exc, _Ref3):
-                    raise HedgePlanNotFound(pid) from exc
+                    # Missing 006 protection tables (or dangling references) is
+                    # a store-availability problem, never proof the plan is
+                    # absent: report 503, not 404.
+                    raise HedgeUnavailable(
+                        "hedge protection store unavailable (migrate to schema 6)"
+                    ) from exc
                 if isinstance(exc, _Val3):
                     raise HedgeValidationError(str(exc)[:300], reason_code="HEDGE_INPUT_INVALID") from exc
             except (HedgeBusy, HedgeIdempotencyMismatch, HedgeVersionConflict, HedgePlanNotFound, HedgeValidationError):

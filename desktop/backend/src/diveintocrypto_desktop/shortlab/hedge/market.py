@@ -776,6 +776,14 @@ class ProductionHedgeMarket:
 
             try:
                 schedules = await self.repo.list_funding_schedules(symbol, as_of)
+                try:
+                    from diveintocrypto_desktop.data.funding import (
+                        unwrap_repo_schedules_for_coverage as _unwrap_sched,
+                    )
+
+                    schedules = _unwrap_sched(schedules)
+                except Exception:
+                    pass
             except Exception:
                 schedules = ()
             cov7 = _sched.compute_schedule_coverage(events, schedules, as_of - 7 * 86_400_000, as_of, as_of)

@@ -136,10 +136,13 @@ async def open_repo(tmp_path, *, target: int = 5) -> ShortLabRepository:
     await repo.migrate(target_version=4)
     if target >= 5:
         await repo.migrate(target_version=5)
+    if target >= 6:
+        await repo.migrate(target_version=6)
     return repo
 
 
 def make_service(repo: Any, clock: FakeClock, **over: Any) -> ShortLabService:
+    from diveintocrypto_desktop.shortlab.service import build_default_repair_ports
     kwargs: dict[str, Any] = dict(
         config=load_shortlab_config(),
         repository=repo,
@@ -149,6 +152,7 @@ def make_service(repo: Any, clock: FakeClock, **over: Any) -> ShortLabService:
         hedge_mark_fn=_mark_fn(clock),
         hedge_quote_fn=_quote_fn(clock),
         hedge_funding_fn=_funding_fn_async,
+        repair_ports=build_default_repair_ports(),
     )
     # Hedge tests run against a 005-migrated DB: publish the gate so health
     # stays honest without an async probe in the test harness.
@@ -454,12 +458,15 @@ async def test_patch_legs_idempotency_and_version_conflict(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_activate_close_gates_409(tmp_path) -> None:
     clock = FakeClock()
-    repo = await open_repo(tmp_path)
+    repo = await open_repo(tmp_path, target=6)
     try:
         service = make_service(repo, clock)
         app = make_app(service)
         with TestClient(app) as client:
-            sim_id = client.post("/api/short/hedge/simulate", json=_simulate_body()).json()["simulationId"]
+            sim_id = client.post("/api/short/hedge/simulate", json=_simulate_body(
+                liquidationPrice="75000",
+                liquidationPriceUpdatedAtMs=NOW - 3_600_000,
+            )).json()["simulationId"]
             plan_id = client.post(
                 "/api/short/hedge/plans", json={"simulationId": sim_id, "clientRequestId": "c-gate"}
             ).json()["planId"]
@@ -486,6 +493,57 @@ async def test_activate_close_gates_409(tmp_path) -> None:
                 json={"event": spot_evt, "clientEventId": "e-spot", "expectedVersion": v2},
             )
             assert p2.status_code == 200, p2.text
+            # CR01: activation requires the six-item check + protection
+            # confirmation. Qualify the env first: liq price is already in the
+            # simulation body below; store it on the plan row, seed a 90d
+            # CONFIRMED schedule with matching events, then confirm.
+            v3 = p2.json()["planVersion"]
+            _row0 = await repo.get_hedge_plan(plan_id)
+            _cfg0 = _row0.get("plan_config_json") or {}
+            if isinstance(_cfg0, str):
+                _cfg0 = json.loads(_cfg0)
+            _cfg0 = dict(_cfg0) if isinstance(_cfg0, dict) else {}
+            _cfg0["liquidation_price"] = "75000"
+            _cfg0["stop_trigger_basis"] = "MARK_PRICE"
+            repo._require_con().execute(
+                "UPDATE sl_hedge_plan SET plan_config_json = ? WHERE plan_id = ?",
+                [json.dumps(_cfg0), plan_id],
+            )
+            _h8 = 8 * 3_600_000
+            _start = NOW - 90 * 86_400_000
+            _slots: list[int] = []
+            _cur = _start + _h8
+            while _cur <= NOW:
+                _slots.append(_cur)
+                _cur += _h8
+            await repo.upsert_funding_events([
+                {"symbol": "BTCUSDT", "funding_time_ms": _s, "funding_rate": 0.0005}
+                for _s in _slots
+            ])
+            await repo.save_funding_schedule({
+                "schedule_id": "sched-api-act", "symbol": "BTCUSDT",
+                "effective_from_ms": _start, "effective_to_ms": None, "known_at_ms": _start,
+                "schedule_json": {
+                    "schedule_id": "sched-api-act", "symbol": "BTCUSDT",
+                    "effective_from_ms": _start, "effective_to_ms": None,
+                    "interval_hours": 8, "anchor_ms": _slots[0], "known_at_ms": _start,
+                    "source": "binance:fapi/fundingInfo", "evidence_ref": "ev-api",
+                    "verification": "CONFIRMED",
+                },
+            })
+            pc = client.post(
+                f"/api/short/hedge/plans/{plan_id}/protection",
+                json={
+                    "expectedVersion": v3,
+                    "clientRequestId": "c-prot-1",
+                    "confirmedAtMs": NOW,
+                    "futures": {"status": "CONFIRMED", "nativeQty": str(fut_qty),
+                                "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+                    "spot": {"status": "CONFIRMED", "nativeQty": str(spot_qty),
+                             "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+                },
+            )
+            assert pc.status_code == 200, pc.text
             a2 = client.post(f"/api/short/hedge/plans/{plan_id}/activate", json={})
             assert a2.status_code == 200, a2.text
             assert a2.json()["status"] == "ACTIVE"
