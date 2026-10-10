@@ -55,7 +55,15 @@ STRATEGY_RATIOS: dict[str, Decimal] = {
     "RELATIVE_75": Decimal("0.75"),
     "RELATIVE_50": Decimal("0.5"),
     "RELATIVE_25": Decimal("0.25"),
+    # CR15 (D14.1): UNHEDGED_0 baseline (spot 0, futures-only) participates
+    # in production capture/grading alongside the four fixed ratios.
+    "UNHEDGED_0": Decimal("0"),
 }
+
+# CR15: SYSTEM_POLICY is not a fixed ratio (it copies the frozen selected
+# proposal of the same USER_DECISION). It is a valid grading strategy when
+# an Entry exists; the ratio is resolved from the Entry (never re-selected).
+_SYSTEM_POLICY = "SYSTEM_POLICY"
 
 HORIZON_DAYS = (7, 30, 90)
 
@@ -113,7 +121,11 @@ def _now_ms() -> int:
 
 
 def normalize_strategy(strategy: Any) -> str:
-    """Validate a fixed hedge strategy (B39.2)."""
+    """Validate a hedge strategy (B39.2 + CR15 D14.1).
+
+    Fixed ratios (ABSOLUTE_100/RELATIVE_*/UNHEDGED_0) plus SYSTEM_POLICY
+    (frozen selected-proposal copy, graded via its Entry pairing).
+    """
     text = str(strategy).strip().upper() if strategy is not None else ""
     # Accept "100"/"75" shorthands defensively, canonicalise to frozen names.
     aliases = {
@@ -123,14 +135,17 @@ def normalize_strategy(strategy: Any) -> str:
         "75": "RELATIVE_75",
         "50": "RELATIVE_50",
         "25": "RELATIVE_25",
+        "0": "UNHEDGED_0",
+        "UNHEDGED": "UNHEDGED_0",
+        "H0": "UNHEDGED_0",
     }
     if text in aliases:
         text = aliases[text]
-    if text not in STRATEGY_RATIOS:
-        raise ValueError(
-            f"strategy={strategy!r} must be one of {sorted(STRATEGY_RATIOS)}"
-        )
-    return text
+    if text in STRATEGY_RATIOS or text == _SYSTEM_POLICY:
+        return text
+    raise ValueError(
+        f"strategy={strategy!r} must be one of {sorted(list(STRATEGY_RATIOS) + [_SYSTEM_POLICY])}"
+    )
 
 
 def normalize_horizon_days(horizon: Any) -> int:
@@ -309,7 +324,14 @@ def _parse_json_dict(value: Any) -> dict[str, Any]:
 
 
 async def _fetch_fcs(repository: Any, snapshot_id: str) -> dict[str, Any] | None:
-    """Fetch one FCS snapshot row by id (supports real + fake repos)."""
+    """Fetch one FCS snapshot row by id (supports real + fake repos).
+
+    CR15: when no FCS row matches, fall back to a USER_DECISION Entry group
+    (source_snapshot_id == snapshot_id). The Entry's frozen symbol/as_of and
+    its Decision's reference notional/funding are used to build an FCS-like
+    view so the same frozen market history grades the real Entry (including
+    UNHEDGED_0 and its SYSTEM_POLICY pairing) instead of ignoring it.
+    """
     # Direct single-row accessors first (future-proof).
     for method in ("get_funding_capture_snapshot", "get_fcs_snapshot", "get_fcs"):
         fn = getattr(repository, method, None)
@@ -349,7 +371,133 @@ async def _fetch_fcs(repository: Any, snapshot_id: str) -> dict[str, Any] | None
             if len(items) < 200:
                 break
             offset += 200
+    # CR15 fallback: USER_DECISION Entry group (real Entry, not FCS).
+    try:
+        _entry_view = await _fetch_entry_fcs_view(repository, snapshot_id)
+        if _entry_view is not None:
+            return _entry_view
+    except Exception:
+        pass
     return None
+
+
+async def _fetch_entry_fcs_view(repository: Any, snapshot_id: str) -> dict[str, Any] | None:
+    """Build an FCS-like view from a USER_DECISION Entry group (CR15).
+
+    Looks for strategy entries with ``source_snapshot_id == snapshot_id``
+    across the four cohorts. Uses the first entry's symbol/as_of and the
+    Decision's reference notional when available (honest, never invented).
+    Returns ``None`` when no Entry group matches.
+    """
+    _list_fn = getattr(repository, "list_strategy_entries", None)
+    if not callable(_list_fn):
+        return None
+    _found: dict[str, Any] | None = None
+    for _cohort in ("USER_DECISION", "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY"):
+        try:
+            # Wide window: entries are point-in-time, filter by source id.
+            rows = await _list_fn(_cohort, 0, 2**62)
+        except TypeError:
+            try:
+                rows = await _list_fn(cohort=_cohort, start_ms=0, end_ms=2**62)  # type: ignore[call-arg]
+            except Exception:
+                continue
+        except Exception:
+            continue
+        for _row in (rows or ()):
+            try:
+                _src = _field(_row, "source_snapshot_id", "sourceSnapshotId")
+                if str(_src or "") != str(snapshot_id):
+                    continue
+                _sym = str(_field(_row, "symbol") or "")
+                _asof = _field(_row, "decision_as_of_ms", "decisionAsOfMs", "as_of_ms")
+                try:
+                    _asof_i = int(_asof)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    continue
+                if not _sym or _asof_i <= 0:
+                    continue
+                _entry_json = _field(_row, "entry_json", "entryJson")
+                if isinstance(_entry_json, str):
+                    try:
+                        import json as _js
+
+                        _entry_json = _js.loads(_entry_json)
+                    except Exception:
+                        _entry_json = {}
+                if not isinstance(_entry_json, Mapping):
+                    _entry_json = {}
+                _found = {
+                    "symbol": _sym,
+                    "canonical_id": str(_field(_row, "canonical_id", "canonicalId") or _sym.lower()),
+                    "as_of_ms": _asof_i,
+                    "_entry_row": _row,
+                    "_entry_json": dict(_entry_json),
+                }
+                break
+            except Exception:
+                continue
+        if _found is not None:
+            break
+    if _found is None:
+        return None
+    # Reference notional: Decision request when available (same USER_DECISION),
+    # else Entry frozen qty * entry price (honest, never invented).
+    _ref: str | None = None
+    try:
+        _get_dec = getattr(repository, "get_hedge_decision", None)
+        if callable(_get_dec):
+            try:
+                _dec_row = await _get_dec(str(snapshot_id))
+            except Exception:
+                _dec_row = None
+            if isinstance(_dec_row, Mapping):
+                _dj = _dec_row.get("decision_json")
+                if isinstance(_dj, str):
+                    try:
+                        import json as _js2
+
+                        _dj = _js2.loads(_dj)
+                    except Exception:
+                        _dj = {}
+                if isinstance(_dj, Mapping):
+                    _req = _dj.get("request")
+                    if isinstance(_req, Mapping) and _req.get("futures_notional_usd") is not None:
+                        try:
+                            _ref = _dec_str(Decimal(str(_req.get("futures_notional_usd"))))
+                        except Exception:
+                            _ref = None
+    except Exception:
+        pass
+    if _ref is None:
+        try:
+            _ej = _found.get("_entry_json") or {}
+            _canon = _ej.get("canonical_futures_qty")
+            _vwap = _ej.get("futures_entry_vwap_native")
+            if _canon is not None and _vwap is not None:
+                with localcontext() as _ctx:
+                    _ctx.prec = 80
+                    _ref = _dec_str(Decimal(str(_canon)) * Decimal(str(_vwap)))
+        except Exception:
+            _ref = None
+    _sym_f = _found.get("symbol") or ""
+    _canon_f = _found.get("canonical_id") or str(_sym_f).lower()
+    return {
+        "snapshot_id": str(snapshot_id),
+        "symbol": str(_sym_f),
+        "canonical_id": str(_canon_f),
+        "as_of_ms": int(_found.get("as_of_ms") or 0),
+        "fcs_version": "fcs_v1",
+        "fcs_config_hash": "",
+        "reference_notional_usd": _ref,
+        "funding_metrics": {},
+        "venue_summary": {},
+        "basis": None,
+        "risk": {},
+        "readiness": "",
+        "_raw": _found.get("_entry_row"),
+        "_from_entry": True,
+    }
 
 
 def _normalise_fcs(row: Any) -> dict[str, Any]:
@@ -758,7 +906,56 @@ async def grade_hedge(
         raise LookupError(f"FCS snapshot {snapshot_id!r} not found")
     snapshot_as_of = int(fcs["as_of_ms"])
     due_ms = snapshot_as_of + horizon_days * DAY_MS
-    ratio = STRATEGY_RATIOS[strategy]
+    # CR15: SYSTEM_POLICY copies the frozen selected proposal of the same
+    # USER_DECISION (never re-selected). Resolve its actual ratio from the
+    # Entry; missing Entry stays UNAVAILABLE (never fabricated).
+    if strategy == _SYSTEM_POLICY:
+        ratio: Decimal | None = None
+        try:
+            _list_fn = getattr(repository, "list_strategy_entries", None)
+            if callable(_list_fn):
+                for _cohort in ("USER_DECISION",):
+                    try:
+                        _rows = await _list_fn(_cohort, 0, 2**62)
+                    except Exception:
+                        continue
+                    for _r in (_rows or ()):
+                        try:
+                            if str(_field(_r, "source_snapshot_id") or "") != str(snapshot_id):
+                                continue
+                            if str(_field(_r, "strategy") or "").upper() != _SYSTEM_POLICY:
+                                continue
+                            _ej = _field(_r, "entry_json")
+                            if isinstance(_ej, str):
+                                try:
+                                    import json as _js_e
+
+                                    _ej = _js_e.loads(_ej)
+                                except Exception:
+                                    _ej = {}
+                            if isinstance(_ej, Mapping) and _ej.get("actual_ratio") is not None:
+                                try:
+                                    ratio = Decimal(str(_ej.get("actual_ratio")))
+                                except Exception:
+                                    ratio = None
+                            break
+                        except Exception:
+                            continue
+                    if ratio is not None:
+                        break
+        except Exception:
+            ratio = None
+        if ratio is None:
+            # No frozen SYSTEM entry to copy: honest UNAVAILABLE (never 0/1).
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id_for(
+                    snapshot_id, strategy, horizon_days, evidence_version, cost_hash),
+                as_of_ms, snapshot_as_of, due_ms, fcs, "SYSTEM_NO_SELECTION",
+                funding_event_count=None, funding_coverage=None,
+            )
+    else:
+        ratio = STRATEGY_RATIOS[strategy]
     outcome_id = outcome_id_for(
         snapshot_id, strategy, horizon_days, evidence_version, cost_hash
     )
@@ -1754,7 +1951,18 @@ async def _save_outcome_best_effort(
 
     Repository owns immutable idempotency. Never retry by discarding refs:
     that would publish a result whose retained evidence can be deleted.
+
+    CR15: UNHEDGED_0/SYSTEM_POLICY live in strategy entries (sl_strategy_*
+    allows all six); sl_hedge_outcome only stores the four fixed ratios.
+    Their grading is still computed for same-Decision pairing (in-memory),
+    but never persisted to the fixed-ratio outcome table.
     """
+    try:
+        _strat = getattr(record, "strategy", None)
+        if isinstance(_strat, str) and _strat.upper() in ("UNHEDGED_0", "SYSTEM_POLICY"):
+            return
+    except Exception:
+        pass
     await repository.save_hedge_outcome(record, refs)
 
 
@@ -1874,12 +2082,62 @@ async def run_due(context: Any, **overrides: Any) -> Any:
             symbol = str(fcs.get("symbol") or "")
         except (TypeError, ValueError):
             continue
-        for strategy in sorted(STRATEGY_RATIOS):
+        for strategy in sorted(list(STRATEGY_RATIOS) + [_SYSTEM_POLICY]):
+            # SYSTEM_POLICY without an Entry is skipped here (graded via the
+            # Entry discovery below when its USER_DECISION group exists).
+            if strategy == _SYSTEM_POLICY:
+                continue
             for horizon_days in HORIZON_DAYS:
                 due_ms = as_of + horizon_days * DAY_MS
                 if now_ms < due_ms:
                     continue
                 candidates.append((due_ms, symbol, snapshot_id, strategy, horizon_days))
+    # CR15: real Entry + completed-Task consumption. Discover strategy
+    # entries (all four cohorts, same 180d window) and grade their due
+    # (source, strategy, horizon) triples -- including UNHEDGED_0 and the
+    # same-Decision SYSTEM_POLICY pairing -- via the same frozen history.
+    # Completed quote tasks are consumed indirectly: entry/exit quotes come
+    # from frozen venue snapshots (future quotes never backfilled).
+    try:
+        _list_entries = getattr(repository, "list_strategy_entries", None)
+        if callable(_list_entries):
+            for _cohort in ("RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY", "USER_DECISION"):
+                try:
+                    _rows = await _list_entries(_cohort, int(window_from), int(now_ms))
+                except TypeError:
+                    try:
+                        _rows = await _list_entries(cohort=_cohort, start_ms=int(window_from), end_ms=int(now_ms))  # type: ignore[call-arg]
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                for _r in (_rows or ()):
+                    try:
+                        _src = str(_field(_r, "source_snapshot_id") or "")
+                        _sym = str(_field(_r, "symbol") or "")
+                        _strat = str(_field(_r, "strategy") or "").upper()
+                        _asof = _field(_r, "decision_as_of_ms", "as_of_ms")
+                        try:
+                            _asof_i = int(_asof)  # type: ignore[arg-type]
+                        except (TypeError, ValueError):
+                            continue
+                        if not _src or not _sym or not _strat:
+                            continue
+                        try:
+                            _strat_n = normalize_strategy(_strat)
+                        except ValueError:
+                            continue
+                        if _asof_i < window_from or _asof_i > now_ms:
+                            continue
+                        for _hz in HORIZON_DAYS:
+                            _due = _asof_i + _hz * DAY_MS
+                            if now_ms < _due:
+                                continue
+                            candidates.append((_due, _sym, _src, _strat_n, _hz))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
     candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
 
     for _due_ms, _symbol, snapshot_id, strategy, horizon_days in candidates:

@@ -145,20 +145,82 @@ def _fundamentals_numbers(fundamentals: Any) -> tuple[float | None, float | None
     return float_ratio, fdv_mc
 
 
+def _manual_from_entry(entry: Any) -> str | None:
+    """Extract a normalized manual base from one override entry mapping."""
+    if not isinstance(entry, Mapping):
+        return None
+    for key in ("profile", "manual_profile", "manualProfile"):
+        if key in entry:
+            manual = _normalize_manual(entry.get(key))
+            if manual is not None:
+                return manual
+    return None
+
+
+def _extract_symbol_entry(
+    overrides: Mapping[str, Any] | None, symbol: str | None
+) -> Mapping[str, Any] | None:
+    """Return the per-symbol override entry for ``symbol`` when present.
+
+    Accepts the frozen document shape ``{"version":..,"overrides":{sym:entry}}``
+    as well as a flat ``{sym: entry}`` mapping. Lookup is exact first, then
+    upper-cased (symbols are canonical upper-case like ``BTCUSDT``).
+    """
+    if not isinstance(overrides, Mapping) or not symbol:
+        return None
+    text = str(symbol)
+    # Frozen document shape.
+    inner = overrides.get("overrides")
+    if isinstance(inner, Mapping):
+        entry = inner.get(text)
+        if isinstance(entry, Mapping) and entry:
+            return entry
+        entry = inner.get(text.upper())
+        if isinstance(entry, Mapping) and entry:
+            return entry
+        entry = inner.get(text.strip().upper())
+        if isinstance(entry, Mapping) and entry:
+            return entry
+    # Flat {symbol: entry} shape.
+    entry = overrides.get(text)
+    if isinstance(entry, Mapping) and entry:
+        # Avoid treating a bare entry ({"profile": ...}) as a symbol map:
+        # a bare entry has no nested mapping values for profile keys.
+        # If the mapping itself carries a profile key, the caller already
+        # handles it as a bare entry; still return it when the key matches
+        # a plausible symbol (caller passes symbol explicitly).
+        return entry
+    entry = overrides.get(text.upper())
+    if isinstance(entry, Mapping) and entry:
+        return entry
+    return None
+
+
 def select_profile(
     identity: Any,
     fundamentals: Any,
     overrides: Mapping[str, Any] | None,
+    symbol: str | None = None,
 ) -> Profile:
     """Pick the scoring profile (pure, deterministic).
 
-    ``overrides`` may be ``None``, a bare ``{futures_symbol: entry}`` mapping
-    (ignored here), or a dict carrying ``profile`` / ``manual_profile`` with
-    one of MEME / LOW_FLOAT_VC / GENERAL_ALT (optionally with a _LITE/_FULL
-    suffix). Only an explicit profile string counts as a manual override.
+    ``overrides`` may be ``None``, a bare per-symbol entry
+    (``{"profile": "MEME", ...}``), the frozen overrides document
+    (``{"version":..,"overrides":{symbol: entry}}``), or a flat
+    ``{futures_symbol: entry}`` mapping. When ``symbol`` is given the
+    entry for that symbol wins (CR08: the unique Profile entry consumes
+    the current symbol's entry); otherwise a top-level
+    ``profile`` / ``manual_profile`` is honoured for backward
+    compatibility. Only an explicit profile string counts as a manual
+    override.
     """
     manual: str | None = None
-    if isinstance(overrides, Mapping):
+    # CR08: current-symbol entry first (frozen manual priority).
+    if symbol is not None and isinstance(overrides, Mapping):
+        entry = _extract_symbol_entry(overrides, symbol)
+        if entry is not None:
+            manual = _manual_from_entry(entry)
+    if manual is None and isinstance(overrides, Mapping):
         for key in ("profile", "manual_profile", "manualProfile"):
             if key in overrides:
                 manual = _normalize_manual(overrides.get(key))

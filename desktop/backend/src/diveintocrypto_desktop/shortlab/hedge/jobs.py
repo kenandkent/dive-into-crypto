@@ -342,6 +342,228 @@ class HedgeJobs:
                     await self._db(repo.resolve_hedge_alert(existing['alert_id'],now))
                     state['alerts'].pop(key,None)
 
+    async def _tick_ledger_and_protection(
+        self, pid: str, plan: Any, positions: Any, cache: Any, now_ms: int
+    ) -> tuple[Any | None, Any | None]:
+        """CR05/CR12: frozen ledger PnL + protection for one normal tick.
+
+        Reads effective fill events (archived fills, never DOUBLE balances),
+        freezes historical EVENT_FX per event (missing stays null, never
+        USDT/USDC=1), builds the ledger market context with the remaining
+        spot current SELL valuation, computes PnL via the real
+        ``compute_ledger_pnl`` and validates the stored protection
+        confirmation. Best-effort: any failure yields ``(None, None)``
+        (honest unknown, never fabricated).
+        """
+        ledger_pnl: Any | None = None
+        protection: Any | None = None
+        try:
+            service: Any = self.service
+            repo: Any = getattr(service, "_repository", None)
+            state: Any = None
+            try:
+                state = self.mirror.get(pid) if isinstance(self.mirror, Mapping) else None
+            except Exception:
+                state = None
+            # -- effective events (immutable fills, never positions) ----------
+            events: list[Any] = []
+            try:
+                if isinstance(state, Mapping):
+                    fills = state.get("fills")
+                    if isinstance(fills, (list, tuple)) and fills:
+                        events = list(fills)
+            except Exception:
+                events = []
+            if not events:
+                # Best-effort refresh from the archive when the mirror has no
+                # fills (real DuckDB path); fakes without _run stay empty.
+                try:
+                    if repo is not None and hasattr(repo, "_run"):
+                        canonical = None
+                        try:
+                            canonical = plan.get("canonical_id") if isinstance(plan, Mapping) else getattr(plan, "canonical_id", None)
+                        except Exception:
+                            canonical = None
+                        fills_fresh, _ = await self._read_archived(pid, canonical)
+                        if fills_fresh:
+                            events = list(fills_fresh)
+                            if isinstance(state, Mapping):
+                                try:
+                                    state["fills"] = tuple(fills_fresh)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            # -- symbol + identity -------------------------------------------
+            symbol = ""
+            try:
+                if isinstance(plan, Mapping):
+                    symbol = str(plan.get("symbol") or "")
+                else:
+                    symbol = str(getattr(plan, "symbol", "") or "")
+            except Exception:
+                symbol = ""
+            symbol = symbol.upper()
+            identity: Any = None
+            try:
+                fn = getattr(service, "_hedge_identity_for", None)
+                if callable(fn):
+                    identity = await fn(symbol)
+            except Exception:
+                identity = None
+            if identity is None:
+                try:
+                    if isinstance(plan, Mapping):
+                        identity = {"canonical_id": str(plan.get("canonical_id") or ""),
+                                    "contract_multiplier": str(plan.get("contract_multiplier") or "1")}
+                except Exception:
+                    identity = None
+            # -- EVENT_FX freeze (historical, per event) ----------------------
+            event_fx: dict[str, Any] = {}
+            try:
+                for _ev in (events or ()):
+                    _eid: Any = None
+                    if isinstance(_ev, Mapping):
+                        _eid = _ev.get("event_id", _ev.get("eventId"))
+                    else:
+                        try:
+                            _eid = getattr(_ev, "event_id", None)
+                        except Exception:
+                            _eid = None
+                    if _eid:
+                        event_fx[str(_eid)] = {}
+            except Exception:
+                pass
+            try:
+                if repo is not None and symbol and hasattr(repo, "list_market_observations") and event_fx:
+                    try:
+                        rows = await repo.list_market_observations(symbol, "EVENT_FX", 0, int(now_ms), int(now_ms))
+                    except Exception:
+                        rows = ()
+                    for _row in (rows or ()):
+                        try:
+                            _val = _row.get("value_json") if isinstance(_row, Mapping) else getattr(_row, "value_json", None)
+                            if isinstance(_val, str):
+                                try:
+                                    import json as _js
+
+                                    _val = _js.loads(_val)
+                                except Exception:
+                                    continue
+                            if not isinstance(_val, Mapping):
+                                continue
+                            _eid2 = _val.get("event_id", _val.get("eventId"))
+                            if not _eid2 or str(_eid2) not in event_fx:
+                                continue
+                            _fxd: dict[str, Any] = {}
+                            for _k in ("price_fx_id", "price_fx", "fee_fx_id", "fee_fx",
+                                        "funding_fx_id", "funding_fx",
+                                        "priceFx", "feeFx", "fundingFx"):
+                                if _val.get(_k) is not None:
+                                    _fxd[_k] = _val.get(_k)
+                            # Only overwrite when the row carries real FX;
+                            # empty rows keep missing-null (never 1).
+                            if _fxd:
+                                event_fx[str(_eid2)] = _fxd
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            # -- market context (current marks + remaining spot SELL) --------
+            mctx: dict[str, Any] = {"now_ms": int(now_ms)}
+            try:
+                _cache = dict(cache) if isinstance(cache, Mapping) else {}
+                _fut = _cache.get("futures_mark", _cache.get("futuresMark", {}))
+                _spot = _cache.get("spot_quote", _cache.get("spotQuote", {}))
+                if not isinstance(_fut, Mapping):
+                    try:
+                        import dataclasses as _dc
+
+                        _fut = _dc.asdict(_fut) if _dc.is_dataclass(_fut) else {}
+                    except Exception:
+                        _fut = {}
+                if not isinstance(_spot, Mapping):
+                    try:
+                        import dataclasses as _dc2
+
+                        _spot = _dc2.asdict(_spot) if _dc2.is_dataclass(_spot) else {}
+                    except Exception:
+                        _spot = {}
+                for _k in ("price", "mark_price", "markPrice", "native_price"):
+                    if _fut.get(_k) is not None:
+                        mctx["futures_mark_native"] = str(_fut.get(_k))
+                        break
+                # CR12: no USDT/USDC=1 default; missing stays null.
+                for _k in ("quote_to_usd", "quoteToUsd"):
+                    if _fut.get(_k) is not None:
+                        mctx["futures_quote_fx"] = str(_fut.get(_k))
+                        break
+                for _k in ("sell_vwap", "sellVwap", "mid_price", "midPrice", "price"):
+                    if _spot.get(_k) is not None:
+                        mctx["spot_sell_vwap_native"] = str(_spot.get(_k))
+                        break
+                for _k in ("quote_to_usd", "quoteToUsd"):
+                    if _spot.get(_k) is not None:
+                        mctx["spot_quote_fx"] = str(_spot.get(_k))
+                        break
+            except Exception:
+                pass
+            # -- compute ledger (real PnL, never hand-filled) ----------------
+            try:
+                _pnl_fn: Any = None
+                try:
+                    _req = getattr(service, "_require_repair_port", None)
+                    if callable(_req):
+                        try:
+                            _pnl_fn = _req("compute_ledger_pnl")
+                        except Exception:
+                            _pnl_fn = None
+                except Exception:
+                    _pnl_fn = None
+                if _pnl_fn is None:
+                    try:
+                        from .pnl import compute_ledger_pnl as _real_pnl
+
+                        _pnl_fn = _real_pnl
+                    except Exception:
+                        _pnl_fn = None
+                if _pnl_fn is not None and identity is not None:
+                    try:
+                        ledger_pnl = _pnl_fn(list(events or ()), identity, dict(event_fx), dict(mctx))
+                    except Exception:
+                        ledger_pnl = None
+            except Exception:
+                ledger_pnl = None
+            # -- protection (stored confirmation, current remaining) ---------
+            try:
+                _rec: Any = None
+                try:
+                    _get_fn = getattr(repo, "get_protection_confirmation", None)
+                    if callable(_get_fn):
+                        _rec = await _get_fn(pid)
+                except Exception:
+                    _rec = None
+                if _rec is not None:
+                    try:
+                        from .protection import validate_protection_confirmation as _vpc
+
+                        _plan_map: dict[str, Any] = dict(plan) if isinstance(plan, Mapping) else {}
+                        protection = _vpc(_rec, _plan_map, list(positions or ()), int(now_ms))
+                    except Exception:
+                        # Keep the raw record as an UNKNOWN view (never PASS).
+                        try:
+                            protection = {"status": "UNKNOWN", "reasons": ("PROTECTION_VALIDATION_FAILED",),
+                                          "checked_at_ms": int(now_ms)}
+                        except Exception:
+                            protection = None
+                else:
+                    protection = None
+            except Exception:
+                protection = None
+        except Exception:
+            ledger_pnl, protection = None, None
+        return ledger_pnl, protection
+
     async def monitor(self, context, job_id=None):
         from ..service import JobStatus
         now=int(context.clock_ms()); stats={'computed':0,'persisted':0,'degraded':0}
@@ -414,7 +636,16 @@ class HedgeJobs:
                         monitor_plan['liquidation_price']=str(Decimal(str(original_liquidation))/multiplier)
                     except Exception:
                         monitor_plan['liquidation_price']=None
-                snapshot=compute_monitor(monitor_plan,state['positions'],cache,state['events'],self.service._config,now)
+                # CR05 (D09/D12): unique normal tick reads effective events,
+                # freezes FX + protection, computes PnL/protection BEFORE the
+                # Monitor so memory/DB/API share one result (no fast-path skip).
+                try:
+                    _ledger_tick, _prot_tick = await self._tick_ledger_and_protection(
+                        pid, monitor_plan, state['positions'], cache, int(now))
+                except Exception:
+                    _ledger_tick, _prot_tick = None, None
+                snapshot=compute_monitor(monitor_plan,state['positions'],cache,state['events'],self.service._config,now,
+                                         ledger_pnl=_ledger_tick, protection=_prot_tick)
                 funding=mapping(cache.get('funding_metrics'))
                 extra=dict(snapshot.metrics_json)
                 extra['user_liquidation_native_price']=original_liquidation
@@ -450,6 +681,18 @@ class HedgeJobs:
                     snapshot=dataclasses.replace(snapshot,status='MONITOR_DEGRADED',metrics_json=metrics)
                 state['previous']=snapshot
                 stats['degraded']+=snapshot.status=='MONITOR_DEGRADED'
+        # CR15 (D14.2): expiry-quote production trigger. Every normal monitor
+        # tick best-effort collects due quote tasks (20/round) so到期报价
+        # does not stall when no explicit scheduler calls it. Failures stay
+        # DEFERRED/UNAVAILABLE inside the quote task (never fabricated) and
+        # never fail the monitor tick itself.
+        try:
+            try:
+                await self.collect_due_quotes(context, int(now), job_id=f"{str(job_id or getattr(context, 'trace_id', 'hedge_monitor'))}-due-quotes")
+            except Exception:
+                pass
+        except Exception:
+            pass
         return JobStatus(str(job_id or context.trace_id),'hedge_monitor','SUCCEEDED',stats=stats,started_at_ms=now,finished_at_ms=int(context.clock_ms()))
 
     async def venue_refresh(self,context,job_id=None):

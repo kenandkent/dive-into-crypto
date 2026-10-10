@@ -408,6 +408,17 @@ class FeatureInputs:
     # Derived 30D trend (same rule as the legacy service path).
     return_30d: float | None
     close_30d_ago: float | None
+    # CR23 (D04.3/R04): same-round frozen Micro/Taker confirm legs. Values
+    # are the cutoff-frozen confirms; source/known times ride alongside so
+    # the risk layer can enforce the freeze (late => unknown, never history).
+    taker_buy_ratio: float | None = None
+    taker_buy_ratio_source: str | None = None
+    taker_buy_ratio_known_at_ms: int | None = None
+    taker_buy_ratio_as_of_ms: int | None = None
+    micro_score: float | None = None
+    micro_score_source: str | None = None
+    micro_score_known_at_ms: int | None = None
+    micro_score_as_of_ms: int | None = None
     sources: tuple[SourceRef, ...] = ()
 
     def to_ltss_inputs(self) -> dict[str, Any]:
@@ -457,8 +468,13 @@ class FeatureInputs:
 
         Returns the stored attributes (identical objects, not recomputed
         copies) so the risk engine can never drift from the scored inputs.
+
+        CR23: same-round frozen Micro/Taker confirms ride as envelopes
+        (``{"value":..,"known_at_ms":..,"source":..}``) so the squeeze
+        tri-state can enforce the cutoff freeze; late/missing stays
+        unconfirmable (never a plain invented float).
         """
-        return {
+        out: dict[str, Any] = {
             "symbol": self.symbol,
             "as_of_ms": self.decision_as_of_ms,
             "mapping_confidence": self.mapping_confidence,
@@ -477,6 +493,28 @@ class FeatureInputs:
             "oi_value_usd": self.oi_value_usd,
             "futures_qv_1d": self.futures_qv_1d,
         }
+        # CR23 envelopes (value + source/known time, same cutoff freeze).
+        if self.taker_buy_ratio is not None:
+            if self.taker_buy_ratio_known_at_ms is not None or self.taker_buy_ratio_source is not None:
+                out["taker_buy_ratio"] = {
+                    "value": self.taker_buy_ratio,
+                    "known_at_ms": self.taker_buy_ratio_known_at_ms,
+                    "source": self.taker_buy_ratio_source,
+                    "source_as_of_ms": self.taker_buy_ratio_as_of_ms,
+                }
+            else:
+                out["taker_buy_ratio"] = self.taker_buy_ratio
+        if self.micro_score is not None:
+            if self.micro_score_known_at_ms is not None or self.micro_score_source is not None:
+                out["micro_score"] = {
+                    "value": self.micro_score,
+                    "known_at_ms": self.micro_score_known_at_ms,
+                    "source": self.micro_score_source,
+                    "source_as_of_ms": self.micro_score_as_of_ms,
+                }
+            else:
+                out["micro_score"] = self.micro_score
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +668,12 @@ def build_feature_inputs(
             "book",
             "contract",
             "fx_rate",
+            # CR23: same-round frozen Micro/Taker confirm legs (late/missing
+            # stays unconfirmable via _validate_leg cutoff freeze).
+            "micro_score",
+            "microstructure_score",
+            "taker_buy_ratio",
+            "taker_buy_volume_ratio",
         )
     }
     sources = tuple(
@@ -935,6 +979,52 @@ def build_feature_inputs(
     live_present = _field(contract_map, "live_universe_present", "in_live_universe")
     live_universe_present = bool(live_present) if live_present is not None else None
 
+    # -- CR23: same-round frozen Micro/Taker confirms (reuse real collection) --
+    # Each leg is an F02 Observed validated against the same cutoff above;
+    # late (known > cutoff) is unusable and stays unconfirmable downstream.
+    # Aliases mirror the squeeze risk keys.
+    def _frozen_confirm(*leg_keys: str) -> tuple[float | None, str | None, int | None, int | None]:
+        for _lk in leg_keys:
+            _leg = legs.get(_lk)
+            if _leg is None or not _leg.usable:
+                continue
+            _raw = _leg.value
+            # Unwrap {"value": v} envelopes from collectors.
+            if isinstance(_raw, Mapping) and "value" in _raw:
+                try:
+                    _inner = _raw.get("value")
+                except Exception:
+                    _inner = None
+                if _inner is None or isinstance(_inner, (int, float, str)):
+                    _raw = _inner
+                else:
+                    continue
+            _val = _finite(_raw)
+            if _val is None:
+                continue
+            _src = _leg.source or None
+            _known: int | None = None
+            try:
+                if _leg.known_at_ms is not None:
+                    _known = int(_leg.known_at_ms)
+            except (TypeError, ValueError):
+                _known = None
+            _asof: int | None = None
+            try:
+                if _leg.source_as_of_ms is not None:
+                    _asof = int(_leg.source_as_of_ms)
+            except (TypeError, ValueError):
+                _asof = None
+            return _val, _src, _known, _asof
+        return None, None, None, None
+
+    taker_val, taker_src, taker_known, taker_asof = _frozen_confirm(
+        "taker_buy_ratio", "taker_buy_volume_ratio", "taker_buy_share"
+    )
+    micro_val, micro_src, micro_known, micro_asof = _frozen_confirm(
+        "micro_score", "microstructure_score", "microstructure_bullish_score"
+    )
+
     # -- 30D trend (same rule as the legacy service path) ----------------------
     return_30d: float | None = None
     close_30d_ago: float | None = None
@@ -1006,6 +1096,14 @@ def build_feature_inputs(
         book_ask_notional_1pct=ask_n,
         book_status=book_status,
         book_reason=str(book_reason) if book_reason is not None else None,
+        taker_buy_ratio=taker_val,
+        taker_buy_ratio_source=taker_src,
+        taker_buy_ratio_known_at_ms=taker_known,
+        taker_buy_ratio_as_of_ms=taker_asof,
+        micro_score=micro_val,
+        micro_score_source=micro_src,
+        micro_score_known_at_ms=micro_known,
+        micro_score_as_of_ms=micro_asof,
         contract_status=contract_status,
         onboard_at_ms=onboard_at_ms,
         delivery_at_ms=delivery_at_ms,
@@ -1092,7 +1190,7 @@ def _ok_state(
 
 
 def build_field_states(
-    inputs: FeatureInputs, policy: Any
+    inputs: FeatureInputs, policy: Any, profile: Any | None = None
 ) -> tuple[FieldState, ...]:
     """Real DQ field states for ``inputs`` (LITE-complete, F07 extends).
 
@@ -1103,6 +1201,10 @@ def build_field_states(
     ``None`` falls back to the frozen defaults). FULL unlock/social/
     catalyst groups need live provider results and are appended downstream
     via ``quality.full_tier_field_states``.
+
+    CR08: when ``profile`` carries ``is_manual`` the ``profile_basis``
+    state freezes the manual-priority reason (``MANUAL_OVERRIDE``) instead
+    of an empty reason.
     """
     counts: Mapping[str, int] = {}
     if isinstance(policy, QualityPolicy):
@@ -1429,13 +1531,22 @@ def build_field_states(
 
     # -- identity legs (binding resolved at the decision instant) -------------
     identity_ok = inputs.mapping_confidence in READY_IDENTITY_CONFIDENCE
+    try:
+        _prof_manual = bool(getattr(profile, "is_manual", False))
+        _prof_reason = str(getattr(profile, "reason", "MANUAL_OVERRIDE") or "MANUAL_OVERRIDE")
+    except Exception:
+        _prof_manual, _prof_reason = False, "MANUAL_OVERRIDE"
     for field_id in ("canonical_mapping", "profile_basis"):
+        if field_id == "profile_basis" and _prof_manual and identity_ok:
+            _reason: str | None = _prof_reason
+        else:
+            _reason = None if identity_ok else IDENTITY_UNVERIFIED
         states.append(
             FieldState(
                 field_id=field_id,
                 status="OK" if identity_ok else "UNAVAILABLE",
                 fetched_at_ms=inputs.decision_as_of_ms,
-                reason_code=None if identity_ok else IDENTITY_UNVERIFIED,
+                reason_code=_reason,
                 source="shortlab-identity",
             )
         )
