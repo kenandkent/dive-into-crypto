@@ -208,14 +208,18 @@ class HedgeJobs:
         return dict(self.market_cache.get(key,{}))
 
     def _request_context_for(self, context: Any, *, job_type: str, job_id: str | None = None) -> Any | None:
-        """Build an immutable RequestContext for market sends (R11b).
+        """Build an immutable RequestContext for market sends (R11b + CR14 D11).
 
         Preserves the JobContext budget/trace; job_type is the D19档位
-        (monitor/opportunity/background) while job_id carries the real task
-        name (hedge_monitor/...). ``None`` budget stays unbounded (tests).
+        (monitor/opportunity/scanner/evidence/...) while job_id carries the
+        real task name (hedge_monitor/...). ``None`` budget stays unbounded
+        (tests). CR14: job_id and deadline_ms are preserved (never dropped
+        after verification); the 8s tick deadline travels for pre-transport
+        checks so mixed loads bill the real job_type/family and background
+        never eats the monitor reserve.
         """
         try:
-            from ..request_budget import make_request_context
+            from ..request_budget import get_current_request_context, make_request_context
         except Exception:
             return None
         budget = getattr(context, 'request_budget', None)
@@ -229,9 +233,23 @@ class HedgeJobs:
             except Exception:
                 now_ms = None
         deadline_ms = (int(now_ms) + R11B_DEADLINE_MS) if isinstance(now_ms, int) else None
+        # Preserve ambient identity provenance when the scheduler installed one
+        # (immutable, never fabricated when absent).
+        identity_snapshot_id = None
+        try:
+            ambient = get_current_request_context()
+            if ambient is not None:
+                cand = getattr(ambient, 'identity_snapshot_id', None)
+                if isinstance(cand, str) and cand.strip():
+                    identity_snapshot_id = cand
+        except Exception:
+            identity_snapshot_id = None
         try:
             return make_request_context(budget, job_type=job_type, host='fapi',
-                                        trace_id=str(trace_id) if trace_id is not None else None)
+                                        trace_id=str(trace_id) if trace_id is not None else None,
+                                        identity_snapshot_id=identity_snapshot_id,
+                                        job_id=str(job_id) if job_id is not None else None,
+                                        deadline_ms=deadline_ms)
         except Exception:
             return None
 
@@ -439,8 +457,13 @@ class HedgeJobs:
         now=int(context.clock_ms()); refreshed=0; failed=0
         await self.service._ensure_hedge_available()
         await self.hydrate()
+        # CR14 (D11/D19.3): venue refresh is SCANNER tier (never monitor), so
+        # background/scan loads never eat the 20% monitor reserve. The real
+        # caller context (job_type + job_id/deadline) travels to market.
+        request_context = self._request_context_for(
+            context, job_type='scanner', job_id=str(job_id or 'hedge_venue_refresh'))
         for state in self.mirror.values():
-            cache=await self._collect(state['plan'],state['positions'],now)
+            cache=await self._collect(state['plan'],state['positions'],now, request_context)
             quote=mapping(cache.get('spot_quote'))
             if not quote:
                 failed+=1; continue
@@ -457,6 +480,12 @@ class HedgeJobs:
         from ..service import JobStatus, _maybe_await
         now=int(context.clock_ms()); computed=0; failed=0
         await self.service._ensure_hedge_available()
+        # CR14 (D11/D19.3): opportunity is BACKGROUND (never monitor), so its
+        # sends never eat the 20% monitor reserve. The immutable caller
+        # context (opportunity job_type + real job_id/deadline) travels to
+        # every market send for honest family/job_type accounting.
+        request_context = self._request_context_for(
+            context, job_type='opportunity', job_id=str(job_id or 'funding_capture_refresh'))
         rows=await _maybe_await(self.service._universe_fn(self.service._config.universe.limit))
         rows=sorted(rows,key=lambda r:float(r.get('quote_volume') or 0),reverse=True)[:self.service._config.universe.shortlist_size]
         for row in rows:
@@ -465,12 +494,50 @@ class HedgeJobs:
             try:
                 identity=mapping(await self.service._hedge_identity_for(symbol))
                 funding=await self.service._hedge_funding_for(symbol)
-                mark=mapping(await self.service._hedge_mark_for(symbol))
+                # CR14: production market path carries the caller context
+                # (real opportunity job_type); test fakes via service helpers
+                # stay working because they do not bill. When explicit fakes
+                # are absent and the market supports it, use it directly so
+                # mixed loads record the real family/job_type instead of the
+                # service helper's interactive mislabel.
+                _market = self._resolve_market_port()
+                _has_mark_fake = getattr(self.service, '_hedge_mark_fn', None) is not None
+                _has_quote_fake = getattr(self.service, '_hedge_quote_fn', None) is not None
+                _use_market = (
+                    _market is not None
+                    and not _has_mark_fake and not _has_quote_fake
+                    and hasattr(_market, 'mark') and hasattr(_market, 'quote')
+                )
+                if _use_market:
+                    try:
+                        import inspect as _insp
+                        _sig_m = _insp.signature(_market.mark)
+                        if 'request_context' in _sig_m.parameters:
+                            mark=mapping(await _market.mark(symbol, request_context=request_context))
+                        else:
+                            mark=mapping(await _market.mark(symbol))
+                    except Exception:
+                        mark=mapping(await self.service._hedge_mark_for(symbol))
+                else:
+                    mark=mapping(await self.service._hedge_mark_for(symbol))
                 price=Decimal(str(mark['price']))
                 price_usd=Decimal(str(mark['canonical_price_usd']))
                 reference=str(self.service._config.funding_capture.reference_notional_usd)
                 qty=Decimal(reference)/price_usd
-                quote=mapping(await self.service._hedge_quote_for(symbol,str(qty),'BINANCE_SPOT'))
+                if _use_market:
+                    try:
+                        import inspect as _insp2
+                        _sig_q = _insp2.signature(_market.quote)
+                        if 'request_context' in _sig_q.parameters:
+                            _qraw = await _market.quote(symbol, str(qty), 'BINANCE_SPOT',
+                                                        request_context=request_context)
+                        else:
+                            _qraw = await _market.quote(symbol, str(qty), 'BINANCE_SPOT')
+                        quote=mapping(_qraw)
+                    except Exception:
+                        quote=mapping(await self.service._hedge_quote_for(symbol,str(qty),'BINANCE_SPOT'))
+                else:
+                    quote=mapping(await self.service._hedge_quote_for(symbol,str(qty),'BINANCE_SPOT'))
                 basis=None
                 spot=quote.get('mid_price')
                 if spot is not None and Decimal(str(spot))>0:
@@ -486,7 +553,15 @@ class HedgeJobs:
                     venue_summary['roundtrip_cost_pct']=str((Decimal(str(quote['buy_vwap']))-Decimal(str(quote['sell_vwap'])))/Decimal(str(spot))+fees)
                 market=getattr(self.service,'_hedge_market',None)
                 if market is not None and hasattr(market,'_exchange_info'):
-                    info=await market._exchange_info()
+                    try:
+                        import inspect as _insp3
+                        _sig_e = _insp3.signature(market._exchange_info)
+                        if 'request_context' in _sig_e.parameters:
+                            info=await market._exchange_info(request_context=request_context)
+                        else:
+                            info=await market._exchange_info()
+                    except Exception:
+                        info=await market._exchange_info()
                     contract=next((c for c in info.get('symbols',[]) if c.get('symbol')==symbol),{})
                     status=contract.get('status'); delivery=contract.get('deliveryDate')
                     identity.update(futures_status=status, no_delisting=(status=='TRADING' and isinstance(delivery,int) and delivery>now) if status is not None and delivery is not None else None)
@@ -605,9 +680,14 @@ class HedgeJobs:
         now=int(context.clock_ms()); checked=0
         await self.service._ensure_hedge_available()
         await self.hydrate()
+        # CR14: settlement is MONITOR tier (like the trailing monitor call),
+        # so its pre-collect carries the real caller context instead of the
+        # legacy monitor-default drop.
+        _settle_ctx = self._request_context_for(
+            context, job_type='monitor', job_id=str(job_id or 'hedge_settlement_check'))
         for state in self.mirror.values():
             plan=state['plan']; symbol=plan['symbol']
-            cache=await self._collect(plan,state['positions'],now)
+            cache=await self._collect(plan,state['positions'],now, _settle_ctx)
             events=cache.get('settled_events') or cache.get('funding_events')
             if events is None:
                 events=await self._db(self.service._repository.list_funding_events(symbol,int(plan.get('created_at_ms') or now),now))

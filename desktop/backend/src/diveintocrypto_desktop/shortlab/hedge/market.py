@@ -221,47 +221,80 @@ class ProductionHedgeMarket:
                                         endpoint_family=family, trace_id=trace_id,
                                         identity_snapshot_id=identity_snapshot_id)
 
-    def _permit(self, host, family):
+    def _permit(self, host, family, request_context: Any | None = None):
         if self.budget is None:
             return None
-        # Non-Binance transports have a public request unit (one send), not a
-        # fabricated Binance exchange weight. Every retry acquires separately.
-        permit = self.budget.try_acquire(host, 1, 'monitor', family)
+        # CR14 (D11/D19.3): record the real caller job_type, never force
+        # everything to ``monitor``. Non-Binance transports have a public
+        # request unit (one send), not a fabricated Binance exchange weight.
+        # Every retry acquires separately. Legacy callers without a context
+        # keep the monitor default for backward compatibility.
+        jt = 'monitor'
+        try:
+            if request_context is not None:
+                cand = getattr(request_context, 'job_type', None)
+                if isinstance(cand, str) and cand.strip():
+                    jt = cand
+        except Exception:
+            jt = 'monitor'
+        fam = family
+        try:
+            if (fam is None or fam in ('coingecko', '0x-price')) and request_context is not None:
+                cand_fam = getattr(request_context, 'endpoint_family', None)
+                if isinstance(cand_fam, str) and cand_fam.strip():
+                    fam = cand_fam
+        except Exception:
+            pass
+        # Normalize legacy labels to D19.3 real families for honest accounting.
+        if fam == 'coingecko':
+            fam = 'cgFx'
+        elif fam == '0x-price':
+            fam = 'onchainPrice'
+        permit = self.budget.try_acquire(host, 1, jt, fam if fam is not None else family)
         if isinstance(permit, Denied):
             raise self._unavailable(permit.reason_code)
         return permit
 
     async def _fx_transport(self, url, params):
-        permit = self._permit('api.coingecko.com', 'coingecko')
-        try:
-            if permit is not None:
-                permit.mark_sent()
-            return await self.fx_provider._default_fetcher(url, params)
-        finally:
-            if permit is not None:
-                permit.release()
+        # CR14 (D11): single billing lives in CoinGeckoProvider
+        # (_transport_with_budget with the real caller RequestContext and
+        # real family from URL). This fetcher is the raw transport only and
+        # must not acquire a second hardcoded-monitor permit (no double
+        # charge, no monitor mislabel for background FX).
+        return await self.fx_provider._default_fetcher(url, params)
 
     async def _chain_transport(self, url, params, headers, request_context):
         import aiohttp
         from diveintocrypto_desktop.data.http import get_session
-        permit = self._permit('api.0x.org', '0x-price')
+        # CR14 (D11/D19.3): 0x venue has no own budget layer, so this is the
+        # single billing point. Record the real caller job_type with the real
+        # D19.3 family (never hardcoded monitor / legacy label).
+        permit = self._permit('api.0x.org', 'onchainPrice', request_context)
+        marked = False
         try:
             session = await get_session()
             if permit is not None:
                 permit.mark_sent()
+                marked = True
             async with session.get(url, params=params, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=10)) as response:
                 response.raise_for_status()
                 return await response.json()
-        finally:
-            if permit is not None:
-                permit.release()
+        except Exception:
+            # Pre-send failure before mark: release the reservation so the
+            # window is not leaked; sent attempts are never refunded.
+            if permit is not None and not marked:
+                try:
+                    permit.release_unsent()
+                except Exception:
+                    pass
+            raise
 
     async def _identity(self, symbol):
         value = await self.service._hedge_identity_for(symbol)
         return SimpleNamespace(**value) if isinstance(value, Mapping) else value
 
-    async def _fx(self, currency):
+    async def _fx(self, currency, request_context: Any | None = None):
         if currency == 'USD':
             return '1'
         coin = {'USDT': 'tether', 'USDC': 'usd-coin', 'FDUSD': 'first-digital-usd'}.get(currency)
@@ -271,7 +304,14 @@ class ProductionHedgeMarket:
             cached = self._fx_cache.get(currency)
             if cached and self.clock() - cached[0] < 60_000:
                 return cached[1]
-            result = await self.fx_provider.fetch(SimpleNamespace(coingecko_id=coin))
+            # CR14 (D11): forward the caller context so FX bills the real
+            # job_type/family via the provider (never forced monitor).
+            try:
+                result = await self.fx_provider.fetch(SimpleNamespace(coingecko_id=coin),
+                                                      request_context=request_context)
+            except TypeError:
+                # Pre-repair provider without request_context kwarg.
+                result = await self.fx_provider.fetch(SimpleNamespace(coingecko_id=coin))
             price = getattr(result.data, 'price_usd', None)
             source_ms = getattr(result, 'as_of_ms', None)
             if not isinstance(source_ms, int) or not 0 <= self.clock() - source_ms <= 60_000:
@@ -307,7 +347,8 @@ class ProductionHedgeMarket:
             raise self._unavailable('MARK_OR_MULTIPLIER_INVALID') from None
         if not multiplier.is_finite() or not native.is_finite() or multiplier <= 0 or native <= 0:
             raise self._unavailable('MARK_OR_MULTIPLIER_INVALID')
-        fx = await self._fx('USDT')
+        # CR14: FX leg carries the same caller context (real job_type).
+        fx = await self._fx('USDT', request_context)
         mark = {**raw, 'native_price': str(native), 'mark_price': str(native),
                 'price': str(native / multiplier),
                 'canonical_price_usd': str(native / multiplier * Decimal(fx)),
@@ -317,19 +358,29 @@ class ProductionHedgeMarket:
         self._marks[symbol] = mark
         return dict(mark)
 
-    async def quote(self, symbol, canonical_qty, venue=None):
+    async def quote(self, symbol, canonical_qty, venue=None, request_context: Any | None = None):
+        """Legacy spot quote (CR14: accepts caller context, else monitor default).
+
+        ``request_context`` is additive and trailing for backward
+        compatibility. When provided, the real job_type/family is preserved
+        via child contexts (never forced monitor); ``None`` keeps the legacy
+        unbounded/monitor path for pre-repair callers and unit tests.
+        """
         identity = await self._identity(symbol)
         venue = venue or 'BINANCE_SPOT'
         if venue == 'ONCHAIN_DEX':
-            buy = await self.chain.quote_buy(identity, canonical_qty, request_context=self._ctx('0x'))
-            sell = await self.chain.quote_sell(identity, canonical_qty, request_context=self._ctx('0x'))
+            # CR14: forward caller context (real job_type) to both legs.
+            buy_ctx = self._child_ctx(request_context, '0x', 'onchainPrice') if request_context is not None else self._ctx('0x')
+            sell_ctx = self._child_ctx(request_context, '0x', 'onchainPrice') if request_context is not None else self._ctx('0x')
+            buy = await self.chain.quote_buy(identity, canonical_qty, request_context=buy_ctx)
+            sell = await self.chain.quote_sell(identity, canonical_qty, request_context=sell_ctx)
             if buy.data is None or sell.data is None:
                 raise self._unavailable(buy.reason_code or sell.reason_code or 'CHAIN_QUOTE_UNAVAILABLE')
             data = _mapping(buy.data)
             data['capabilities'] = {**dict(data.get('capabilities') or {}), 'fx': dict(self._fx_provenance.get(buy.data.quote_currency, {}))}
             data.update(sell_vwap=sell.data.sell_vwap, sell_executable_qty=sell.data.sell_executable_qty,
                         mid_price=None, exit_feasible=False, exit_feasibility='UNKNOWN',
-                        entry_feasible=False, quote_to_usd=await self._fx(buy.data.quote_currency))
+                        entry_feasible=False, quote_to_usd=await self._fx(buy.data.quote_currency, request_context))
             data['capabilities']['fx'] = dict(self._fx_provenance.get(buy.data.quote_currency, {}))
             if data.get('buy_vwap') is not None:
                 data['reference_notional_usd'] = str(Decimal(data['buy_vwap']) * Decimal(canonical_qty) * Decimal(data['quote_to_usd']))
@@ -337,13 +388,16 @@ class ProductionHedgeMarket:
         adapter = {'BINANCE_SPOT': self.spot, 'BINANCE_ALPHA': self.alpha}.get(venue)
         if adapter is None:
             raise self._unavailable('VENUE_UNSUPPORTED')
-        result = await adapter.quote(identity, canonical_qty, request_context=self._ctx('spot' if venue == 'BINANCE_SPOT' else 'alpha'))
+        host = 'spot' if venue == 'BINANCE_SPOT' else 'alpha'
+        adapter_ctx = self._child_ctx(request_context, host, None) if request_context is not None else self._ctx(host)
+        result = await adapter.quote(identity, canonical_qty, request_context=adapter_ctx)
         if result.status not in ('OK', 'PARTIAL') or result.data is None or result.stale:
             raise self._unavailable(result.reason_code or 'VENUE_QUOTE_UNAVAILABLE')
         data = result.data
         if data.requested_canonical_qty != canonical_qty:
             raise self._unavailable('QUOTE_QUANTITY_MISMATCH')
-        fx = await self._fx(data.quote_currency)
+        # CR14: FX leg carries the same caller context (real job_type).
+        fx = await self._fx(data.quote_currency, request_context)
         # Venue execution prices are quote currency values; planner applies FX once.
         scale = Decimal(fx)
         direction_costs = dict(data.direction_costs)
@@ -374,14 +428,20 @@ class ProductionHedgeMarket:
             self._exchange_cache = (self.clock(), raw)
             return raw
 
-    async def funding(self, symbol):
+    async def funding(self, symbol, request_context: Any | None = None):
+        """Legacy funding (CR14: accepts caller context, else monitor default).
+
+        ``request_context`` is additive and trailing. When provided, Mark and
+        exchangeInfo inherit the real job_type via child contexts; ``None``
+        keeps the legacy path for pre-repair callers and unit tests.
+        """
         now = self.clock()
         cached = self._funding_cache.get(symbol)
         if cached and now - cached[0] < 30_000:
             return cached[1]
-        mark = await self.mark(symbol)
+        mark = await self.mark(symbol, request_context=request_context)
         try:
-            raw = await self._exchange_info()
+            raw = await self._exchange_info(request_context=request_context)
             entry = next((e for e in raw.get('symbols', []) if e.get('symbol') == symbol), {})
         except Exception:
             entry = {}
@@ -441,9 +501,21 @@ class ProductionHedgeMarket:
         self._rules_cache[key] = (self.clock(), rules)
         return rules
 
-    async def collect(self, symbol, qty, venue=None):
-        values = await asyncio.gather(self.mark(symbol), self.quote(symbol, qty, venue),
-                                      self.funding(symbol), return_exceptions=True)
+    async def collect(self, symbol, qty, venue=None, request_context: Any | None = None):
+        """Legacy bundle (CR14: accepts caller context, else monitor default).
+
+        ``request_context`` is additive and trailing. When provided, all three
+        legs inherit the real job_type/family (never forced monitor); ``None``
+        keeps the legacy path for pre-repair callers and unit tests.
+        """
+        # CR14: forward the immutable caller context to every leg so mixed
+        # loads record the real family/job_type (background never misbilled
+        # as monitor). Each leg derives its own child host/family internally.
+        values = await asyncio.gather(
+            self.mark(symbol, request_context=request_context),
+            self.quote(symbol, qty, venue, request_context=request_context),
+            self.funding(symbol, request_context=request_context),
+            return_exceptions=True)
         result = {'fetched_at_ms': self.clock(), 'collection_errors': {}}
         for key, value in zip(('futures_mark', 'spot_quote', 'funding_metrics'), values):
             if isinstance(value, Exception):
@@ -547,8 +619,9 @@ class ProductionHedgeMarket:
             book_reason = 'BOOK_UNAVAILABLE'
 
         # FX for quote currency (USDT; USD==1, never guessed).
+        # CR14: same caller context so the FX leg bills the real job_type.
         try:
-            fx = await self._fx(str(mark.get('quote_currency', 'USDT')))
+            fx = await self._fx(str(mark.get('quote_currency', 'USDT')), request_context)
         except BudgetExhausted:
             raise
         except Exception as exc:
@@ -621,7 +694,7 @@ class ProductionHedgeMarket:
                 data['capabilities'] = {**dict(data.get('capabilities') or {}), 'fx': dict(self._fx_provenance.get(buy.data.quote_currency, {}))}
                 data.update(sell_vwap=sell.data.sell_vwap, sell_executable_qty=sell.data.sell_executable_qty,
                             mid_price=None, exit_feasible=False, exit_feasibility='UNKNOWN',
-                            entry_feasible=False, quote_to_usd=await self._fx(buy.data.quote_currency))
+                            entry_feasible=False, quote_to_usd=await self._fx(buy.data.quote_currency, request_context))
                 data['capabilities']['fx'] = dict(self._fx_provenance.get(buy.data.quote_currency, {}))
                 return data
             adapter = {'BINANCE_SPOT': self.spot, 'BINANCE_ALPHA': self.alpha}.get(venue)
@@ -638,7 +711,8 @@ class ProductionHedgeMarket:
             data_obj = result.data
             if getattr(data_obj, 'requested_canonical_qty', qty_str) != qty_str:
                 raise self._unavailable('QUOTE_QUANTITY_MISMATCH')
-            fx = await self._fx(data_obj.quote_currency)
+            # CR14: FX leg carries the same caller context (real job_type).
+            fx = await self._fx(data_obj.quote_currency, request_context)
             scale = Decimal(fx)
             direction_costs = dict(data_obj.direction_costs)
             for key in ('buy_fee_usd', 'sell_fee_usd'):

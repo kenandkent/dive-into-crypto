@@ -226,3 +226,132 @@ async def test_opportunity_writes_projection_v2_queryable_without_manual_seed(tm
         assert item['expires_at_ms'] == NOW + 30000
     finally:
         await repo.close()
+
+
+# ---------------------------------------------------------------------------
+# CR14 (D11/D19.3): Jobs caller context — _request_context_for preserves
+# job_id/deadline (never dropped after verification); monitor uses monitor,
+# venue uses scanner, opportunity uses opportunity (BACKGROUND) and forwards
+# the immutable context to market so mixed loads bill real family/job_type
+# and background never eats the monitor reserve.
+# ---------------------------------------------------------------------------
+
+def test_cr14_request_context_preserves_job_id_and_deadline():
+    from diveintocrypto_desktop.shortlab.request_budget import RequestBudget
+    svc = SimpleNamespace(_repository=SimpleNamespace(), _config=None)
+    jobs = HedgeJobs(svc)
+    mon_ctx = SimpleNamespace(trace_id='m', clock_ms=lambda: 1_791_417_600_000,
+                              request_budget=RequestBudget(max_sends=240))
+    rc = jobs._request_context_for(mon_ctx, job_type='monitor', job_id='hedge_monitor')
+    assert rc.job_type == 'monitor'
+    assert rc.job_id == 'hedge_monitor'
+    assert rc.deadline_ms == 1_791_417_600_000 + 8000
+    assert rc.trace_id == 'm'
+    ev = jobs._request_context_for(mon_ctx, job_type='evidence', job_id='strategy_capture')
+    assert ev.job_type == 'evidence' and ev.job_id == 'strategy_capture'
+    assert ev.deadline_ms == 1_791_417_600_000 + 8000
+    opp = jobs._request_context_for(mon_ctx, job_type='opportunity',
+                                    job_id='funding_capture_refresh')
+    assert opp.job_type == 'opportunity' and opp.job_id == 'funding_capture_refresh'
+    from diveintocrypto_desktop.shortlab.request_budget import budget_class
+    assert budget_class('monitor') == 'MONITOR'
+    assert budget_class('opportunity') == 'BACKGROUND'
+    assert budget_class('scanner') == 'SCANNER'
+    assert budget_class('evidence') == 'BACKGROUND'
+
+
+@pytest.mark.asyncio
+async def test_cr14_opportunity_forwards_caller_context_to_market():
+    from diveintocrypto_desktop.shortlab.config import load_shortlab_config
+    from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics
+    cfg = load_shortlab_config()
+    seen: dict = {}
+
+    async def _fake_exchange_info(request_context=None):
+        seen['jt'] = getattr(request_context, 'job_type', None)
+        seen['jid'] = getattr(request_context, 'job_id', None)
+        seen['dl'] = getattr(request_context, 'deadline_ms', None)
+        return {'symbols': []}
+
+    repo = SimpleNamespace(list_funding_events=AsyncMock(return_value=[]),
+                           save_funding_capture_snapshot=AsyncMock(),
+                           save_spot_venue_snapshot=AsyncMock())
+    svc = SimpleNamespace(_repository=repo, _config=cfg,
+                          _ensure_hedge_available=AsyncMock(),
+                          _universe_fn=lambda n: [{'symbol': '1000PEPEUSDT', 'quote_volume': 1}],
+                          _hedge_identity_for=AsyncMock(return_value={
+                              'canonical_id': 'pepe', 'contract_multiplier': 1000,
+                              'identity_confidence': 'VERIFIED'}),
+                          _hedge_mark_for=AsyncMock(return_value={
+                              'price': '0.00001', 'canonical_price_usd': '0.00001'}),
+                          _hedge_funding_for=AsyncMock(return_value=FundingMetrics('1000PEPEUSDT')),
+                          _hedge_quote_for=AsyncMock(return_value={
+                              'snapshot_id': 'q', 'venue': 'BINANCE_SPOT',
+                              'mid_price': '0.00001', 'as_of_ms': 100000,
+                              'fetched_at_ms': 100000, 'status': 'OK'}),
+                          _hedge_market=SimpleNamespace(_exchange_info=_fake_exchange_info))
+    jobs = HedgeJobs(svc)
+    ctx = SimpleNamespace(trace_id='t', clock_ms=lambda: 100000, request_budget=None)
+    result = await jobs.opportunity(ctx, job_id='funding_capture_refresh')
+    assert result.stats == {'computed': 1, 'failed': 0}
+    assert seen.get('jt') == 'opportunity', seen
+    assert seen.get('jid') == 'funding_capture_refresh', seen
+    assert isinstance(seen.get('dl'), int), seen
+
+
+@pytest.mark.asyncio
+async def test_cr14_venue_refresh_uses_scanner_not_monitor():
+    seen: dict = {}
+
+    async def _fake_collect(symbol, qty, venue=None, request_context=None):
+        seen['jt'] = getattr(request_context, 'job_type', None)
+        seen['jid'] = getattr(request_context, 'job_id', None)
+        return {'spot_quote': {'snapshot_id': 'q', 'venue': 'BINANCE_SPOT',
+                               'venue_symbol': 'BTCUSDT', 'as_of_ms': 100000,
+                               'fetched_at_ms': 100000, 'expires_at_ms': 200000,
+                               'reference_notional_usd': '10000', 'quote_json': {},
+                               'status': 'OK'}}
+
+    repo = SimpleNamespace(
+        list_hedge_plans=AsyncMock(side_effect=lambda **kw: [
+            {'plan_id': 'p', 'symbol': 'BTCUSDT', 'status': 'ACTIVE',
+             'canonical_id': 'c', 'plan_config_json': {}}] if kw.get('status') == 'ACTIVE' else []),
+        aggregate_hedge_position=AsyncMock(return_value=[]),
+        latest_hedge_monitor=AsyncMock(return_value=None),
+        list_hedge_alerts=AsyncMock(return_value=[]),
+        save_spot_venue_snapshot=AsyncMock())
+    svc = SimpleNamespace(_repository=repo, _config=None,
+                          _ensure_hedge_available=AsyncMock(),
+                          _hedge_lock_for=lambda pid: asyncio.Lock(),
+                          _hedge_market=SimpleNamespace(collect=_fake_collect))
+    jobs = HedgeJobs(svc)
+    ctx = SimpleNamespace(trace_id='v', clock_ms=lambda: 100000, request_budget=None)
+    result = await jobs.venue_refresh(ctx, job_id='hedge_venue_refresh')
+    assert result.stats == {'refreshed': 1, 'failed': 0}
+    assert seen.get('jt') == 'scanner', seen
+    assert seen.get('jid') == 'hedge_venue_refresh', seen
+
+
+@pytest.mark.asyncio
+async def test_cr14_collect_verifies_signature_then_forwards_not_drops():
+    # _collect inspects market.collect for request_context support; with the
+    # CR14 market signature it must forward (never silently drop).
+    seen: dict = {}
+
+    async def _fake_collect(symbol, qty, venue=None, request_context=None):
+        seen['jt'] = getattr(request_context, 'job_type', None)
+        return {'ok': True}
+
+    svc = SimpleNamespace(_repository=SimpleNamespace(), _config=None,
+                          _ensure_hedge_available=AsyncMock(),
+                          _hedge_lock_for=lambda pid: asyncio.Lock(),
+                          _hedge_market=SimpleNamespace(collect=_fake_collect))
+    jobs = HedgeJobs(svc)
+    plan = {'plan_id': 'p', 'symbol': 'BTCUSDT', 'canonical_id': 'c',
+            'status': 'ACTIVE', 'plan_config_json': {}}
+    from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+    ctx = make_request_context(None, job_type='monitor', host='fapi',
+                               trace_id='t-m', job_id='hedge_monitor')
+    out = await jobs._collect(plan, [], 100000, ctx)
+    assert out == {'ok': True}
+    assert seen.get('jt') == 'monitor', seen

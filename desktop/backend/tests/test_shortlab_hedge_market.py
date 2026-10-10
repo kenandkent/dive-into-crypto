@@ -170,3 +170,145 @@ async def test_spot_outage_keeps_actual_mark_available_for_orphan_leg():
     assert cache['futures_mark']['price']=='0.001'
     assert 'spot_quote' not in cache
     assert cache['collection_errors']['spot_quote']=='SPOT_UNAVAILABLE'
+
+
+# ---------------------------------------------------------------------------
+# CR14 (D11/D19.3): caller context — legacy collect/quote/funding accept a
+# trailing request_context and forward the real job_type (never forced
+# monitor); mixed loads bill the real family/job_type and background never
+# eats the monitor reserve.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cr14_collect_forwards_caller_context_not_monitor():
+    from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+    m = market()
+    seen: dict = {}
+
+    async def _mark(symbol, request_context=None):
+        seen['mark_jt'] = getattr(request_context, 'job_type', None)
+        seen['mark_jid'] = getattr(request_context, 'job_id', None)
+        return {'price': '0.001', 'as_of_ms': 100000}
+
+    async def _quote(symbol, qty, venue=None, request_context=None):
+        seen['quote_jt'] = getattr(request_context, 'job_type', None)
+        return {'mid_price': '1', 'status': 'OK'}
+
+    async def _funding(symbol, request_context=None):
+        seen['fund_jt'] = getattr(request_context, 'job_type', None)
+        from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics
+        return FundingMetrics(symbol=symbol)
+
+    m.mark = _mark  # type: ignore[method-assign]
+    m.quote = _quote  # type: ignore[method-assign]
+    m.funding = _funding  # type: ignore[method-assign]
+    ctx = make_request_context(None, job_type='opportunity', host='fapi',
+                               trace_id='t-cr14', job_id='funding_capture_refresh',
+                               deadline_ms=200000)
+    await m.collect('1000PEPEUSDT', '1', 'BINANCE_SPOT', request_context=ctx)
+    assert seen == {'mark_jt': 'opportunity', 'mark_jid': 'funding_capture_refresh',
+                    'quote_jt': 'opportunity', 'fund_jt': 'opportunity'}, seen
+
+
+@pytest.mark.asyncio
+async def test_cr14_quote_and_funding_accept_context_positionally_compatible():
+    import inspect
+    from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+    m = market()
+    # Signatures keep trailing optional request_context for pre-repair callers.
+    assert 'request_context' in inspect.signature(m.collect).parameters
+    assert 'request_context' in inspect.signature(m.quote).parameters
+    assert 'request_context' in inspect.signature(m.funding).parameters
+    assert 'request_context' in inspect.signature(m._fx).parameters
+    # Legacy calls without context still work (unbounded, budget None).
+    m.mark = AsyncMock(return_value={'price': '0.001', 'as_of_ms': 100000})
+    m.quote = AsyncMock(side_effect=RuntimeError('SPOT_UNAVAILABLE'))
+    m.funding = AsyncMock(side_effect=RuntimeError('FUNDING_UNAVAILABLE'))
+    cache = await m.collect('1000PEPEUSDT', '0')
+    assert cache['futures_mark']['price'] == '0.001'
+
+
+@pytest.mark.asyncio
+async def test_cr14_fx_forwards_caller_job_type_to_provider():
+    from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+    m = market()
+    seen: dict = {}
+
+    async def _fake_fetch(identity, request_context=None):
+        seen['jt'] = getattr(request_context, 'job_type', None)
+        seen['jid'] = getattr(request_context, 'job_id', None)
+        from types import SimpleNamespace as _NS
+        return _NS(status='OK', stale=False, as_of_ms=99000,
+                   data=_NS(price_usd='0.98'))
+
+    m.fx_provider.fetch = _fake_fetch  # type: ignore[method-assign]
+    ctx = make_request_context(None, job_type='evidence', host='fapi',
+                               trace_id='t-fx', job_id='strategy_capture')
+    assert await m._fx('USDT', ctx) == '0.98'
+    assert seen == {'jt': 'evidence', 'jid': 'strategy_capture'}, seen
+
+
+def test_cr14_permit_records_real_job_type_and_family_background_keeps_monitor_reserve():
+    from diveintocrypto_desktop.shortlab.request_budget import (
+        Denied, RequestBudget, make_request_context,
+    )
+    budget = RequestBudget(max_sends=20, window_ms=60_000)
+    m = ProductionHedgeMarket(SimpleNamespace(), None, SimpleNamespace(), budget, lambda: 100000)
+    bg = make_request_context(budget, job_type='opportunity', host='fapi', trace_id='t-bg')
+    permit = m._permit('api.0x.org', 'onchainPrice', bg)
+    assert permit and getattr(permit, 'job_type', None) == 'opportunity'
+    assert getattr(permit, 'endpoint_family', None) == 'onchainPrice'
+    permit.mark_sent()
+    # Legacy without context keeps monitor default.
+    legacy = m._permit('fapi', 'klines')
+    assert getattr(legacy, 'job_type', None) == 'monitor'
+    # Background cap is 10/20 (monitor 20% + scanner 30% reserved); the 11th
+    # background send denies while monitor still has its reserve.
+    budget2 = RequestBudget(max_sends=20, window_ms=60_000)
+    for _ in range(10):
+        p = budget2.try_acquire('fapi', 10, 'opportunity', 'klines')
+        assert p
+        p.mark_sent()
+    assert isinstance(budget2.try_acquire('fapi', 10, 'opportunity', 'klines'), Denied)
+    assert budget2.remaining('monitor') == 10
+    assert budget2.try_acquire('fapi', 10, 'monitor', 'klines')
+
+
+@pytest.mark.asyncio
+async def test_cr14_chain_transport_bills_real_job_type_not_monitor():
+    from diveintocrypto_desktop.shortlab.request_budget import RequestBudget, make_request_context
+    from diveintocrypto_desktop.data import http as _http
+    budget = RequestBudget(max_sends=240, window_ms=60_000)
+    m = ProductionHedgeMarket(SimpleNamespace(), None, SimpleNamespace(), budget, lambda: 100000)
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {'ok': True}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *exc):
+            return None
+
+    class _Session:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _Ctx()
+
+    async def _fake_session():
+        return _Session()
+
+    import unittest.mock as _mock
+    ctx = make_request_context(budget, job_type='opportunity', host='fapi', trace_id='t-0x',
+                               job_id='funding_capture_refresh')
+    with _mock.patch.object(_http, 'get_session', side_effect=_fake_session):
+        out = await m._chain_transport('https://api.0x.org/swap/allowance-holder/price/v2',
+                                       {'a': '1'}, {'h': 'v'}, ctx)
+    assert out == {'ok': True}
+    assert budget.sent_attempts == 1
+    # The single permit recorded the real BACKGROUND job_type, not monitor.
+    assert budget._host_sends and len(budget._host_sends) == 1
