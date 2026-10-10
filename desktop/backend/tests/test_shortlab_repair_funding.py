@@ -328,6 +328,30 @@ def test_last_uses_slot_match_not_120s_ttl():
     # Last settled 8h old must still PASS (120s TTL must NOT apply to it).
     ctx = _matrix_context("pos", "pos")
     assert evaluate_funding_entry_gate(ctx, policy, NOW).status == "PASS"
+    # CR09 (D05.3): 14-day-old settled rate with other qualified must be
+    # UNKNOWN (nearest expected settled slot ±60s from CONFIRMED schedule,
+    # never the current 120s TTL; missing slot => UNKNOWN, never PASS).
+    # Event/source are self-consistent here; staleness vs the expected slot
+    # is what must block entry.
+    old_t = NOW - 14 * DAY_MS
+    old_cur = _observed({"rate": "0.0005", "funding_time_ms": NOW - 60_000},
+                        source_as_of=NOW - 60_000, known_at=NOW - 50_000)
+    old_last = Observed(
+        value={"rate": "0.0004", "funding_time_ms": old_t},
+        meta=ObservationMeta(
+            status="OK", source="binance:fapi/fundingRate",
+            source_as_of_ms=old_t,
+            fetched_at_ms=old_t + 5000, known_at_ms=old_t + 5000,
+        ),
+    )
+    ctx_old = make_funding_context(
+        current_rate="0.0005", last_settled_rate="0.0004",
+        current_observation=old_cur, last_settled_observation=old_last,
+    )
+    res_old = evaluate_funding_entry_gate(ctx_old, policy, NOW)
+    assert res_old.status == "UNKNOWN"
+    assert "FUNDING_SCHEDULE_UNKNOWN" in res_old.reasons
+    assert res_old.status != "PASS"
     # Last value time disagreeing with its source time beyond 60s is UNKNOWN.
     bad_last = Observed(
         value={"rate": "0.0004", "funding_time_ms": NOW - H8},

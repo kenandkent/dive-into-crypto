@@ -193,6 +193,54 @@ def _extract_tolerance_ms(policy: Any) -> int:
     return _DEFAULT_MATCH_TOLERANCE_MS
 
 
+def _verified_interval_ms(context: FundingContext, is_partial: bool) -> int | None:
+    """Nearest-slot interval from CONFIRMED coverage (D05.2/D05.3, CR09).
+
+    Returns the implied settlement interval in ms derived from a verified
+    coverage window (window_len / expected_count). Prefers 7D, then 30D,
+    then 90D (skipped for PARTIAL_90D). A window is usable only when it
+    carries a verified slot count (expected_count not None, no
+    FUNDING_SCHEDULE_UNKNOWN, window valid). The interval comes from the
+    confirmed schedule's slot count, never from guessing 8h/4h and never
+    from the current-rate 120s TTL. ``None`` means no verifiable slot
+    (missing slot) and the caller must return UNKNOWN, never PASS.
+    """
+    cands: list[Any] = [context.coverage_7d, context.coverage_30d]
+    if not is_partial:
+        cands.append(context.coverage_90d)
+    for cov in cands:
+        try:
+            exp = getattr(cov, "expected_count", None)
+            reasons = tuple(getattr(cov, "reasons", ()) or ())
+            wstart = int(getattr(cov, "window_start_ms"))
+            wend = int(getattr(cov, "window_end_ms"))
+        except (TypeError, ValueError):
+            continue
+        if exp is None:
+            continue
+        try:
+            exp_i = int(exp)
+        except (TypeError, ValueError):
+            continue
+        if exp_i <= 0:
+            continue
+        if "FUNDING_SCHEDULE_UNKNOWN" in reasons:
+            continue
+        if wend <= wstart:
+            continue
+        window_len = int(wend) - int(wstart)
+        if window_len <= 0:
+            continue
+        interval = window_len / float(exp_i)
+        if not (interval > 0):
+            continue
+        # Guard against degenerate windows (interval larger than window).
+        if interval > float(window_len):
+            continue
+        return int(interval)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Observation helpers
 # ---------------------------------------------------------------------------
@@ -400,6 +448,38 @@ def evaluate_funding_entry_gate(
             if evt_time is not None and abs(int(evt_time) - int(last_source)) > tol_ms:
                 if "FUNDING_SCHEDULE_UNKNOWN" not in unknown_reasons:
                     unknown_reasons.append("FUNDING_SCHEDULE_UNKNOWN")
+
+    # -- CR09 (D05.3): last settled must come from the nearest expected ------
+    # -- settled slot from the CONFIRMED schedule (±60s), never the 120s ----
+    # -- current TTL. Missing verifiable slot => UNKNOWN, never PASS. --------
+    # The verified interval comes from CONFIRMED coverage (window_len /
+    # expected_count). The last settlement slot time (event funding_time when
+    # carried, else source time) must be within one interval + tolerance of
+    # as_of, i.e. it matches the nearest expected settled slot. A 14-day-old
+    # settlement with an 8h schedule is ~42 intervals stale and yields
+    # FUNDING_SCHEDULE_UNKNOWN. The current 120s TTL is never consulted here.
+    if (
+        "FUNDING_SCHEDULE_UNKNOWN" not in unknown_reasons
+        and "HISTORY_CLASS_UNKNOWN" not in unknown_reasons
+        and last_obs is not None
+        and last_source is not None
+        and last_known is not None
+        and int(last_known) <= as_of
+        and int(last_source) <= as_of + _FUTURE_SKEW_MS
+    ):
+        interval_ms = _verified_interval_ms(context, is_partial)
+        if interval_ms is None:
+            unknown_reasons.append("FUNDING_SCHEDULE_UNKNOWN")
+        else:
+            evt2 = _obs_event_time(last_obs)
+            if evt2 is not None and int(evt2) > as_of + _FUTURE_SKEW_MS:
+                unknown_reasons.append("FUNDING_SCHEDULE_UNKNOWN")
+            else:
+                slot_time = int(evt2) if evt2 is not None else int(last_source)
+                max_age_ms = int(interval_ms) + int(tol_ms)
+                if (as_of - slot_time) > max_age_ms:
+                    if "FUNDING_SCHEDULE_UNKNOWN" not in unknown_reasons:
+                        unknown_reasons.append("FUNDING_SCHEDULE_UNKNOWN")
 
     input_refs = dict(context.input_refs) if isinstance(context.input_refs, Mapping) else {}
     if unknown_reasons:
