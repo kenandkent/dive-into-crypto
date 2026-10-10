@@ -927,6 +927,18 @@ def _mark_daily(fake: FakeMarketProvider, start_ms: int, end_ms: int) -> None:
         fake.add_mark_bar(_mark_bar("BTCUSDT", open_ms, price))
 
 
+def _mark_hourly(fake: FakeMarketProvider, start_ms: int, end_ms: int) -> None:
+    """True MARK 1h bars across the window (CR17: daily bars alone only PARTIAL)."""
+    steps = max(1, (int(end_ms) - int(start_ms)) // HOUR_MS)
+    for i in range(steps + 1):
+        open_ms = int(start_ms) + i * HOUR_MS
+        if open_ms > int(end_ms):
+            break
+        frac = (open_ms - int(start_ms)) / max(1, int(end_ms) - int(start_ms))
+        price = str(Decimal("100") + (Decimal("110") - Decimal("100")) * Decimal(str(frac)))
+        fake.add_mark_bar(_mark_bar("BTCUSDT", open_ms, price))
+
+
 @pytest.mark.asyncio
 async def test_mark_empty_never_complete_reader_proved(repo):
     """TRADE complete + MARK empty => PARTIAL (reader executed, no masquerade)."""
@@ -1011,7 +1023,8 @@ async def test_mark_complete_when_mark_covers(repo):
     fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
     fake.quotes[0]["snapshot_id"] = "q-entry"
     fake.quotes[1]["snapshot_id"] = "q-exit"
-    _mark_daily(fake, NOW, NOW + 7 * DAY_MS)
+    # CR17: 1h-continuous MARK bars are required for COMPLETE (daily alone is PARTIAL).
+    _mark_hourly(fake, NOW, NOW + 7 * DAY_MS)
     outcome = await grade_hedge(
         "fcs-mark-full", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
     )
