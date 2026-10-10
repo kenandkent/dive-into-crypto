@@ -20,6 +20,7 @@ from diveintocrypto_desktop.shortlab.config import load_shortlab_config
 from diveintocrypto_desktop.shortlab.funding_schedule import (
     compute_priced_event_coverage,
     compute_schedule_coverage,
+    latest_expected_settled_slot,
 )
 from diveintocrypto_desktop.shortlab.hedge.entry_gate import (
     evaluate_funding_entry_gate,
@@ -372,6 +373,48 @@ def test_last_uses_slot_match_not_120s_ttl():
     assert "FUNDING_SCHEDULE_UNKNOWN" in res.reasons
 
 
+def test_last_settled_must_match_latest_expected_slot_not_previous_slot():
+    """A prior 8h event is stale when a newer expected settlement is due."""
+    ctx = _matrix_context("pos", "pos")
+    last = _observed(
+        {"rate": "0.0004", "funding_time_ms": NOW - H8},
+        source_as_of=NOW - H8,
+        known_at=NOW - H8 + 5_000,
+    )
+    ctx = build_funding_context(
+        ctx.metrics,
+        ctx.coverage_7d,
+        ctx.coverage_30d,
+        ctx.coverage_90d,
+        history_class=ctx.history_class,
+        listing_age_days=ctx.listing_age_days,
+        conservative_apr=ctx.conservative_apr,
+        conservative_method=ctx.conservative_method,
+        current_observation=ctx.current_observation,
+        last_settled_observation=last,
+        schedule_refs=ctx.schedule_refs,
+        input_refs={**ctx.input_refs, "last_expected_slot_ms": str(NOW),
+                    "schedule_checked_at_ms": str(NOW)},
+    )
+
+    result = evaluate_funding_entry_gate(ctx, _default_policy(), NOW)
+
+    assert result.status == "UNKNOWN"
+    assert "FUNDING_SCHEDULE_UNKNOWN" in result.reasons
+
+
+def test_latest_expected_settled_slot_uses_confirmed_anchor_and_cutoff():
+    schedule = _segment(start=NOW - 2 * DAY_MS, end=None, interval_hours=8,
+                        anchor=NOW - 2 * DAY_MS, known_at=NOW - DAY_MS)
+    assert latest_expected_settled_slot(
+        [schedule], as_of_ms=NOW + 5 * 60_000,
+        known_by_ms=NOW + 5 * 60_000, symbol="1000PEPEUSDT") == NOW
+    # Future-known schedule cannot answer a historical cutoff.
+    assert latest_expected_settled_slot(
+        [schedule], as_of_ms=NOW, known_by_ms=NOW - 2 * DAY_MS,
+        symbol="1000PEPEUSDT") is None
+
+
 def test_partial_90d_skips_90d_gates_with_na():
     policy = _default_policy()
     cur = _observed({"rate": "0.0005", "funding_time_ms": NOW - 60_000},
@@ -648,13 +691,18 @@ def test_young_partial_builders():
     cov90 = FundingCoverage(NOW - 90 * DAY_MS, NOW, None, 0, None, "0",
                             (), ("FUNDING_SCHEDULE_UNKNOWN",))
     cur = _observed({"rate": "0.0005"}, source_as_of=NOW - 60_000, known_at=NOW - 50_000)
-    last = _observed({"rate": "0.0004"}, source_as_of=NOW - H8, known_at=NOW - H8 + 5000)
+    last = _observed({"rate": "0.0004", "funding_time_ms": NOW - H8},
+                     source_as_of=NOW - H8, known_at=NOW - H8 + 5000)
     ctx = build_funding_context(
         metrics, cov7, cov30, cov90, history_class="PARTIAL_90D",
         listing_age_days=45, conservative_apr="0.2",
         conservative_method="MIN_APR30_P25_30D",
         current_observation=cur, last_settled_observation=last,
-        schedule_refs=("sched-1",), input_refs={"funding": "fcs-young"},
+        schedule_refs=("sched-1",), input_refs={
+            "funding": "fcs-young",
+            "schedule_checked_at_ms": str(NOW),
+            "last_expected_slot_ms": str(NOW - H8),
+        },
     )
     assert ctx.history_class == "PARTIAL_90D"
     assert ctx.listing_age_days == 45

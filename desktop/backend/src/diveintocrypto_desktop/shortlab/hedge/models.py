@@ -1089,6 +1089,15 @@ class HedgeEvidenceSummary:
     avg_net_return: str | None = None
     median_net_return: str | None = None
     evidence_version: str = HEDGE_EVIDENCE_VERSION
+    cohort: str | None = None
+    unavailable_count: int = 0
+    pending_count: int = 0
+    paired_count: int = 0
+    paired_missing_count: int = 0
+    paired_mean_strategy_return: str | None = None
+    paired_mean_unhedged_return: str | None = None
+    paired_mean_diff: str | None = None
+    evaluation_report: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _check_enum("strategy", self.strategy, ALLOWED_STRATEGIES)
@@ -1099,12 +1108,22 @@ class HedgeEvidenceSummary:
             )
         if self.horizon_days not in ALLOWED_HORIZON_DAYS:
             raise ValueError("horizon_days must be 7, 30 or 90")
-        for name in ("sample_count", "complete_count", "censored_count"):
+        for name in ("sample_count", "complete_count", "censored_count",
+                     "unavailable_count", "pending_count", "paired_count",
+                     "paired_missing_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative int")
-        require_optional_decimal_str("avg_net_return", self.avg_net_return)
-        require_optional_decimal_str("median_net_return", self.median_net_return)
+        if self.cohort is not None and self.cohort not in {
+            "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY",
+            "USER_DECISION", "LEGACY_FCS",
+        }:
+            raise ValueError("cohort is not a hedge evidence cohort")
+        for name in ("avg_net_return", "median_net_return", "paired_mean_strategy_return",
+                     "paired_mean_unhedged_return", "paired_mean_diff"):
+            require_optional_decimal_str(name, getattr(self, name))
+        if self.evaluation_report is not None and not isinstance(self.evaluation_report, dict):
+            raise ValueError("evaluation_report must be a dict or None")
 
 
 # ---------------------------------------------------------------------------

@@ -30,10 +30,19 @@ jobs:
         working-directory: desktop/backend
         run: |
           uv sync
-          uv run pytest -q
+          mkdir -p runtime/verification/ci
+          uv run pytest -q --junitxml=runtime/verification/ci/backend.xml
 
       - name: Root E2E suite (tests/)
-        run: uv run --project desktop/backend pytest tests/ -q
+        run: uv run --project desktop/backend pytest tests/ -q --junitxml=desktop/backend/runtime/verification/ci/root.xml
+
+      - name: Upload backend regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-lab-backend-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/backend/runtime/verification/ci/
+          if-no-files-found: error
 
   ui:
     name: UI (npm test + build, dist drift gate)
@@ -48,12 +57,43 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/ui/package-lock.json
 
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: desktop/backend/uv.lock
+
+      - name: Install Python 3.12 for the isolated repair harness
+        run: uv python install 3.12
+
+      - name: Install locked backend runtime for browser acceptance
+        run: uv sync --project desktop/backend --locked
+
       - name: Install, test, build
         working-directory: desktop/ui
         run: |
           npm ci
           npm test
           node build.mjs
+
+      - name: Install Chromium for browser acceptance
+        working-directory: desktop/ui
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: test/.tmp/ms-playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run real React repair browser acceptance
+        working-directory: desktop/ui
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: test/.tmp/ms-playwright
+        run: npm run test:repair-e2e
+
+      - name: Upload browser acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-lab-browser-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop/ui/test/.tmp/repair-browser/
+          if-no-files-found: error
 
       - name: Assert committed dist/ matches a fresh build
         run: git diff --exit-code -- desktop/ui/dist

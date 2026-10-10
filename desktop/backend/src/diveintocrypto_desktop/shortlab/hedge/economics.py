@@ -33,7 +33,7 @@ from diveintocrypto_desktop.shortlab.repair_contracts import (
     ScenarioResult,
 )
 
-__all__ = ["evaluate_economics", "build_ratio_proposal"]
+__all__ = ["evaluate_economics", "evaluate_position_scenarios", "build_ratio_proposal"]
 
 _COST_BASIS = COST_FORMULA_VERSION_V2
 
@@ -498,6 +498,118 @@ def evaluate_economics(
         gate=gate3,
         unknown_components=tuple(sorted(set(unknown_components))),
     )
+
+
+def evaluate_position_scenarios(
+    *,
+    futures_qty: Any,
+    spot_qty: Any,
+    futures_mark: Any,
+    liquidation_price: Any,
+    futures_entry_price: Any,
+    futures_entry_fx: Any,
+    futures_exit_price: Any,
+    futures_exit_fx: Any,
+    spot_entry_price: Any,
+    spot_entry_fx: Any,
+    spot_exit_price: Any,
+    spot_exit_fx: Any,
+    futures_exit_fee_rate: Any,
+    spot_exit_fee_rate: Any,
+    entry_cost_usd: Any,
+    slippage_usd: Any,
+    gas_usd: Any,
+    policy: Any,
+    has_spot: bool = True,
+) -> tuple[ScenarioResult, ...]:
+    """Evaluate the six configured shocks on exact remaining native quantities.
+
+    This is shared by new ratio proposals and activation's re-check of the
+    current ledger position. Missing FX, prices, fees, or liquidation data
+    produce UNKNOWN rows; carry never offsets scenario losses.
+    """
+    if not isinstance(has_spot, bool):
+        raise ValueError("has_spot must be bool")
+    scenarios_cfg = _extract_scenarios(policy)
+    stress_bps = _extract_exit_stress_bps(policy)
+
+    def _opt(name: str, value: Any) -> Decimal | None:
+        try:
+            return _parse_optional_decimal(value, name)
+        except ValueError:
+            return None
+
+    fqty = _opt("futures_qty", futures_qty)
+    sqty = _opt("spot_qty", spot_qty)
+    mark = _opt("futures_mark", futures_mark)
+    liq = _opt("liquidation_price", liquidation_price)
+    fent = _opt("futures_entry_price", futures_entry_price)
+    fentryfx = _opt("futures_entry_fx", futures_entry_fx)
+    fexit = _opt("futures_exit_price", futures_exit_price)
+    fexitfx = _opt("futures_exit_fx", futures_exit_fx)
+    sent = _opt("spot_entry_price", spot_entry_price) if has_spot else Decimal("0")
+    sentfx = _opt("spot_entry_fx", spot_entry_fx) if has_spot else Decimal("1")
+    sexit = _opt("spot_exit_price", spot_exit_price) if has_spot else Decimal("0")
+    sexitfx = _opt("spot_exit_fx", spot_exit_fx) if has_spot else Decimal("1")
+    f_rate = _opt("futures_exit_fee_rate", futures_exit_fee_rate)
+    s_rate = _opt("spot_exit_fee_rate", spot_exit_fee_rate) if has_spot else Decimal("0")
+    entry_cost = _opt("entry_cost_usd", entry_cost_usd)
+    slip = _opt("slippage_usd", slippage_usd)
+    gas = _opt("gas_usd", gas_usd)
+    base_unknown = any(v is None for v in (
+        fqty, sqty, mark, liq, fent, fentryfx, fexit, fexitfx,
+        sent, sentfx, sexit, sexitfx, f_rate, s_rate,
+        entry_cost, slip, gas,
+    ))
+    if (fqty is not None and fqty <= 0) or (sqty is not None and has_spot and sqty <= 0):
+        base_unknown = True
+    results: list[ScenarioResult] = []
+    for sid in _SCENARIO_ORDER:
+        cfg = scenarios_cfg[sid]
+        fmove = _parse_decimal(cfg["futures_move"], f"{sid}.futures_move")
+        smove = _parse_decimal(cfg["spot_move"], f"{sid}.spot_move")
+        fshock = _parse_decimal(cfg["fx_shock"], f"{sid}.fx_shock")
+        common = dict(
+            scenario_id=sid, futures_move=_dec_str(fmove),
+            spot_move=_dec_str(smove), fx_shock=_dec_str(fshock),
+        )
+        if base_unknown:
+            results.append(ScenarioResult(**common, status="UNKNOWN", net_pnl_usd=None,
+                                          loss_usd=None, reasons=("UNKNOWN_SCENARIO_INPUT",)))
+            continue
+        assert fqty is not None and sqty is not None and mark is not None and liq is not None
+        assert fent is not None and fentryfx is not None and fexit is not None and fexitfx is not None
+        assert sent is not None and sentfx is not None and sexit is not None and sexitfx is not None
+        assert f_rate is not None and s_rate is not None and entry_cost is not None and slip is not None and gas is not None
+        with localcontext() as ctx:
+            ctx.prec = 80
+            if mark * (Decimal("1") + fmove) >= liq:
+                results.append(ScenarioResult(**common, status="INVALID_AFTER_LIQUIDATION",
+                                              net_pnl_usd=None, loss_usd=None,
+                                              reasons=("LIQUIDATION_CROSSED",)))
+                continue
+            fut_fx_s = fexitfx * (Decimal("1") + fshock)
+            spot_fx_s = sexitfx * (Decimal("1") + fshock)
+            stress_mult = Decimal("1") + Decimal(stress_bps) / Decimal("10000")
+            spot_disc = Decimal("1") - Decimal(stress_bps) / Decimal("10000")
+            fut_exit_s = fexit * (Decimal("1") + fmove) * stress_mult
+            # Linear futures are quote settled: apply the shocked current FX
+            # to the native-price spread, never book historical entry FX as
+            # principal PnL. Entry fees/cash remain separately FX-frozen.
+            fut_pnl = (fent - fut_exit_s) * fqty * fut_fx_s
+            fut_fee = fut_exit_s * fqty * fut_fx_s * f_rate
+            if has_spot:
+                spot_exit_s = sexit * (Decimal("1") + smove) * spot_disc
+                spot_pnl = (spot_exit_s * spot_fx_s - sent * sentfx) * sqty
+                spot_fee = spot_exit_s * sqty * spot_fx_s * s_rate
+            else:
+                spot_pnl = Decimal("0")
+                spot_fee = Decimal("0")
+            net = fut_pnl + spot_pnl - entry_cost - fut_fee - spot_fee - slip - gas
+            loss = -net if net < 0 else Decimal("0")
+        results.append(ScenarioResult(**common, status="VALID", net_pnl_usd=_dec_str(net),
+                                      loss_usd=_dec_str(loss), reasons=()))
+    return tuple(results)
 
 
 # ---------------------------------------------------------------------------
@@ -1094,108 +1206,19 @@ def build_ratio_proposal(
         policy,
     )
 
-    # -- scenarios (real quantities + scenario exit amounts) -------------------------
-    scenario_results: list[ScenarioResult] = []
-    # Futures pressure uses native mark; PnL uses execution VWAPs.
-    fut_entry_px = entry_px
-    fut_exit_base = fut_buy if fut_buy is not None else mark
-    # Spot execution legs (h0 has none).
-    spot_entry_px = spot_buy_final
-    spot_exit_base = spot_sell_final
-    for sid in _SCENARIO_ORDER:
-        cfg = scenarios_cfg[sid]
-        fmove = _parse_decimal(cfg["futures_move"], f"{sid}.futures_move")
-        smove = _parse_decimal(cfg["spot_move"], f"{sid}.spot_move")
-        fshock = _parse_decimal(cfg["fx_shock"], f"{sid}.fx_shock")
-        with localcontext() as ctx:
-            ctx.prec = 80
-            pressure = mark * (Decimal("1") + fmove)
-        if pressure >= liq_price:
-            scenario_results.append(
-                ScenarioResult(
-                    scenario_id=sid,
-                    futures_move=_dec_str(fmove),
-                    spot_move=_dec_str(smove),
-                    fx_shock=_dec_str(fshock),
-                    status="INVALID_AFTER_LIQUIDATION",
-                    net_pnl_usd=None,
-                    loss_usd=None,
-                    reasons=("LIQUIDATION_CROSSED",),
-                )
-            )
-            continue
-        # Unknown execution legs => UNKNOWN (never zero-fill).
-        if fut_entry_px is None or fut_exit_base is None or fx_fut is None:
-            scenario_results.append(
-                ScenarioResult(
-                    scenario_id=sid,
-                    futures_move=_dec_str(fmove),
-                    spot_move=_dec_str(smove),
-                    fx_shock=_dec_str(fshock),
-                    status="UNKNOWN",
-                    net_pnl_usd=None,
-                    loss_usd=None,
-                    reasons=("UNKNOWN_COST",),
-                )
-            )
-            continue
-        if not is_h0 and (spot_entry_px is None or spot_exit_base is None or fx_spot_final is None):
-            scenario_results.append(
-                ScenarioResult(
-                    scenario_id=sid,
-                    futures_move=_dec_str(fmove),
-                    spot_move=_dec_str(smove),
-                    fx_shock=_dec_str(fshock),
-                    status="UNKNOWN",
-                    net_pnl_usd=None,
-                    loss_usd=None,
-                    reasons=("UNKNOWN_COST",),
-                )
-            )
-            continue
-        with localcontext() as ctx:
-            ctx.prec = 80
-            fx_fut_s = fx_fut * (Decimal("1") + fshock)
-            # Extra 100bps exit stress: futures BUY premium, spot SELL discount.
-            stress_mult = Decimal("1") + Decimal(stress_bps) / Decimal("10000")
-            spot_disc = Decimal("1") - Decimal(stress_bps) / Decimal("10000")
-            fut_exit_s = fut_exit_base * (Decimal("1") + fmove) * stress_mult
-            fut_pnl = (fut_entry_px - fut_exit_s) * fut_qty * fx_fut_s
-            if is_h0:
-                spot_pnl = Decimal("0")
-                scen_exit_fee = (fut_exit_s * fut_qty * fx_fut_s) * fut_exit_rate
-                scen_spot_exit = Decimal("0")
-            else:
-                assert spot_entry_px is not None and spot_exit_base is not None and fx_spot_final is not None
-                fx_spot_s = fx_spot_final * (Decimal("1") + fshock)
-                spot_exit_s = spot_exit_base * (Decimal("1") + smove) * spot_disc
-                spot_pnl = (spot_exit_s * fx_spot_s - spot_entry_px * fx_spot_final) * spot_qty_final
-                # Scenario exit fees on stressed notionals (carry credit 0).
-                scen_fut_exit = (fut_exit_s * fut_qty * fx_fut_s) * fut_exit_rate
-                scen_spot_exit = (spot_exit_s * spot_qty_final * fx_spot_s) * sxr
-                scen_exit_fee = scen_fut_exit + scen_spot_exit
-            # Net: directional PnL minus full scenario costs (entry + stressed
-            # exit + explicit slippage + gas). Funding carry credit is 0.
-            scen_entry = entry_fee_total
-            scen_slip = slippage_total
-            scen_gas = gas_roundtrip
-            if is_h0:
-                net_scen = fut_pnl - (scen_entry + scen_exit_fee + scen_slip + scen_gas)
-            else:
-                net_scen = (fut_pnl + spot_pnl) - (scen_entry + scen_exit_fee + scen_slip + scen_gas)
-            loss_scen = -net_scen if net_scen < 0 else Decimal("0")
-        scenario_results.append(
-            ScenarioResult(
-                scenario_id=sid,
-                futures_move=_dec_str(fmove),
-                spot_move=_dec_str(smove),
-                fx_shock=_dec_str(fshock),
-                status="VALID",
-                net_pnl_usd=_dec_str(net_scen),
-                loss_usd=_dec_str(loss_scen),
-                reasons=("CURRENT_PRICE_REFERENCE",) if False else (),
-            )
-        )
+    # -- scenarios (same pure evaluator used by activation on actual holdings) --
+    scenario_results = evaluate_position_scenarios(
+        futures_qty=fut_qty, spot_qty=spot_qty_final,
+        futures_mark=mark, liquidation_price=liq_price,
+        futures_entry_price=entry_px, futures_entry_fx=fx_fut,
+        futures_exit_price=fut_buy if fut_buy is not None else mark,
+        futures_exit_fx=fx_fut,
+        spot_entry_price=spot_buy_final, spot_entry_fx=fx_spot_final,
+        spot_exit_price=spot_sell_final, spot_exit_fx=fx_spot_final,
+        futures_exit_fee_rate=fut_exit_rate, spot_exit_fee_rate=sxr,
+        entry_cost_usd=entry_fee_total, slippage_usd=slippage_total,
+        gas_usd=gas_roundtrip, policy=policy, has_spot=not is_h0,
+    )
 
     # -- execution / risk gates ----------------------------------------------------------
     exec_reasons: list[str] = []

@@ -287,7 +287,7 @@ async def test_v14_user_decision_six_strategies_exact_qty_fx_source(repo):
     market = FakeMarket()
     result = await capture_strategy_entries(context, repo, market, _ctx())
     assert result.status == "COMPLETE"
-    assert tuple(result.entry_ids) == tuple(f"{context.source_snapshot_id}:{s}" for s in context.strategies)
+    assert tuple(result.entry_ids) == tuple(f"{context.cohort}:{context.source_snapshot_id}:{s}" for s in context.strategies)
     assert result.executed_as_of_ms is not None and result.executed_as_of_ms > context.decision_as_of_ms
     # Group skew <=5s (futures 2000 vs spot 2500 -> 500ms).
     assert result.executed_as_of_ms - context.decision_as_of_ms < 10000
@@ -485,6 +485,64 @@ async def test_v14_day_first_sample_rejects_second_source(repo):
     result = await capture_strategy_entries(second, repo, FakeMarket(), _ctx())
     assert result.status == "UNAVAILABLE"
     assert "DAY_SAMPLE_ALREADY_EXISTS" in result.reasons
+
+
+@pytest.mark.asyncio
+async def test_same_source_strategy_captures_separate_cohort_entries_tasks_and_outcomes(repo):
+    import dataclasses
+
+    from diveintocrypto_desktop.shortlab.evidence.capture import capture_strategy_entries
+    from diveintocrypto_desktop.shortlab.evidence.hedge_metrics import hedge_summary
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import resolve_cost_hash
+    from diveintocrypto_desktop.shortlab.hedge import HEDGE_EVIDENCE_VERSION_CURRENT
+
+    day_ms = 86_400_000
+    cost_hash = resolve_cost_hash(None)
+    source = "score-shared-across-cohorts"
+    context = _make_capture(
+        strategies=("ABSOLUTE_100",), cohort="RESEARCH_CANDIDATE",
+        source_snapshot_id=source, decision=None,
+    )
+    await _save_usdt_fx(
+        repo, source_as_of_ms=FIXTURE_NOW + 500,
+        known_at_ms=FIXTURE_NOW + 600, fx_id="fx-shared-cohort-entry",
+    )
+    research = await capture_strategy_entries(context, repo, FakeMarket(), _ctx())
+    executable_context = dataclasses.replace(context, cohort="EXECUTABLE_DIRECTIONAL")
+    executable = await capture_strategy_entries(executable_context, repo, FakeMarket(), _ctx())
+    assert research.status == executable.status == "COMPLETE"
+    research_entry_id = research.entry_ids[0]
+    executable_entry_id = executable.entry_ids[0]
+    assert research_entry_id != executable_entry_id
+    assert research_entry_id == f"RESEARCH_CANDIDATE:{source}:ABSOLUTE_100"
+    assert executable_entry_id == f"EXECUTABLE_DIRECTIONAL:{source}:ABSOLUTE_100"
+    research_entry = await repo.get_strategy_entry_by_id(research_entry_id)
+    executable_entry = await repo.get_strategy_entry_by_id(executable_entry_id)
+    assert research_entry["source_snapshot_id"] == executable_entry["source_snapshot_id"] == source
+
+    for entry_id, value in ((research_entry_id, "0.1"), (executable_entry_id, "0.3")):
+        tasks = await repo.list_strategy_quote_tasks(entry_id, 0, 2**62, limit=10)
+        assert tasks and all(task["entry_id"] == entry_id for task in tasks)
+        await repo.save_hedge_outcome({
+            "outcome_id": f"{entry_id}:7d", "fcs_snapshot_id": entry_id,
+            "strategy": "ABSOLUTE_100", "horizon_days": 7,
+            "outcome_status": "COMPLETE", "reason_code": None,
+            "evidence_version": HEDGE_EVIDENCE_VERSION_CURRENT,
+            "cost_config_hash": cost_hash,
+            "outcome_json": {"pnl": {"net_return": value}},
+            "updated_at_ms": FIXTURE_NOW + 8 * day_ms,
+        })
+
+    summaries = {}
+    for cohort in ("RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL"):
+        summaries[cohort] = await hedge_summary({
+            "strategy": "ABSOLUTE_100", "cohort": cohort, "horizon": "7D",
+            "now_ms": FIXTURE_NOW + 8 * day_ms,
+        }, repo, None)
+        assert summaries[cohort].sample_count == 1
+        assert summaries[cohort].complete_count == 1
+    assert summaries["RESEARCH_CANDIDATE"].avg_net_return == "0.1"
+    assert summaries["EXECUTABLE_DIRECTIONAL"].avg_net_return == "0.3"
 
 
 @pytest.mark.asyncio

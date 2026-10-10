@@ -349,6 +349,9 @@ async def test_f01_restart_readback_keeps_base_tables_and_legacy_scores(tmp_path
     try:
         await reopened.migrate()
         assert (await reopened.get_identity_snapshot("id-1")) == _identity()
+        assert await reopened.get_identity_snapshots(("id-1", "missing")) == {
+            "id-1": _identity(),
+        }
         assert (await reopened.get_contract_rules_snapshot("rules-1")) == _rules()
         assert (await reopened.get_fundamental_before("BTC", AS_OF)) == _fundamental()
         assert (await reopened.get_config_snapshot("p" * 16)) == _config()

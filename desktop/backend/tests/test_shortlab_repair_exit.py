@@ -697,6 +697,7 @@ def test_cr06_coverage_refs_earliest_expiry() -> None:
 @pytest.mark.asyncio
 async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
     import dataclasses
+    from types import SimpleNamespace
 
     from diveintocrypto_desktop.shortlab.hedge.models import (
         SpotVenueQuote,
@@ -766,7 +767,7 @@ async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
             rule_version="rules-cr06-svc", raw_filters={},
             order_types={"LIMIT": True, "MARKET": True, "STOP": True},
             price_rules={"tick_size": "0.000001"},
-            lot_rules={"step_size": "0.01", "min_qty": "0.001", "max_qty": "1000000"},
+            lot_rules={"step_size": "0.0001" if venue == "BINANCE_SPOT" else "0.01", "min_qty": "0.0001", "max_qty": "1000000"},
             notional_rules={"min_notional": "5"},
             stop_orders_supported=True,
             conditional_orders_source_ref="rules:1000PEPEUSDT:cr06",
@@ -819,9 +820,10 @@ async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
         pid = plan["planId"]
 
         def _evt(leg: str, typ: str, qty: str) -> dict[str, Any]:
+            native_qty = "0.001234" if leg == "FUTURES_SHORT" else qty
             return {
                 "schema_version": "hedge-event-v1", "leg_type": leg, "event_type": typ,
-                "native_qty": qty, "canonical_qty": qty, "native_price": "100",
+                "native_qty": native_qty, "canonical_qty": qty, "native_price": "100",
                 "price_currency": "USDT", "fee_currency": None, "fee_amount": None,
                 "fee_usd": None, "gas_usd": None, "source": "USER_ENTERED",
                 "executed_at_ms": NOW_SVC, "gross_qty": qty, "net_qty": qty,
@@ -829,10 +831,22 @@ async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
 
         r1 = await svc.apply_leg_event(pid, {"event": _evt("FUTURES_SHORT", "OPEN_FUTURES_SHORT", "1.234"), "client_event_id": "e-f-1", "expected_version": 1})
         await svc.apply_leg_event(pid, {"event": _evt("SPOT_LONG", "OPEN_SPOT_LONG", "1.234"), "client_event_id": "e-s-1", "expected_version": r1["planVersion"]})
+        _future_requests = []
+        async def _collect_futures(_symbol: str, contract_qty: str, _request_context: Any):
+            _future_requests.append(contract_qty)
+            return {"futures_quote": {
+                "quote_id": "futures-native-quote", "buy_vwap_native": "101",
+                "buy_executable_qty": contract_qty, "quote_to_usd": "1",
+                "quote_currency": "USDT", "as_of_ms": NOW_SVC,
+                "known_at_ms": NOW_SVC, "expires_at_ms": NOW_SVC + 1_000,
+            }}
+        svc._market_port = SimpleNamespace(collect_futures=_collect_futures)
         out = await svc.repair_exit_guidance(pid)
-        # Quantity rounded to step .01 (1.234 -> 1.23), venue per holding, 1s expiry kept.
+        # Futures use native contracts (.001234 -> .0012); Spot uses canonical
+        # quantity (.1.234 -> 1.23), venue per holding, 1s expiry kept.
         by_leg = {str(leg["leg_type"]): leg for leg in out["legs"]}
-        assert str(by_leg["FUTURES_SHORT"]["native_qty"]) == "1.23"
+        assert str(by_leg["FUTURES_SHORT"]["native_qty"]) == "0.0012"
+        assert _future_requests == ["0.001234"]
         assert str(by_leg["SPOT_LONG"]["native_qty"]) == "1.23"
         assert by_leg["FUTURES_SHORT"]["side"] == "BUY"
         assert by_leg["SPOT_LONG"]["side"] == "SELL"
@@ -847,3 +861,26 @@ async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
         assert by_leg["SPOT_LONG"]["vwap_native"] is not None
     finally:
         await repo.close()
+
+
+def test_cr06_1000_multiplier_exit_reports_native_futures_contracts() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.exit_guidance import build_pair_exit_guidance
+
+    guidance = build_pair_exit_guidance(
+        {"plan_id": "p", "plan_version": 1, "symbol": "1000PEPEUSDT",
+         "contract_multiplier": "1000", "futures_notional_usd": "1234",
+         "spot_venue": "BINANCE_SPOT"},
+        [
+            {"leg_type": "FUTURES_SHORT", "open_qty": "1234", "closed_qty": "0", "remaining_qty": "1234"},
+            {"leg_type": "SPOT_LONG", "open_qty": "1234", "closed_qty": "0", "remaining_qty": "1234"},
+        ],
+        {"now_ms": 10_000, "futures_buy_vwap_native": "100", "spot_sell_vwap_native": "100",
+         "futures_exit_coverage": "1", "spot_exit_coverage": "1", "futures_quote_fx": "1",
+         "spot_quote_fx": "1", "exit_quote_refs": {"futures": "fq", "spot": "sq"}},
+        {"FUTURES_SHORT": {"lot_rules": {"step_size": "0.001"}},
+         "SPOT_LONG": {"lot_rules": {"step_size": "1"}}},
+        10_000,
+    )
+
+    futures = next(leg for leg in guidance.legs if leg["leg_type"] == "FUTURES_SHORT")
+    assert futures["native_qty"] == "1.234"

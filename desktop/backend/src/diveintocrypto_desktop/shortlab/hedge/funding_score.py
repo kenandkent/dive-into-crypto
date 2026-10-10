@@ -1074,6 +1074,8 @@ def build_funding_context(
     last_settled_observation: Any | None,
     schedule_refs: Sequence[str] = (),
     input_refs: Mapping[str, str] | None = None,
+    schedules: Sequence[Any] | None = None,
+    as_of_ms: int | None = None,
 ) -> Any:
     """Assemble a frozen :class:`FundingContext` from already-computed parts.
 
@@ -1090,6 +1092,22 @@ def build_funding_context(
 
     if history_class not in ("FULL_90D", "PARTIAL_90D", "INSUFFICIENT", "HISTORY_CLASS_UNKNOWN"):
         raise ValueError(f"history_class={history_class!r} unknown")
+    frozen_refs = dict(input_refs) if input_refs is not None else {}
+    if as_of_ms is not None:
+        cutoff = int(as_of_ms)
+        from diveintocrypto_desktop.shortlab.funding_schedule import (
+            latest_expected_settled_slot,
+        )
+
+        symbol = str(getattr(metrics, "symbol", "") or "") or None
+        expected = latest_expected_settled_slot(
+            schedules or (), as_of_ms=cutoff, known_by_ms=cutoff, symbol=symbol
+        )
+        frozen_refs["schedule_checked_at_ms"] = str(cutoff)
+        if expected is not None:
+            frozen_refs["last_expected_slot_ms"] = str(expected)
+        else:
+            frozen_refs.pop("last_expected_slot_ms", None)
     return FundingContext(
         metrics=metrics,
         coverage_7d=coverage_7d,
@@ -1102,7 +1120,7 @@ def build_funding_context(
         current_observation=current_observation,
         last_settled_observation=last_settled_observation,
         schedule_refs=tuple(schedule_refs),
-        input_refs=dict(input_refs) if input_refs is not None else {},
+        input_refs=frozen_refs,
     )
 
 

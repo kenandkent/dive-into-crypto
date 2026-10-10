@@ -521,11 +521,22 @@ test("evidence directional and hedge call different endpoints without mixing", a
   const { renderToStaticMarkup } = await import("react-dom/server");
   const both = renderToStaticMarkup(React.createElement(app.ShortLabEvidence, {
     initial: { data: { filters: {}, horizons: { "30D": { PENDING: 1, COMPLETE: 1, CENSORED: 0, UNAVAILABLE: 0, total: 2 } }, total: 2 } },
-    initialHedge: { data: { generatedAt: 2, buckets: [{ strategy: "ABSOLUTE_100", horizon: "30D", historyClass: "FULL", PENDING: 0, COMPLETE: 2, CENSORED: 0, UNAVAILABLE: 0, total: 2, meanNetReturn: 0.02 }], total: 2 } },
+    initialHedge: { data: { generatedAt: 2, buckets: [{ strategy: "ABSOLUTE_100", horizon: "7D", cohort: "MIXED_COHORTS", historyClass: "MIXED", PENDING: 0, COMPLETE: 2, CENSORED: 0, UNAVAILABLE: 0, total: 2, sampleCount: 2, meanNetReturn: null, medianNetReturn: null, pairedCount: 0, pairedMissingCount: 0, pairedMeanDiff: null, evaluation: { sample_status: "MIXED_BUCKETS", p05_net_return: null, status_counts: { COMPLETE: 2 }, entry_status_counts: { ENTRY_COMPLETE: 1, UNEXECUTABLE: 1 }, coverage: { complete: 2, total: 2 }, liquidation_path_coverage: { counts: { COMPLETE: 1, PARTIAL: 1 }, complete_fraction: 0.5 }, known_costs: { priced_outcomes: 2, mean_fees_usd: 5 }, max_adverse_basis_usd: 12, max_portfolio_drawdown_usd: 20, bootstrap: { status: "MIXED_BUCKETS", n_assets: 0, n: 0 }, paired_bootstrap: { status: "MIXED_BUCKETS", n_assets: 0, n: 0 }, walk_forward: { oos_month: null, oos_label: "MIXED_BUCKETS" } }, subBuckets: [{ bucket: { cohort: "USER_DECISION", profile: "PROFILE_A", formula_version: "FORMULA_A", goal: "CARRY", history_class: "FULL" }, sampleCount: 1, evaluation: { sample_status: "INSUFFICIENT_SAMPLE", mean_net: 0.02, p05_net_return: 0.02, paired: { n_paired: 1, n_missing: 0, mean_diff: 0.01 }, entry_status_counts: { ENTRY_COMPLETE: 1 }, coverage: { complete: 1, total: 1 }, liquidation_path_coverage: { counts: { COMPLETE: 1 }, complete_fraction: 1 }, known_costs: { priced_outcomes: 1, mean_fees_usd: 5 }, max_adverse_basis_usd: 12, max_portfolio_drawdown_usd: 20, bootstrap: { status: "INSUFFICIENT_SAMPLE", n_assets: 1, n: 1 }, paired_bootstrap: { status: "INSUFFICIENT_SAMPLE", n_assets: 1, n: 1 }, walk_forward: { oos_month: "2026-10", oos_label: "RULES_ONLY_NO_PRIOR_MONTH" } } }, { bucket: { cohort: "RESEARCH_CANDIDATE", profile: "PROFILE_B", formula_version: "FORMULA_B", goal: "CARRY", history_class: "FULL" }, sampleCount: 1, evaluation: { sample_status: "INSUFFICIENT_SAMPLE", mean_net: 0.03, p05_net_return: 0.03, entry_status_counts: { UNEXECUTABLE: 1 }, coverage: { complete: 1, total: 1 }, liquidation_path_coverage: { counts: { PARTIAL: 1 }, complete_fraction: 0 }, known_costs: { priced_outcomes: 1, mean_fees_usd: 7 }, max_adverse_basis_usd: 14, max_portfolio_drawdown_usd: 25, bootstrap: { status: "INSUFFICIENT_SAMPLE", n_assets: 1, n: 1 }, paired_bootstrap: { status: "INSUFFICIENT_SAMPLE", n_assets: 1, n: 1 }, walk_forward: { oos_month: "2026-10", oos_label: "RULES_ONLY_NO_PRIOR_MONTH" } } }] }], total: 2 } },
   }));
   assert.ok(both.includes('data-testid="shortlab-evidence-tabs"'), "evidence sub-tabs present");
   assert.ok(both.includes('data-testid="shortlab-evidence-tab-directional"'));
   assert.ok(both.includes('data-testid="shortlab-evidence-tab-hedge"'));
+  assert.ok(both.includes('data-testid="hedge-evidence-bucket-ABSOLUTE_100-7D"'));
+  assert.ok(both.includes('data-testid="hedge-evidence-paired"'));
+  assert.ok(both.includes('data-testid="hedge-evidence-evaluation"'));
+  assert.ok(both.includes('data-testid="hedge-evidence-sub-buckets"'));
+  assert.ok(both.includes('PROFILE_A'));
+  assert.ok(both.includes('UNEXECUTABLE 1'));
+  assert.ok(both.includes('meanFeesUsd'));
+  assert.ok(both.includes('maxAdverseBasisUsd'));
+  assert.ok(both.includes('MIXED_BUCKETS'));
+  assert.ok(both.includes("INSUFFICIENT_SAMPLE"), "insufficient sample is visible in the real hedge panel");
+  assert.ok(both.includes("0.01"), "paired mean difference is rendered");
   const hedgeOnly = renderToStaticMarkup(React.createElement(app.ShortLabEvidence, {
     initialHedge: { data: { generatedAt: 2, buckets: [{ strategy: "RELATIVE_50", horizon: "7D", historyClass: "FULL", PENDING: 0, COMPLETE: 1, CENSORED: 0, UNAVAILABLE: 0, total: 1 }], total: 1 } },
     defaultTab: "hedge",

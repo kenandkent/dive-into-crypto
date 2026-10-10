@@ -8,8 +8,8 @@ weight accounting, monthly restart-retained):
 - tier isolation: monitor 100%, scanner 80% (floor), background 50%;
   background never eats monitor/scanner reserves
 - unknown host/path/limit refuses as UNBUDGETED without transport
-- weight reservation/deduction per (family, limit); spotTicker single vs
-  full; depth missing limit refuses
+- weight reservation/deduction per (family, limit); spotTicker single,
+  batch-size and all-symbol tiers; depth missing limit refuses
 - deadline check before transport (expired => DEADLINE_EXCEEDED, no send)
 - retry = new permit/ID, cache never reserves
 - monthly via R01 RepositoryPort: D19.4 state table spot-checks +
@@ -229,8 +229,8 @@ class TestTierIsolation:
 
 class TestUnknownRegistry:
     def test_version_is_v2(self):
-        assert rb.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v2"
-        assert http_mod.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v2"
+        assert rb.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v3"
+        assert http_mod.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v3"
 
     def test_known_families(self):
         assert rb.endpoint_family_for_url("https://fapi.binance.com/fapi/v1/markPriceKlines") == "markKlines"
@@ -238,6 +238,11 @@ class TestUnknownRegistry:
         assert rb.endpoint_family_for_url("https://api.binance.com/api/v3/klines") == "spotKlines"
         assert rb.endpoint_family_for_url("https://api.binance.com/api/v3/depth") == "spotDepth"
         assert rb.endpoint_family_for_url("https://api.binance.com/api/v3/ticker/24hr") == "spotTicker"
+        assert rb.endpoint_family_for_url("https://api.binance.com/api/v3/ticker/bookTicker") == "spotBookTicker"
+        assert rb.endpoint_weight("spotBookTicker", {"symbol": "BTCUSDT"}) == 2
+        assert rb.endpoint_weight("spotBookTicker", {"symbols": '["BTCUSDT","ETHUSDT"]'}) == 4
+        assert rb.endpoint_weight("spotBookTicker", {}) == 4
+        assert rb.endpoint_weight("spotBookTicker", {"symbol": "BTCUSDT", "symbols": '["BTCUSDT"]'}) is None
         assert (
             rb.endpoint_family_for_url(
                 "https://www.binance.com/bapi/defi/v1/public/alpha-trade/ticker"
@@ -266,9 +271,9 @@ class TestUnknownRegistry:
         assert rb.endpoint_weight("spotKlines", {"limit": 2000}) is None
         assert rb.endpoint_weight("futuresDepth", None) is None
         assert rb.endpoint_weight("spotDepth", {"limit": 0}) is None
-        # spotTicker single (2) vs full (40).
+        # spotTicker single (2) vs full (80).
         assert rb.endpoint_weight("spotTicker", {"symbol": "BTCUSDT"}) == 2
-        assert rb.endpoint_weight("spotTicker", None) == 40
+        assert rb.endpoint_weight("spotTicker", None) == 80
         assert rb.endpoint_weight("fundingInfo", None) == 5
 
     @pytest.mark.asyncio

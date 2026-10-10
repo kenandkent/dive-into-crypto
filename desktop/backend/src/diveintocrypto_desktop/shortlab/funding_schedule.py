@@ -47,6 +47,7 @@ __all__ = [
     "EVENT_MATCH_TOLERANCE_MS",
     "compute_schedule_coverage",
     "compute_priced_event_coverage",
+    "latest_expected_settled_slot",
 ]
 
 #: D15 ``optimization.funding_schedule.event_match_tolerance_sec`` (frozen 60).
@@ -245,6 +246,82 @@ def _format_duration_fraction(confirmed_ms: int, window_ms: int) -> str:
     if confirmed_ms >= window_ms:
         return "1"
     return _format_fraction(confirmed_ms, window_ms)
+
+
+def latest_expected_settled_slot(
+    schedules: Sequence[Any],
+    *,
+    as_of_ms: int,
+    known_by_ms: int,
+    symbol: str | None = None,
+) -> int | None:
+    """Return the latest due slot from a currently confirmed schedule.
+
+    Selection mirrors :func:`compute_schedule_coverage`: only schedules
+    known by the cutoff count, and revisions sharing ``(symbol,
+    effective_from_ms)`` select latest ``known_at_ms`` then ascending
+    ``schedule_id``. The active schedule must be CONFIRMED and unambiguous at
+    ``as_of_ms``; no interval is inferred from event gaps or window counts.
+    """
+    try:
+        as_of = int(as_of_ms)
+        known_by = int(known_by_ms)
+    except (TypeError, ValueError):
+        return None
+    if as_of < 0 or known_by < 0:
+        return None
+
+    grouped: dict[tuple[str, int], FundingScheduleSegment] = {}
+    for raw in schedules or ():
+        try:
+            seg = _coerce_segment(raw)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if seg.known_at_ms > known_by or (symbol is not None and seg.symbol != symbol):
+            continue
+        key = (seg.symbol, seg.effective_from_ms)
+        previous = grouped.get(key)
+        if previous is None or seg.known_at_ms > previous.known_at_ms or (
+            seg.known_at_ms == previous.known_at_ms
+            and seg.schedule_id < previous.schedule_id
+        ):
+            grouped[key] = seg
+
+    selected = sorted(
+        grouped.values(), key=lambda item: (item.symbol, item.effective_from_ms)
+    )
+    active = [
+        seg for seg in selected
+        if seg.verification == "CONFIRMED"
+        and seg.effective_from_ms <= as_of
+        and (seg.effective_to_ms is None or as_of < seg.effective_to_ms)
+    ]
+    if len(active) != 1:
+        return None
+    seg = active[0]
+    # Any known segment overlapping the active one makes the instant
+    # ambiguous, including an UNKNOWN segment whose boundary cannot be used.
+    active_lo = seg.effective_from_ms
+    active_hi = seg.effective_to_ms
+    for other in selected:
+        if other is seg or other.symbol != seg.symbol:
+            continue
+        other_lo = other.effective_from_ms
+        other_hi = other.effective_to_ms
+        if (active_hi is None or other_lo < active_hi) and (
+            other_hi is None or active_lo < other_hi
+        ):
+            return None
+
+    interval_ms = seg.interval_hours * _HOUR_MS
+    if interval_ms <= 0:
+        return None
+    slot = seg.anchor_ms + ((as_of - seg.anchor_ms) // interval_ms) * interval_ms
+    if slot < seg.effective_from_ms:
+        return None
+    if seg.effective_to_ms is not None and slot >= seg.effective_to_ms:
+        return None
+    return int(slot)
 
 
 # ---------------------------------------------------------------------------

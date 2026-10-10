@@ -157,7 +157,11 @@ async def test_fx_cached_quote_keeps_first_known_time():
     first=await m.quote('1000PEPEUSDT','2')
     now[0]=110000
     second=await m.quote('1000PEPEUSDT','2')
-    assert first.capabilities['fx']==second.capabilities['fx']=={'source_as_of_ms':99000,'known_at_ms':100000,'currency':'USDT'}
+    assert first.capabilities['fx']==second.capabilities['fx']=={
+        'source_as_of_ms':99000, 'known_at_ms':100000,
+        'fetched_at_ms':100000, 'currency':'USDT',
+        'rate_str':'.98', 'provider':'coingecko',
+    }
     assert m.fx_provider.fetch.await_count==1
 
 @pytest.mark.asyncio

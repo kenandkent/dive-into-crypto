@@ -616,19 +616,23 @@ def bootstrap_mean_ci(
     Insufficient assets/samples -> ``status=INSUFFICIENT_SAMPLE`` with null
     bounds (never auto-claimed as a probability model).
     """
+    raw_values = list(values or ())
     vals: list[float] = []
-    for value in list(values or ()):
+    for value in raw_values:
         parsed = _finite_float(value)
         if parsed is not None:
             vals.append(parsed)
     asset_list = [str(a) for a in list(assets or []) if str(a).strip()]
-    n_assets = len(set(asset_list)) if asset_list else 0
-    # When assets are not supplied, fall back to sample count for the asset
-    # gate only if the caller explicitly passes min_assets=0; otherwise the
-    # asset gate applies (unknown assets cannot prove breadth).
-    if not asset_list:
-        n_assets = 0
-    if n_assets < min_assets or len(vals) < min_samples:
+    # Each return must carry its own asset label. A short asset universe is
+    # not enough to reconstruct observation-to-cluster membership, and a
+    # flat bootstrap would understate within-asset dependence.
+    aligned = len(asset_list) == len(raw_values) and len(vals) == len(raw_values)
+    clusters: dict[str, list[float]] = {}
+    if aligned:
+        for asset, value in zip(asset_list, vals):
+            clusters.setdefault(asset, []).append(value)
+    n_assets = len(clusters)
+    if not aligned or n_assets < min_assets or len(vals) < min_samples:
         return {
             "status": INSUFFICIENT_SAMPLE,
             "n": int(len(vals)),
@@ -641,10 +645,15 @@ def bootstrap_mean_ci(
         }
     rng = random.Random(int(seed))
     n = len(vals)
+    cluster_values = [clusters[asset] for asset in sorted(clusters)]
+    n_clusters = len(cluster_values)
     means: list[float] = []
     for _ in range(int(samples)):
-        draw = [rng.choice(vals) for _ in range(n)]
-        means.append(sum(draw) / n)
+        # Resample whole assets with replacement, retaining all observations
+        # inside each selected asset cluster.
+        draw_clusters = [rng.choice(cluster_values) for _ in range(n_clusters)]
+        draw = [value for cluster in draw_clusters for value in cluster]
+        means.append(sum(draw) / len(draw))
     means.sort()
     low_idx = int(0.025 * len(means))
     high_idx = min(len(means) - 1, int(0.975 * len(means)))
@@ -703,25 +712,70 @@ def build_evaluation_report(
     items = [dict(r) if isinstance(r, Mapping) else {} for r in list(outcomes or ())]
     counts = {"COMPLETE": 0, "PENDING": 0, "CENSORED": 0, "UNAVAILABLE": 0}
     nets: list[float] = []
+    net_assets: list[str] = []
     asset_set: set[str] = set(str(a) for a in list(assets or []) if str(a).strip())
+    known_fees: list[float] = []
+    funding_mark_coverage: list[float] = []
+    adverse_moves: list[float] = []
+    drawdowns: list[float] = []
+    path_counts = {"COMPLETE": 0, "PARTIAL": 0, "UNKNOWN": 0}
+    entry_counts: dict[str, int] = {}
     for row in items:
         status = str(row.get("status", row.get("outcome_status", "UNAVAILABLE"))).upper()
         if status not in counts:
             status = "UNAVAILABLE"
         counts[status] += 1
+        mark_coverage = _finite_float(row.get("funding_coverage"))
+        if mark_coverage is not None and 0.0 <= mark_coverage <= 1.0:
+            funding_mark_coverage.append(mark_coverage)
         if status == "COMPLETE":
-            net = _finite_float(row.get("net_return", row.get("netReturn", row.get("net_pnl_usd"))))
+            pnl = row.get("pnl") if isinstance(row.get("pnl"), Mapping) else {}
+            risk_row = row.get("risk") if isinstance(row.get("risk"), Mapping) else {}
+            net = _finite_float(row.get("net_return", row.get("netReturn", pnl.get("net_return", row.get("net_pnl_usd")))))
             if net is not None:
                 nets.append(net)
             asset = row.get("asset", row.get("symbol"))
             if asset is not None and str(asset).strip():
-                asset_set.add(str(asset).strip())
+                label = str(asset).strip()
+                asset_set.add(label)
+                if net is not None:
+                    net_assets.append(label)
+            elif net is not None:
+                # Preserve positional mismatch so unknown assets cannot be
+                # silently assigned another observation's cluster.
+                net_assets.append("")
+            fees = _finite_float(row.get("fees_usd", pnl.get("fees_usd")))
+            if fees is not None:
+                known_fees.append(fees)
+            adverse = _finite_float(row.get("max_adverse_basis_usd", risk_row.get("max_adverse_basis_usd")))
+            if adverse is not None:
+                adverse_moves.append(abs(adverse))
+            drawdown = _finite_float(row.get("max_drawdown_usd", risk_row.get("max_portfolio_drawdown_usd")))
+            if drawdown is not None:
+                drawdowns.append(abs(drawdown))
+            path = str(row.get("path_coverage", risk_row.get("path_coverage", "UNKNOWN"))).upper()
+            path_counts[path if path in path_counts else "UNKNOWN"] += 1
+        entry_status = str(row.get("entry_status") or "UNKNOWN").upper()
+        entry_counts[entry_status] = entry_counts.get(entry_status, 0) + 1
     # Paired baseline (identical samples only).
     paired = paired_baseline_diff(list(paired_pairs or ())) if paired_pairs is not None else {
         "n_paired": 0, "n_missing": 0, "missing_ratio": 0.0,
         "mean_diff": None, "median_diff": None,
         "mean_system": None, "mean_baseline": None,
     }
+    paired_diffs: list[float] = []
+    paired_assets: list[str] = []
+    for pair in list(paired_pairs or ()):
+        if not isinstance(pair, Mapping):
+            continue
+        system = _finite_float(pair.get("system"))
+        baseline = _finite_float(pair.get("baseline"))
+        asset = str(pair.get("asset") or "").strip()
+        if system is None or baseline is None:
+            continue
+        paired_diffs.append(system - baseline)
+        paired_assets.append(asset)
+    paired_boot = bootstrap_mean_ci(paired_diffs, paired_assets)
     # Coverage / censor.
     censored = counts["CENSORED"]
     complete = counts["COMPLETE"]
@@ -733,8 +787,11 @@ def build_evaluation_report(
         "censored_retained": bool(censored == 0 or censored > 0),
         "unknown_filled_zero": False,
     }
-    # Bootstrap (assets from explicit list + per-row assets).
-    boot = bootstrap_mean_ci(nets, sorted(asset_set))
+    # Bootstrap needs a label for every complete comparable return. An
+    # external list of distinct assets cannot replace observation labels.
+    if len(list(assets or ())) == len(nets) and len(nets) > 0:
+        net_assets = [str(a).strip() for a in list(assets or ())]
+    boot = bootstrap_mean_ci(nets, net_assets)
     sample_status = boot["status"]
     report: dict[str, Any] = {
         "evidence_version": str(HEDGE_EVIDENCE_VERSION_CURRENT),
@@ -743,6 +800,7 @@ def build_evaluation_report(
         "status_counts": dict(counts),
         "paired": dict(paired),
         "baseline": dict(paired),
+        "paired_bootstrap": dict(paired_boot),
         "coverage": dict(coverage),
         "censored": int(censored),
         "bootstrap": dict(boot),
@@ -756,7 +814,82 @@ def build_evaluation_report(
         ordered = sorted(nets)
         mid = len(ordered) // 2
         report["median_net"] = (ordered[mid - 1] + ordered[mid]) / 2.0
-    # Cost-after risk: unknown without synchronized spot/perp paths.
+    ordered_nets = sorted(nets)
+    report["p05_net_return"] = ordered_nets[int(0.05 * (len(ordered_nets) - 1))] if ordered_nets else None
+    report["known_costs"] = {
+        "priced_outcomes": len(known_fees),
+        "mean_fees_usd": sum(known_fees) / len(known_fees) if known_fees else None,
+        "total_fees_usd": sum(known_fees) if known_fees else None,
+    }
+    report["funding_mark_coverage"] = {
+        "priced_outcomes": len(funding_mark_coverage),
+        "mean": (sum(funding_mark_coverage) / len(funding_mark_coverage))
+        if funding_mark_coverage else None,
+    }
+    report["liquidation_path_coverage"] = {
+        "counts": dict(path_counts),
+        "complete_fraction": (path_counts["COMPLETE"] / sum(path_counts.values())) if sum(path_counts.values()) else None,
+    }
+    report["max_adverse_basis_usd"] = max(adverse_moves) if adverse_moves else None
+    report["max_portfolio_drawdown_usd"] = max(drawdowns) if drawdowns else None
+    report["entry_status_counts"] = entry_counts
+    report["walk_forward"] = _walk_forward_months(items)
+    # This evaluator summarizes frozen outcomes; it has no synchronized
+    # spot/perp path from which to recalculate drawdown after costs.
     report["cost_after_risk"] = None
-    report["risk"] = {"max_drawdown_usd": None, "reason": "SYNCHRONIZED_SPOT_PATH_UNAVAILABLE"}
+    report["risk"] = {
+        "max_drawdown_usd": max(drawdowns) if drawdowns else None,
+        "reason": None if drawdowns else "SYNCHRONIZED_SPOT_PATH_UNAVAILABLE",
+    }
     return report
+
+
+def _walk_forward_months(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe rolling month buckets without claiming fitted model results."""
+    from datetime import datetime, timezone
+
+    monthly: dict[str, dict[str, Any]] = {}
+    for row in items:
+        raw = row.get("as_of_ms", row.get("decision_as_of_ms", row.get("executed_as_of_ms")))
+        try:
+            month = datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc).strftime("%Y-%m")
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        status = str(row.get("status", row.get("outcome_status", "UNAVAILABLE"))).upper()
+        if status not in ("COMPLETE", "PENDING", "CENSORED", "UNAVAILABLE"):
+            status = "UNAVAILABLE"
+        bucket = monthly.setdefault(month, {
+            "status_counts": {"COMPLETE": 0, "PENDING": 0, "CENSORED": 0, "UNAVAILABLE": 0},
+            "net_returns": [],
+        })
+        bucket["status_counts"][status] += 1
+        if status == "COMPLETE":
+            pnl = row.get("pnl") if isinstance(row.get("pnl"), Mapping) else {}
+            net = _finite_float(row.get("net_return", row.get("netReturn", pnl.get("net_return", row.get("net_pnl_usd")))))
+            if net is not None:
+                bucket["net_returns"].append(net)
+    months = sorted(monthly)
+    oos = months[-1] if months else None
+    prior = months[:-1]
+    monthly_reports: dict[str, dict[str, Any]] = {}
+    for month in months:
+        row = monthly[month]
+        returns = sorted(row["net_returns"])
+        n = len(returns)
+        monthly_reports[month] = {
+            "status_counts": dict(row["status_counts"]),
+            "complete_return_count": n,
+            "mean_net_return": sum(returns) / n if n else None,
+            "median_net_return": (
+                returns[n // 2] if n % 2 else (returns[n // 2 - 1] + returns[n // 2]) / 2
+            ) if n else None,
+            "p05_net_return": returns[int(0.05 * (n - 1))] if n else None,
+        }
+    return {
+        "mode": "RULES_ONLY",
+        "calibration_applied": False,
+        "monthly_reports": monthly_reports,
+        "fit_months": prior,
+        "oos_month": oos,
+        "oos_label": "OUT_OF_SAMPLE_RULES_ONLY" if oos and prior else "RULES_ONLY_NO_PRIOR_MONTH",
+    }

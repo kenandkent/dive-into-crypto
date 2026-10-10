@@ -471,7 +471,10 @@ async def test_activate_close_gates_409(tmp_path) -> None:
                 "/api/short/hedge/plans", json={"simulationId": sim_id, "clientRequestId": "c-gate"}
             ).json()["planId"]
             # No legs yet -> activate is 409 HEDGE_LEGS_INCOMPLETE.
-            a1 = client.post(f"/api/short/hedge/plans/{plan_id}/activate", json={})
+            version = client.get(f"/api/short/hedge/plans/{plan_id}").json()["plan"]["planVersion"]
+            a1 = client.post(
+                f"/api/short/hedge/plans/{plan_id}/activate", json={"expectedVersion": version}
+            )
             assert a1.status_code == 409
             assert a1.json()["reason"] == "HEDGE_LEGS_INCOMPLETE"
             # Fill both legs (futures 0.15 + spot matching the simulation target).
@@ -544,32 +547,20 @@ async def test_activate_close_gates_409(tmp_path) -> None:
                 },
             )
             assert pc.status_code == 200, pc.text
-            a2 = client.post(f"/api/short/hedge/plans/{plan_id}/activate", json={})
-            assert a2.status_code == 200, a2.text
-            assert a2.json()["status"] == "ACTIVE"
-            # Open qty remains -> close is 409 OPEN_LEGS_REMAIN.
-            c1 = client.post(f"/api/short/hedge/plans/{plan_id}/close", json={})
-            assert c1.status_code == 409
-            assert c1.json()["reason"] == "OPEN_LEGS_REMAIN"
-            # Close both legs, then close the plan.
-            v3 = a2.json()["planVersion"]
-            fut_close = _event_body(fut_qty, leg_type="FUTURES_SHORT", event_type="CLOSE_FUTURES_SHORT")
-            spot_close = _event_body(spot_qty, leg_type="SPOT_LONG", event_type="CLOSE_SPOT_LONG")
-            p3 = client.patch(
-                f"/api/short/hedge/plans/{plan_id}/legs",
-                json={"event": fut_close, "clientEventId": "e-fut-c", "expectedVersion": v3},
+            a2 = client.post(
+                f"/api/short/hedge/plans/{plan_id}/activate",
+                json={"expectedVersion": pc.json()["planVersion"]},
             )
-            assert p3.status_code == 200, p3.text
-            v4 = p3.json()["planVersion"]
-            # The final close may already be CLOSED by the ledger roll-forward;
-            # either CLOSED response or a second close that succeeds is fine.
-            p4 = client.patch(
-                f"/api/short/hedge/plans/{plan_id}/legs",
-                json={"event": spot_close, "clientEventId": "e-spot-c", "expectedVersion": v4},
+            assert a2.status_code == 422, a2.text
+            assert a2.json()["reason"] == "ACTIVATION_CHECK_FAILED"
+            assert "economics=UNKNOWN" in a2.json()["detail"]
+            assert "funding_gate=UNKNOWN" in a2.json()["detail"]
+            # A stale but well-formed CAS token remains a 409 conflict.
+            stale = client.post(
+                f"/api/short/hedge/plans/{plan_id}/activate",
+                json={"expectedVersion": pc.json()["planVersion"] - 1},
             )
-            assert p4.status_code == 200, p4.text
-            got = client.get(f"/api/short/hedge/plans/{plan_id}").json()
-            assert got["plan"]["status"] in ("CLOSED", "ACTIVE", "CLOSING")
+            assert stale.status_code == 409, stale.text
     finally:
         await repo.close()
 

@@ -1861,6 +1861,61 @@ async def hedge_evidence_summary(request: Request) -> Any:
             out["generatedAt"] = out.pop("generated_at_ms")
         return out
     try:
+        import dataclasses as _dataclasses
+
+        if _dataclasses.is_dataclass(result):
+            summary = _dataclasses.asdict(result)
+            strategy = str(summary.get("strategy") or "")
+            horizon_days = int(summary.get("horizon_days") or 0)
+            report = summary.get("evaluation_report") if isinstance(summary.get("evaluation_report"), Mapping) else {}
+            dimensions = report.get("bucket") if isinstance(report.get("bucket"), Mapping) else {}
+            history_values = dimensions.get("history_class")
+            if isinstance(history_values, (list, tuple)):
+                history_class = ", ".join(str(v) for v in history_values) if history_values else "UNKNOWN"
+            else:
+                history_class = str(history_values or "UNKNOWN")
+            bucket = {
+                "strategy": strategy,
+                "horizon": f"{horizon_days}D",
+                "horizonDays": horizon_days,
+                "cohort": summary.get("cohort") or "MIXED_COHORTS",
+                "historyClass": history_class,
+                "total": int(summary.get("sample_count") or 0),
+                "sampleCount": int(summary.get("sample_count") or 0),
+                "PENDING": int(summary.get("pending_count") or 0),
+                "COMPLETE": int(summary.get("complete_count") or 0),
+                "CENSORED": int(summary.get("censored_count") or 0),
+                "UNAVAILABLE": int(summary.get("unavailable_count") or 0),
+                "meanNetReturn": summary.get("avg_net_return"),
+                "medianNetReturn": summary.get("median_net_return"),
+                "pairedCount": int(summary.get("paired_count") or 0),
+                "pairedMissingCount": int(summary.get("paired_missing_count") or 0),
+                "pairedMeanStrategyReturn": summary.get("paired_mean_strategy_return"),
+                "pairedMeanUnhedgedReturn": summary.get("paired_mean_unhedged_return"),
+                "pairedMeanDiff": summary.get("paired_mean_diff"),
+                "evaluation": report,
+                "sampleStatus": report.get("sample_status"),
+                "subBuckets": [
+                    {
+                        "bucket": dict(item.get("bucket") or {}),
+                        "sampleCount": int(item.get("sample_count") or 0),
+                        "completeCount": int(item.get("complete_count") or 0),
+                        "censoredCount": int(item.get("censored_count") or 0),
+                        "unavailableCount": int(item.get("unavailable_count") or 0),
+                        "pendingCount": int(item.get("pending_count") or 0),
+                        "evaluation": dict(item.get("evaluation") or {}),
+                    }
+                    for item in (report.get("sub_buckets") or [])
+                    if isinstance(item, Mapping)
+                ],
+            }
+            return {
+                "generatedAt": int(_service_now(service)),
+                "filters": dict(filters),
+                "total": bucket["total"],
+                "buckets": [bucket],
+                "summary": summary,
+            }
         return {
             "generatedAt": int(getattr(result, "generated_at_ms", _service_now(service))),
             "filters": dict(getattr(result, "filters", filters) or {}),

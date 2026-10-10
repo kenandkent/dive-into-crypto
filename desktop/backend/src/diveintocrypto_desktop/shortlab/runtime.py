@@ -182,6 +182,7 @@ def build_default_identity_catalog(
     config: ShortLabConfig | None = None,
     *,
     clock: Callable[[], int] | None = None,
+    repository: Any | None = None,
 ) -> Any:
     """Default identity directory: verified set first, network on refresh.
 
@@ -189,8 +190,21 @@ def build_default_identity_catalog(
     verified set keeps serving either way.
     """
     from diveintocrypto_desktop.shortlab.identity.catalog import IdentityCatalog
-
-    return IdentityCatalog(clock=clock)
+    kwargs: dict[str, Any] = {"clock": clock, "repository": repository}
+    try:
+        optimization = getattr(config, "optimization", None)
+        providers = getattr(optimization, "providers", None) if optimization is not None else None
+        cg = providers.get("coingecko") if isinstance(providers, Mapping) else None
+        if cg is not None:
+            monthly = cg.get("account_monthly_limit") if isinstance(cg, Mapping) else getattr(cg, "account_monthly_limit", None)
+            reserve = cg.get("reserve_fraction") if isinstance(cg, Mapping) else getattr(cg, "reserve_fraction", None)
+            if monthly is not None:
+                kwargs["account_monthly_limit"] = int(monthly)
+            if reserve is not None:
+                kwargs["reserve_fraction"] = float(reserve)
+    except Exception:
+        pass
+    return IdentityCatalog(**kwargs)
 
 
 def build_default_quality_policy(config: ShortLabConfig) -> Any:
@@ -510,7 +524,8 @@ class ShortLabRuntime:
                 self._observed_cache = None
         if self._identity_catalog is None:
             try:
-                self._identity_catalog = build_default_identity_catalog(config, clock=self._clock)
+                self._identity_catalog = build_default_identity_catalog(
+                    config, clock=self._clock, repository=self._repository)
             except Exception:
                 self._identity_catalog = None
         if self._quality_policy is None:

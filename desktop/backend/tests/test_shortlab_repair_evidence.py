@@ -360,10 +360,51 @@ def test_insufficient_sample_marked() -> None:
     few_samples = bootstrap_mean_ci([0.01] * 50, assets=[f"a{i}" for i in range(40)])
     assert few_samples["status"] == INSUFFICIENT_SAMPLE
     # Sufficient -> 95% interval present, never auto "model valid".
-    enough = bootstrap_mean_ci([0.01] * 120, assets=[f"a{i}" for i in range(35)])
+    enough = bootstrap_mean_ci([0.01] * 120, assets=[f"a{i % 35}" for i in range(120)])
     assert enough["status"] != INSUFFICIENT_SAMPLE
     assert enough["ci_low"] is not None and enough["ci_high"] is not None
+    assert enough["n_assets"] == 35
     assert "model_valid" not in enough or enough.get("model_valid") is not True
+
+
+def test_asset_cluster_bootstrap_requires_aligned_labels_and_reports_oos_month() -> None:
+    from diveintocrypto_desktop.shortlab.evidence.evaluation import (
+        INSUFFICIENT_SAMPLE,
+        bootstrap_mean_ci,
+        build_evaluation_report,
+    )
+
+    values = [float(i % 30) / 100 for i in range(100)]
+    assets = [f"asset-{i % 30}" for i in range(100)]
+    aligned = bootstrap_mean_ci(values, assets=assets)
+    assert aligned["status"] == "OK"
+    assert aligned["n_assets"] == 30
+    same_coin = build_evaluation_report(outcomes=[
+        {
+            "status": "COMPLETE", "net_return": float(i % 5) / 100,
+            "asset": "BTC", "symbol": "BTCUSDT" if i % 2 else "BTCUSDC",
+            "as_of_ms": 1730419200000,
+        }
+        for i in range(100)
+    ])
+    assert same_coin["bootstrap"]["n_assets"] == 1
+    assert same_coin["bootstrap"]["status"] == INSUFFICIENT_SAMPLE
+    # Counts alone cannot establish asset clustering when observations are
+    # not labeled with their actual asset cluster.
+    mismatched = bootstrap_mean_ci(values, assets=[f"asset-{i}" for i in range(30)])
+    assert mismatched["status"] == INSUFFICIENT_SAMPLE
+    assert mismatched["ci_low"] is None and mismatched["ci_high"] is None
+
+    report = build_evaluation_report(outcomes=[
+        {"status": "COMPLETE", "net_return": 0.02, "asset": "BTC", "decision_id": "d1", "as_of_ms": 1730419200000},
+        {"status": "CENSORED", "asset": "BTC", "decision_id": "d2", "as_of_ms": 1733011200000},
+    ])
+    wf = report["walk_forward"]
+    assert wf["mode"] == "RULES_ONLY"
+    assert wf["calibration_applied"] is False
+    assert wf["oos_month"] == "2024-12"
+    assert wf["oos_label"] == "OUT_OF_SAMPLE_RULES_ONLY"
+    assert "2024-11" in wf["fit_months"]
 
 
 def test_evaluation_report_insufficient_never_claims_edge() -> None:

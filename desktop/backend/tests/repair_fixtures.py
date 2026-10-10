@@ -283,7 +283,13 @@ def make_funding_context(case: str = "valid", **kwargs: Any) -> FundingContext:
         current_observation=context_kwargs.get("current_observation", current_obs),
         last_settled_observation=context_kwargs.get("last_settled_observation", last_obs),
         schedule_refs=tuple(kwargs.get("schedule_refs", ("sched-1",))),
-        input_refs=dict(kwargs.get("input_refs", {"funding": "fcs-MEME_FULL_VALID"})),
+        input_refs=dict(kwargs.get("input_refs", {
+            "funding": "fcs-MEME_FULL_VALID",
+            **({
+                "schedule_checked_at_ms": str(now),
+                "last_expected_slot_ms": str(now - 8 * 3600_000),
+            } if last_obs is not None else {}),
+        })),
     )
 
 

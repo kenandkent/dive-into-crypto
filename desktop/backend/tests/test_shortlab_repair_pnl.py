@@ -9,7 +9,7 @@ futures/spot realised ``40`` each and remaining ``6`` each (via unrealised
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, getcontext, localcontext
 from typing import Any
 
 import pytest
@@ -380,3 +380,123 @@ def test_unknown_exit_cost_nulls_net_after_only() -> None:
     assert pnl.estimated_exit_cost_usd is None
     assert pnl.net_after_exit_usd is None
     assert "UNKNOWN_EXIT_COST" in pnl.unknown_components
+
+
+def test_remaining_entry_basis_matches_moving_average_after_partial_close_and_fx() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.pnl import remaining_open_entry_basis
+
+    events = [
+        {"event_id": "f1", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "100", "price_currency": "USDT"},
+        {"event_id": "f2", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": "3", "native_price": "200", "price_currency": "USDT"},
+        {"event_id": "fc", "leg_type": "FUTURES_SHORT", "event_type": "CLOSE_FUTURES_SHORT",
+         "native_qty": "1.5", "native_price": "190", "price_currency": "USDT"},
+        {"event_id": "s1", "leg_type": "SPOT_LONG", "event_type": "OPEN_SPOT_LONG",
+         "native_qty": "1", "native_price": "10", "price_currency": "USDT"},
+        {"event_id": "s2", "leg_type": "SPOT_LONG", "event_type": "OPEN_SPOT_LONG",
+         "native_qty": "3", "native_price": "20", "price_currency": "USDT"},
+        {"event_id": "sc", "leg_type": "SPOT_LONG", "event_type": "CLOSE_SPOT_LONG",
+         "native_qty": "1", "native_price": "15", "price_currency": "USDT"},
+    ]
+    fx = {
+        "f1": {"price_fx": "1.1"}, "f2": {"price_fx": "1.2"},
+        "fc": {"price_fx": "1.3"},
+        "s1": {"price_fx": "2"}, "s2": {"price_fx": "3"},
+        "sc": {"price_fx": "1.5"},
+    }
+    # Futures remain in native quote units and retain the moving average 175;
+    # spot basis is historical USD cost per unit and remains 50 after close.
+    assert remaining_open_entry_basis(events, fx, "FUTURES_SHORT", "2.5", contract_multiplier="1") == "175"
+    assert remaining_open_entry_basis(events, fx, "SPOT_LONG", "3") == "50"
+    pnl = compute_ledger_pnl(
+        events,
+        {"canonical_id": "test", "contract_multiplier": "1", "multiplier_source": "EXCHANGE"},
+        fx,
+        {"now_ms": FIXTURE_NOW, "futures_mark_native": "175", "futures_quote_fx": "1",
+         "spot_sell_vwap_native": "15", "spot_quote_fx": "1"},
+    )
+    # Moving average 175 gives a $29.25 Futures realized loss on the 1.5
+    # close at 190*1.3; 50 USD spot basis gives the matching realized result.
+    assert pnl.realized_futures_usd == "-29.25"
+    assert pnl.realized_spot_usd == "-27.5"
+
+    corrected = events[:2] + [
+        {"event_id": "fc", "leg_type": "FUTURES_SHORT", "event_type": "CLOSE_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "150", "price_currency": "USDT", "executed_at_ms": 3},
+        {"event_id": "fr", "leg_type": "FUTURES_SHORT", "event_type": "CORRECT_REVERSAL",
+         "reverses_event_id": "fc", "native_qty": "1", "native_price": "150",
+         "price_currency": "USDT", "executed_at_ms": 4},
+    ]
+    assert remaining_open_entry_basis(corrected, fx, "FUTURES_SHORT", "4", contract_multiplier="1") == "175"
+
+
+def test_remaining_entry_basis_reopen_after_partial_close_uses_remaining_inventory_weight() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.pnl import remaining_open_entry_basis
+
+    events = [
+        {"event_id": "open-100", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": "2", "native_price": "100", "price_currency": "USDT", "executed_at_ms": 1},
+        {"event_id": "close-1", "leg_type": "FUTURES_SHORT", "event_type": "CLOSE_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "90", "price_currency": "USDT", "executed_at_ms": 2},
+        {"event_id": "open-200", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "200", "price_currency": "USDT", "executed_at_ms": 3},
+    ]
+    fx = {event["event_id"]: {"price_fx": "1"} for event in events}
+    # Remaining inventory is 1 @ 100 plus 1 @ 200. Closed history cannot stay
+    # in the average denominator (which would incorrectly yield 133.33).
+    assert remaining_open_entry_basis(events, fx, "FUTURES_SHORT", "2", contract_multiplier="1") == "150"
+    ledger = compute_ledger_pnl(
+        events,
+        {"canonical_id": "test", "contract_multiplier": "1", "multiplier_source": "EXCHANGE"},
+        fx,
+        {"now_ms": FIXTURE_NOW, "futures_mark_native": "150", "futures_quote_fx": "1"},
+    )
+    assert ledger.unrealized_futures_usd == "0"
+
+
+def test_remaining_entry_basis_restores_close_and_rejects_zero_cost_full_restore() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.pnl import remaining_open_entry_basis
+
+    opens_and_full_close = [
+        {"event_id": "open", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "100", "price_currency": "USDT", "executed_at_ms": 1},
+        {"event_id": "close", "leg_type": "FUTURES_SHORT", "event_type": "CLOSE_FUTURES_SHORT",
+         "native_qty": "1", "native_price": "90", "price_currency": "USDT", "executed_at_ms": 2},
+        {"event_id": "restore", "leg_type": "FUTURES_SHORT", "event_type": "CORRECT_REVERSAL",
+         "reverses_event_id": "close", "native_qty": "1", "native_price": "90", "price_currency": "USDT", "executed_at_ms": 3},
+    ]
+    fx = {event["event_id"]: {"price_fx": "1"} for event in opens_and_full_close}
+    # compute_ledger_pnl carries full-close reversal inventory with zero cost;
+    # this helper must not misrepresent that unknown basis as a known zero.
+    with pytest.raises(ValueError, match="restore entry basis for empty position"):
+        remaining_open_entry_basis(opens_and_full_close, fx, "FUTURES_SHORT", "1", contract_multiplier="1")
+
+
+def test_remaining_entry_basis_uses_80_digit_context_and_restores_global_precision() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.pnl import remaining_open_entry_basis
+
+    q1 = Decimal("1.000000000000000000000000000000000000001")
+    q2 = Decimal("1")
+    events = [
+        {"event_id": "precision-open-1", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": str(q1), "native_price": "100", "price_currency": "USDT", "executed_at_ms": 1},
+        {"event_id": "precision-open-2", "leg_type": "FUTURES_SHORT", "event_type": "OPEN_FUTURES_SHORT",
+         "native_qty": str(q2), "native_price": "200", "price_currency": "USDT", "executed_at_ms": 2},
+    ]
+    with localcontext() as ctx:
+        ctx.prec = 80
+        expected_qty = q1 + q2
+        expected_value = q1 * Decimal("100") + q2 * Decimal("200")
+        expected = expected_value / expected_qty
+
+    old_precision = getcontext().prec
+    try:
+        getcontext().prec = 10
+        result = remaining_open_entry_basis(
+            events, {}, "FUTURES_SHORT", str(expected_qty), contract_multiplier="1",
+        )
+        assert Decimal(result) == expected
+        assert getcontext().prec == 10
+    finally:
+        getcontext().prec = old_precision

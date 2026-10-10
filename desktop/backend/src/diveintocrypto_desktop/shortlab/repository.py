@@ -2041,6 +2041,35 @@ class ShortLabRepository:
         )
         return None if raw is None else self._identity_from_row(raw)
 
+    async def get_identity_snapshots(
+        self, snapshot_ids: Sequence[str], *, priority: int | None = None,
+        trace: str | None = None,
+    ) -> Mapping[str, IdentitySnapshotRecord]:
+        """Fetch a set of immutable identity snapshots in one repository read."""
+        if isinstance(snapshot_ids, (str, bytes)) or not isinstance(snapshot_ids, Sequence):
+            raise ValidationError("snapshot_ids must be a sequence of non-empty strings")
+        ids = tuple(dict.fromkeys(snapshot_ids))
+        if len(ids) > 1000 or any(not isinstance(value, str) or not value for value in ids):
+            raise ValidationError("snapshot_ids must contain at most 1000 non-empty strings")
+        if not ids:
+            return {}
+        return await self._run(
+            self._get_identity_snapshots_sync, ids, priority=priority, trace=trace,
+        )
+
+    def _get_identity_snapshots_sync(
+        self, snapshot_ids: tuple[str, ...],
+    ) -> Mapping[str, IdentitySnapshotRecord]:
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        rows = self._rows_to_dicts(self._require_con().execute(
+            f"SELECT * FROM sl_identity_snapshot WHERE identity_snapshot_id IN ({placeholders})",
+            list(snapshot_ids),
+        ))
+        return {
+            str(raw["identity_snapshot_id"]): self._identity_from_row(raw)
+            for raw in rows
+        }
+
     # -- contract rules (immutable three-piece set) -------------------------
     @staticmethod
     def _rules_raw(data: dict[str, Any]) -> dict[str, Any]:
@@ -4775,9 +4804,8 @@ class ShortLabRepository:
             {"reason_code"},
             name="hedge_outcome",
         )
-        if data["strategy"] not in ("ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50",
-                                    "RELATIVE_25"):
-            raise ValidationError("strategy must be a fixed hedge strategy")
+        if data["strategy"] not in _R01_STRATEGIES:
+            raise ValidationError(f"strategy must be one of {sorted(_R01_STRATEGIES)}")
         if data["horizon_days"] not in (7, 30, 90):
             raise ValidationError("horizon_days must be 7, 30 or 90")
         if data["outcome_status"] not in ("PENDING", "COMPLETE", "CENSORED",
@@ -4805,8 +4833,44 @@ class ShortLabRepository:
             params = [raw["fcs_snapshot_id"], raw["strategy"], raw["horizon_days"],
                       raw["evidence_version"], raw["cost_config_hash"]]
             self._insert_immutable(con, "sl_hedge_outcome", where, params, raw)
-            # Same-transaction references: outcome -> FCS (+ entry sims).
-            auto_refs = [("FCS", raw["fcs_snapshot_id"], "outcome-fcs")] + list(references)
+            # New Entry outcomes key this field by the exact cohort-qualified
+            # Entry id. Older rows may still key it by source_snapshot_id;
+            # only accept that legacy key when it identifies one Entry.
+            entry_table = con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_name = 'sl_strategy_entry_snapshot'"
+            ).fetchone()[0] > 0
+            exact_entry = (
+                con.execute(
+                    "SELECT entry_id FROM sl_strategy_entry_snapshot WHERE entry_id = ?",
+                    [raw["fcs_snapshot_id"]],
+                ).fetchone()
+                if entry_table else None
+            )
+            if exact_entry is not None:
+                source_ref = ("STRATEGY_ENTRY", str(exact_entry[0]), "outcome-entry")
+            elif self._hedge_ref_exists_sync(con, "FCS", raw["fcs_snapshot_id"]):
+                source_ref = ("FCS", raw["fcs_snapshot_id"], "outcome-fcs")
+            else:
+                # Source-key outcomes are legacy-compatible only while the
+                # source resolves to one Entry. Cohort-qualified Entry ids
+                # are required when the same source/strategy spans cohorts.
+                entries = con.execute(
+                    "SELECT entry_id FROM sl_strategy_entry_snapshot "
+                    "WHERE source_snapshot_id = ? AND strategy = ? "
+                    "ORDER BY decision_as_of_ms ASC, cohort ASC, entry_id ASC",
+                    [raw["fcs_snapshot_id"], raw["strategy"]],
+                ).fetchall() if entry_table else []
+                if not entries:
+                    raise ReferenceNotFoundError(
+                        f"referenced FCS/strategy entry {raw['fcs_snapshot_id']!r} not found"
+                    )
+                if len(entries) != 1:
+                    raise ValidationError(
+                        "legacy outcome source matches multiple cohort Entries; use entry_id"
+                    )
+                source_ref = ("STRATEGY_ENTRY", str(entries[0][0]), "outcome-entry")
+            auto_refs = [source_ref] + list(references)
             for rtype, rid, *_rest in [
                     tuple(r) if isinstance(r, (list, tuple)) else
                     (r.get("referenced_type"), r.get("referenced_id"),
@@ -5228,6 +5292,26 @@ class ShortLabRepository:
             _require_int(known_by_ms, name="known_by_ms"),
             int(max_age_ms),
         )
+
+    async def get_fx_observation(self, fx_id: str) -> Mapping[str, Any] | None:
+        """Read one exact archived FX observation by its immutable id."""
+        if not isinstance(fx_id, str) or not fx_id:
+            raise ValidationError("fx_id must be a non-empty str")
+        return await self._run(self._get_fx_observation_sync, fx_id)
+
+    def _get_fx_observation_sync(self, fx_id: str) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_fx_observation"):
+            return None
+        row = self._fetch_raw(con, "sl_fx_observation", "fx_id = ?", [fx_id])
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["source_json"] = json.loads(result["source_json"]) if isinstance(result.get("source_json"), str) else result.get("source_json")
+        except (TypeError, ValueError):
+            result["source_json"] = {}
+        return result
 
     def _get_fx_at_sync(
         self, currency: str, event_ms: int, known_by_ms: int, max_age_ms: int
@@ -6104,8 +6188,29 @@ class ShortLabRepository:
             self._insert_immutable(
                 con, "sl_strategy_entry_snapshot", "entry_id = ?", [eid], raw
             )
-            if references:
-                self._hedge_insert_refs_sync(con, "STRATEGY_ENTRY", eid, references, dec_asof)
+            auto_refs: list[Any] = list(references)
+            # Entry roots keep their point-in-time identity, quote and FX
+            # evidence. Composite/descriptive identifiers stay in JSON but
+            # do not become retention edges unless an archived row exists.
+            for key, ref_type in (("identity_snapshot_id", "IDENTITY"),
+                                  ("decision_snapshot_id", "DECISION"),
+                                  ("source_snapshot_id", "FCS")):
+                ref_id = parsed_entry.get(key)
+                if isinstance(ref_id, str) and ref_id and self._hedge_ref_exists_sync(con, ref_type, ref_id):
+                    auto_refs.append((ref_type, ref_id, f"entry-{key}"))
+            for key, ref_type in (("fx_refs", "FX"), ("quote_refs", "MARKET_OBSERVATION")):
+                values = parsed_entry.get(key)
+                if not isinstance(values, Mapping):
+                    continue
+                for ref_id in values.values():
+                    if not isinstance(ref_id, str) or not ref_id:
+                        continue
+                    if self._hedge_ref_exists_sync(con, ref_type, ref_id):
+                        auto_refs.append((ref_type, ref_id, f"entry-{key}"))
+                    elif key == "quote_refs" and self._hedge_ref_exists_sync(con, "VENUE_QUOTE", ref_id):
+                        auto_refs.append(("VENUE_QUOTE", ref_id, "entry-venue-quote"))
+            if auto_refs:
+                self._hedge_insert_refs_sync(con, "STRATEGY_ENTRY", eid, auto_refs, dec_asof)
             con.execute("COMMIT")
         except Exception:
             try:
@@ -6123,6 +6228,65 @@ class ShortLabRepository:
             _require_int(start_ms, name="start_ms"),
             _require_int(end_ms, name="end_ms"),
         )
+
+    async def get_strategy_entry(
+        self, source_snapshot_id: str, strategy: str, cohort: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Fetch one source/strategy Entry, refusing cross-cohort ambiguity."""
+        if not isinstance(source_snapshot_id, str) or not source_snapshot_id:
+            raise ValidationError("source_snapshot_id must be a non-empty str")
+        if strategy not in _R01_STRATEGIES:
+            raise ValidationError(f"strategy={strategy!r} must be one of {sorted(_R01_STRATEGIES)}")
+        if cohort is not None and cohort not in _R01_COHORTS:
+            raise ValidationError(f"cohort={cohort!r} must be one of {sorted(_R01_COHORTS)}")
+        return await self._run(self._get_strategy_entry_sync, source_snapshot_id, strategy, cohort)
+
+    async def get_strategy_entry_by_id(self, entry_id: str) -> Mapping[str, Any] | None:
+        """Fetch one immutable Entry using its exact cohort-qualified id."""
+        if not isinstance(entry_id, str) or not entry_id:
+            raise ValidationError("entry_id must be a non-empty str")
+        return await self._run(self._get_strategy_entry_by_id_sync, entry_id)
+
+    def _get_strategy_entry_by_id_sync(self, entry_id: str) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_strategy_entry_snapshot"):
+            return None
+        rows = self._rows_to_dicts(con.execute(
+            "SELECT * FROM sl_strategy_entry_snapshot WHERE entry_id = ?", [entry_id],
+        ))
+        if not rows:
+            return None
+        result = dict(rows[0])
+        try:
+            result["entry_json"] = json.loads(result["entry_json"]) if isinstance(result.get("entry_json"), str) else result.get("entry_json")
+        except (TypeError, ValueError):
+            result["entry_json"] = {}
+        return result
+
+    def _get_strategy_entry_sync(
+        self, source_snapshot_id: str, strategy: str, cohort: str | None,
+    ) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_strategy_entry_snapshot"):
+            return None
+        clauses = ["source_snapshot_id = ?", "strategy = ?"]
+        params: list[Any] = [source_snapshot_id, strategy]
+        if cohort is not None:
+            clauses.append("cohort = ?")
+            params.append(cohort)
+        rows = self._rows_to_dicts(con.execute(
+            "SELECT * FROM sl_strategy_entry_snapshot WHERE " + " AND ".join(clauses) +
+            " ORDER BY cohort ASC, decision_as_of_ms ASC, entry_id ASC",
+            params,
+        ))
+        if not rows or (cohort is None and len(rows) != 1):
+            return None
+        result = dict(rows[0])
+        try:
+            result["entry_json"] = json.loads(result["entry_json"]) if isinstance(result.get("entry_json"), str) else result.get("entry_json")
+        except (TypeError, ValueError):
+            result["entry_json"] = {}
+        return result
 
     def _list_strategy_entries_sync(
         self, cohort: str, start_ms: int, end_ms: int
@@ -6246,6 +6410,72 @@ class ShortLabRepository:
             )
         return tid
 
+    async def get_strategy_quote_task(self, task_id: str) -> Mapping[str, Any] | None:
+        """Read one persisted EXIT task and its decoded frozen result."""
+        if not isinstance(task_id, str) or not task_id:
+            raise ValidationError("task_id must be a non-empty str")
+        return await self._run(self._get_strategy_quote_task_sync, task_id)
+
+    def _get_strategy_quote_task_sync(self, task_id: str) -> Mapping[str, Any] | None:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_strategy_quote_task"):
+            return None
+        row = self._fetch_raw(con, "sl_strategy_quote_task", "task_id = ?", [task_id])
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["task_json"] = json.loads(result["task_json"]) if isinstance(result.get("task_json"), str) else (result.get("task_json") or {})
+        except (TypeError, ValueError):
+            result["task_json"] = {}
+        return result
+
+    async def list_strategy_quote_tasks(
+        self, entry_id: str | None, start_ms: int, end_ms: int,
+        limit: int = 200, offset: int = 0,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """List archived EXIT tasks by parent Entry and due-time window."""
+        start = _require_int(start_ms, name="start_ms")
+        end = _require_int(end_ms, name="end_ms")
+        if start > end:
+            raise ValidationError("start_ms must be <= end_ms")
+        if entry_id is not None and (not isinstance(entry_id, str) or not entry_id):
+            raise ValidationError("entry_id must be a non-empty str or None")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValidationError("limit must be an int in 1..1000")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValidationError("offset must be an int >= 0")
+        return await self._run(
+            self._list_strategy_quote_tasks_sync, entry_id, start, end, limit, offset,
+        )
+
+    def _list_strategy_quote_tasks_sync(
+        self, entry_id: str | None, start_ms: int, end_ms: int,
+        limit: int, offset: int,
+    ) -> tuple[Mapping[str, Any], ...]:
+        con = self._require_con()
+        if not self._r01_table_exists(con, "sl_strategy_quote_task"):
+            return ()
+        where = "due_ms >= ? AND due_ms <= ?"
+        params: list[Any] = [start_ms, end_ms]
+        if entry_id is not None:
+            where += " AND entry_id = ?"
+            params.append(entry_id)
+        cur = con.execute(
+            "SELECT * FROM sl_strategy_quote_task WHERE " + where +
+            " ORDER BY due_ms ASC, task_id ASC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        out: list[dict[str, Any]] = []
+        for row in self._rows_to_dicts(cur):
+            d = dict(row)
+            try:
+                d["task_json"] = json.loads(d["task_json"]) if isinstance(d.get("task_json"), str) else (d.get("task_json") or {})
+            except (TypeError, ValueError):
+                d["task_json"] = {}
+            out.append(d)
+        return tuple(out)
+
     async def claim_due_quote_tasks(
         self, as_of_ms: int, limit: int = 20
     ) -> tuple[Mapping[str, Any], ...]:
@@ -6343,30 +6573,57 @@ class ShortLabRepository:
             raise ValidationError("result must be a mapping")
         con = self._require_con()
         self._r01_require_r01_tables(con, ("sl_strategy_quote_task",))
-        row = self._fetch_raw(con, "sl_strategy_quote_task", "task_id = ?", [task_id])
-        if row is None:
-            raise ReferenceNotFoundError(f"quote task {task_id!r} not found")
-        if row["status"] != "RUNNING":
-            raise ValidationError(
-                f"quote task {task_id!r} must be RUNNING to finish (got {row['status']!r})"
-            )
+        con.execute("BEGIN TRANSACTION")
         try:
-            tj = json.loads(row["task_json"]) if isinstance(row["task_json"], str) else (row["task_json"] or {})
-        except (TypeError, ValueError):
-            tj = {}
-        if not isinstance(tj, dict):
-            tj = {}
-        merged = dict(tj)
-        for k, v in dict(result).items():
-            merged[k] = v
-        merged["finish_status"] = status
-        now_ms = time.time_ns() // 1_000_000
-        new_text = _canonical_json(merged)
-        con.execute(
-            "UPDATE sl_strategy_quote_task SET status = ?, task_json = ?, "
-            "updated_at_ms = ? WHERE task_id = ?",
-            [status, new_text, now_ms, task_id],
-        )
+            row = self._fetch_raw(con, "sl_strategy_quote_task", "task_id = ?", [task_id])
+            if row is None:
+                raise ReferenceNotFoundError(f"quote task {task_id!r} not found")
+            if row["status"] != "RUNNING":
+                raise ValidationError(
+                    f"quote task {task_id!r} must be RUNNING to finish (got {row['status']!r})"
+                )
+            try:
+                tj = json.loads(row["task_json"]) if isinstance(row["task_json"], str) else (row["task_json"] or {})
+            except (TypeError, ValueError):
+                tj = {}
+            if not isinstance(tj, dict):
+                tj = {}
+            merged = dict(tj)
+            for k, v in dict(result).items():
+                merged[k] = v
+            merged["finish_status"] = status
+            now_ms = time.time_ns() // 1_000_000
+            new_text = _canonical_json(merged)
+            con.execute(
+                "UPDATE sl_strategy_quote_task SET status = ?, task_json = ?, "
+                "updated_at_ms = ? WHERE task_id = ?",
+                [status, new_text, now_ms, task_id],
+            )
+            # Quote-task evidence remains attached to its Entry root so the
+            # raw market/FX observations survive retention with the outcome.
+            refs: list[tuple[str, str, str]] = []
+            for key, rtype in (("quote_refs", "MARKET_OBSERVATION"), ("fx_refs", "FX")):
+                values = merged.get(key)
+                if not isinstance(values, Mapping):
+                    continue
+                for rid in values.values():
+                    if not isinstance(rid, str) or not rid:
+                        continue
+                    if self._hedge_ref_exists_sync(con, rtype, rid):
+                        refs.append((rtype, rid, f"quote-task-{key}"))
+                    elif key == "quote_refs" and self._hedge_ref_exists_sync(con, "VENUE_QUOTE", rid):
+                        refs.append(("VENUE_QUOTE", rid, "quote-task-venue"))
+            if refs:
+                self._hedge_insert_refs_sync(
+                    con, "STRATEGY_ENTRY", str(row["entry_id"]), refs, now_ms,
+                )
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         return None
 
     # -- crash recovery ------------------------------------------------------------

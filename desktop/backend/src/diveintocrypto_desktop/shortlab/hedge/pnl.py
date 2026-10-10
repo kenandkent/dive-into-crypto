@@ -35,7 +35,7 @@ from typing import Any, Mapping, Sequence
 
 from diveintocrypto_desktop.shortlab.repair_contracts import LedgerPnl
 
-__all__ = ["compute_ledger_pnl"]
+__all__ = ["compute_ledger_pnl", "remaining_open_entry_basis"]
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +135,143 @@ def _to_event_dict(raw: Any) -> dict[str, Any]:
             data[snake] = v
         return data
     raise ValueError("hedge event must be a mapping or frozen DTO")
+
+
+def remaining_open_entry_basis(
+    events: Sequence[Any],
+    event_fx: Mapping[str, Mapping[str, Any]],
+    leg_type: str,
+    remaining_qty: Any,
+    *,
+    contract_multiplier: Any = None,
+) -> str:
+    """Compute the frozen moving-average basis under the ledger's precision contract."""
+    with localcontext() as ctx:
+        ctx.prec = 80
+        return _remaining_open_entry_basis_core(
+            events, event_fx, leg_type, remaining_qty,
+            contract_multiplier=contract_multiplier,
+        )
+
+
+def _remaining_open_entry_basis_core(
+    events: Sequence[Any],
+    event_fx: Mapping[str, Mapping[str, Any]],
+    leg_type: str,
+    remaining_qty: Any,
+    *,
+    contract_multiplier: Any = None,
+) -> str:
+    """Return the current moving weighted-average entry basis per unit.
+
+    Futures basis remains in native quote-price units; the scenario evaluator
+    applies the shocked current quote FX to the native-price spread. Spot
+    basis is historical USD cost per canonical unit, using each opening event's
+    frozen price FX. Partial closes reduce quantity without changing the
+    weighted average, matching :func:`compute_ledger_pnl`.
+    """
+    if leg_type not in ("FUTURES_SHORT", "SPOT_LONG"):
+        raise ValueError("leg_type must be FUTURES_SHORT or SPOT_LONG")
+    remain = _parse_decimal(remaining_qty, "remaining_qty")
+    if remain <= 0:
+        raise ValueError("remaining_qty must be > 0")
+    if not isinstance(event_fx, Mapping):
+        raise ValueError("event_fx must be a mapping")
+
+    def _effective_basis_qty(event: Mapping[str, Any]) -> Decimal:
+        for key in ("net_qty", "canonical_qty", "native_qty", "gross_qty"):
+            raw = event.get(key)
+            if raw is None or not str(raw).strip():
+                continue
+            qty = _parse_decimal(raw, key)
+            if leg_type == "FUTURES_SHORT" and key != "native_qty":
+                if contract_multiplier is None:
+                    raise ValueError("futures basis requires verified multiplier")
+                qty = qty / _parse_decimal(contract_multiplier, "contract_multiplier")
+            return qty
+        raise ValueError("entry event has no effective quantity")
+    current_qty = Decimal(0)
+    entry_value = Decimal(0)
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(events or ()):
+        event = _to_event_dict(raw)
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            event_id = f"basis-{index}"
+            event["event_id"] = event_id
+        event["event_type"] = _canonicalise_event_type(event.get("event_type"), event.get("leg_type"), event)
+        event["_basis_sort"] = event.get("executed_at_ms") if isinstance(event.get("executed_at_ms"), int) else 0
+        normalized.append(event)
+    normalized.sort(key=lambda item: (int(item["_basis_sort"]), str(item["event_id"])))
+    by_id = {str(event["event_id"]): event for event in normalized}
+    reversed_ids: set[str] = set()
+    for event in normalized:
+        target = event.get("reverses_event_id") or event.get("supersedes_event_id")
+        if target is not None:
+            if not isinstance(target, str) or not target or target in reversed_ids:
+                raise ValueError("invalid or duplicate correction target")
+            reversed_ids.add(target)
+    for event in normalized:
+        if str(event.get("leg_type") or "").upper() != leg_type:
+            continue
+        event_type = str(event.get("event_type") or "").upper()
+        if event_type == "FUNDING_RECEIPT":
+            continue
+        if event_type in ("OPEN_FUTURES_SHORT", "OPEN_SPOT_LONG"):
+            if event_type != f"OPEN_{leg_type}":
+                continue
+            qty = _effective_basis_qty(event)
+            price = _parse_decimal(event.get("native_price"), "open.native_price")
+            if qty <= 0 or price <= 0:
+                raise ValueError("open fill qty/price must be positive")
+            if leg_type == "FUTURES_SHORT":
+                unit_basis = price
+            else:
+                currency = str(event.get("price_currency") or "").upper()
+                if currency == "USD":
+                    fx = Decimal(1)
+                else:
+                    event_id = str(event.get("event_id") or "")
+                    fx_row = event_fx.get(event_id)
+                    fx = _parse_decimal(fx_row.get("price_fx"), "open.price_fx") if isinstance(fx_row, Mapping) and fx_row.get("price_fx") is not None else None
+                    if fx is None or fx <= 0:
+                        raise ValueError("spot open fill price FX is unknown")
+                unit_basis = price * fx
+            current_qty += qty
+            entry_value += qty * unit_basis
+        elif event_type in (f"CLOSE_{leg_type}", "LIQUIDATION"):
+            qty = _effective_basis_qty(event)
+            if qty <= 0 or qty > current_qty:
+                raise ValueError("close fill quantity is outside open position")
+            if current_qty <= 0:
+                raise ValueError("cannot close an empty position")
+            average = entry_value / current_qty
+            entry_value -= qty * average
+            current_qty -= qty
+        elif event_type in ("CORRECT_REVERSAL", "CORRECT_SUPERSEDE"):
+            target = event.get("reverses_event_id") or event.get("supersedes_event_id")
+            target_event = by_id.get(target) if isinstance(target, str) else None
+            target_type = str((target_event or {}).get("event_type") or "").upper()
+            qty = _effective_basis_qty(event)
+            if qty <= 0:
+                raise ValueError("correction fill quantity must be positive")
+            if target_type in (f"CLOSE_{leg_type}", "LIQUIDATION"):
+                if current_qty <= 0:
+                    raise ValueError("cannot restore entry basis for empty position")
+                average = entry_value / current_qty
+                current_qty += qty
+                entry_value += qty * average
+            else:
+                if qty > current_qty or current_qty <= 0:
+                    raise ValueError("correction reverses more than open quantity")
+                average = entry_value / current_qty
+                current_qty -= qty
+                entry_value -= qty * average
+        else:
+            raise ValueError(f"unsupported entry event type: {event_type}")
+    if current_qty != remain or current_qty <= 0:
+        raise ValueError("open/close quantities do not match remaining position")
+    return _fmt(entry_value / current_qty)
 
 
 def _canonicalise_event_type(event_type: Any, leg_type: Any, data: Mapping[str, Any]) -> Any:

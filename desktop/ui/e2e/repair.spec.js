@@ -60,7 +60,8 @@ async function createPlanViaApi(request, tag) {
 test.describe('R15b repair browser (real React)', () => {
   test('plan switch: B never shows A data (late A ignored)', async ({ page, request }) => {
     test.setTimeout(30_000);
-    await harnessState(request);
+    const state = await harnessState(request);
+    await page.addInitScript((nowMs) => { Date.now = () => nowMs; }, state.nowMs + 1_000);
     await switchScenario(request, 'plan-switch');
     const a = await createPlanViaApi(request, 'switch-a');
     const b = await createPlanViaApi(request, 'switch-b');
@@ -76,13 +77,47 @@ test.describe('R15b repair browser (real React)', () => {
     // response never overwrites B.
     const planInput = page.getByLabel('plan id');
     await expect(planInput).toBeVisible({ timeout: 10_000 });
+    const planAResponse = page.waitForResponse((response) =>
+      response.url().endsWith(`/api/short/hedge/plans/${a.savedPlanId}`) && response.status() === 200,
+      { timeout: 10_000 },
+    );
     await planInput.fill(a.savedPlanId);
     await page.getByRole('button', { name: /RETRY/i }).first().click();
     await expect(page.getByTestId('hedge-monitor-status')).toBeVisible({ timeout: 10_000 });
+    const loadedA = await (await planAResponse).json();
+    expect(Number((loadedA.plan || loadedA).planVersion)).toBeGreaterThanOrEqual(1);
     // Switch to B (real routing, no mock).
+    let planBDelayed = false;
+    let releasePlanB;
+    const planBGate = new Promise((resolve) => { releasePlanB = resolve; });
+    await page.route(`**/api/short/hedge/plans/${b.savedPlanId}`, async (route) => {
+      planBDelayed = true;
+      const response = await route.fetch();
+      await planBGate;
+      await route.fulfill({ response });
+    });
+    let writesDuringSwitch = 0;
+    page.on('request', (r) => {
+      if (r.method() !== 'GET' && /\/api\/short\/hedge\/plans\/[^/]+\/(activate|close|legs)$/.test(r.url())) {
+        writesDuringSwitch += 1;
+      }
+    });
     await planInput.fill(b.savedPlanId);
     await page.getByRole('button', { name: /RETRY/i }).first().click();
+    await expect.poll(() => planBDelayed).toBe(true);
+    const activate = page.getByRole('button', { name: /激活/i });
+    const close = page.getByRole('button', { name: /关闭/i });
+    const apply = page.getByRole('button', { name: /登记|apply/i });
+    try {
+      await expect(page.getByTestId('hedge-monitor-loading')).toBeVisible();
+      await expect(activate).toHaveCount(0);
+      await expect(close).toHaveCount(0);
+      await expect(apply).toHaveCount(0);
+    } finally {
+      releasePlanB();
+    }
     await expect(page.getByTestId('hedge-monitor')).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => writesDuringSwitch).toBe(0);
     // Backend isolation: legs on A never appear on B (no cross-plan write).
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(500);
@@ -103,6 +138,68 @@ test.describe('R15b repair browser (real React)', () => {
       data: { symbol: 'NOPEUSDT', mode: 'ABSOLUTE', futuresNotionalUsd: '0', preferredSpotVenue: 'AUTO' },
     });
     expect([400, 422, 404, 503].includes(bad.status())).toBeTruthy();
+  });
+
+  test('poll failure after a successful load disables every write without sending one', async ({ page, request }) => {
+    test.setTimeout(30_000);
+    const state = await harnessState(request);
+    // Backend fixture quotes use the harness clock. Align the browser's
+    // expiry check to that same clock rather than making the seeded quotes
+    // appear stale against wall time.
+    const freshNowMs = state.nowMs + 1_000;
+    await page.addInitScript((nowMs) => { Date.now = () => nowMs; }, freshNowMs);
+    const { savedPlanId } = await createPlanViaApi(request, 'poll-error');
+    await page.goto(`${ORIGIN}/#/shortlab/monitor`);
+    const planInput = page.getByLabel('plan id');
+    const planResponse = page.waitForResponse((response) =>
+      response.url().endsWith(`/api/short/hedge/plans/${savedPlanId}`) && response.status() === 200,
+      { timeout: 10_000 },
+    );
+    const monitorResponse = page.waitForResponse((response) =>
+      response.url().endsWith(`/api/short/hedge/plans/${savedPlanId}/monitor`) && response.status() === 200,
+      { timeout: 10_000 },
+    );
+    await planInput.fill(savedPlanId);
+    await page.getByRole('button', { name: /RETRY/i }).first().click();
+    await expect(page.getByTestId('hedge-monitor-status')).toBeVisible({ timeout: 10_000 });
+    await expect(planInput).toHaveValue(savedPlanId);
+    const loadedPlanReply = await planResponse;
+    const loadedPlanBody = await loadedPlanReply.json();
+    const loadedPlan = loadedPlanBody.plan || loadedPlanBody;
+    expect(Number(loadedPlan.planVersion || loadedPlan.plan_version)).toBeGreaterThanOrEqual(1);
+    const loadedMonitorReply = await monitorResponse;
+    const loadedMonitor = await loadedMonitorReply.json();
+    expect(loadedMonitor.planId).toBe(savedPlanId);
+    const activate = page.getByRole('button', { name: /激活/i });
+    const close = page.getByRole('button', { name: /关闭/i });
+    const apply = page.getByRole('button', { name: /登记|apply/i });
+    await expect(activate).toBeEnabled();
+    await expect(close).toBeEnabled();
+    await expect(apply).toBeEnabled();
+
+    let writeRequests = 0;
+    page.on('request', (r) => {
+      if (r.method() !== 'GET' && /\/api\/short\/hedge\/plans\/[^/]+\/(activate|close|legs)$/.test(r.url())) {
+        writeRequests += 1;
+      }
+    });
+    let pollFailed = false;
+    await page.route(`**/api/short/hedge/plans/${savedPlanId}/monitor`, (route) => {
+      pollFailed = true;
+      return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'temporary failure' }) });
+    });
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect.poll(() => pollFailed, { timeout: 10_000 }).toBe(true);
+    await expect(page.locator('[data-testid="hedge-monitor-kept-stale"], [data-testid="hedge-monitor-stale"]'))
+      .toBeVisible({ timeout: 5_000 });
+
+    await expect(activate).toBeDisabled();
+    await expect(close).toBeDisabled();
+    await expect(apply).toBeDisabled();
+    await activate.evaluate((button) => button.click());
+    await close.evaluate((button) => button.click());
+    await apply.evaluate((button) => button.click());
+    expect(writeRequests).toBe(0);
   });
 
   test('10s risk: single-leg + clock advance keeps honest monitor', async ({ page, request }) => {
@@ -160,6 +257,37 @@ test.describe('R15b repair browser (real React)', () => {
     const opps = await (await request.get(`${ORIGIN}/api/short/funding-opportunities?limit=5`)).json();
     expect(typeof opps.total).toBe('number');
     expect(Array.isArray(opps.items)).toBeTruthy();
+  });
+
+  test('hedge evidence endpoint renders its summary bucket in React', async ({ page, request }) => {
+    test.setTimeout(30_000);
+    const response = await request.get(`${ORIGIN}/api/short/hedge/evidence/summary`);
+    expect(response.status()).toBe(200);
+    const summary = await response.json();
+    expect(Array.isArray(summary.buckets)).toBeTruthy();
+    expect(summary.buckets.length).toBe(1);
+    const bucket = summary.buckets[0];
+    expect(bucket.strategy).toBe('ABSOLUTE_100');
+    expect(bucket.total).toBeGreaterThanOrEqual(0);
+
+    await page.goto(`${ORIGIN}/#/shortlab/monitor`);
+    await expect(page.getByTestId('shortlab-shell')).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId('shortlab-tab-evidence').click();
+    await expect(page.getByTestId('shortlab-evidence-tab-hedge')).toBeVisible({ timeout: 10_000 });
+    const uiResponse = page.waitForResponse((r) =>
+      r.url().includes('/api/short/hedge/evidence/summary') && r.status() === 200,
+      { timeout: 10_000 },
+    );
+    await page.getByTestId('shortlab-evidence-tab-hedge').click();
+    const renderedResponse = await uiResponse;
+    const renderedSummary = await renderedResponse.json();
+    expect(renderedSummary.buckets.length).toBe(1);
+    await expect(page.getByTestId('hedge-evidence-empty')).toHaveCount(0);
+    await expect(page.getByTestId(`hedge-evidence-bucket-${renderedSummary.buckets[0].strategy}-${renderedSummary.buckets[0].horizon}`)).toBeVisible();
+    await expect(page.getByTestId('hedge-evidence-evaluation')).toBeVisible();
+    await expect(page.getByTestId('hedge-evidence-evaluation')).toContainText(
+      renderedSummary.buckets[0].sampleStatus || 'INSUFFICIENT_SAMPLE',
+    );
   });
 
   test('load: repeated plan creation stays bounded (60s)', async ({ request }) => {

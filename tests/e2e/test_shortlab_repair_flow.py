@@ -183,22 +183,31 @@ def isolated_server(tmp_path_factory):
             pass
 
 
-def _decision_body(now_ms: int) -> dict:
+def _decision_body(
+    now_ms: int,
+    *,
+    symbol: str = "1000PEPEUSDT",
+    liquidation_price: str = "0.025",
+    max_scenario_loss_usd: str = "1000",
+) -> dict:
     return {
-        "symbol": "1000PEPEUSDT",
+        "symbol": symbol,
         "goal": "CARRY_CAPTURE",
         "futuresNotionalUsd": "10000",
         "plannedHoldDays": 30,
         "availableCapitalUsd": "25000",
-        "maxScenarioLossUsd": "1000",
+        "maxScenarioLossUsd": max_scenario_loss_usd,
         "marginUsd": "12000",
-        "liquidationPrice": "0.025",
+        "liquidationPrice": liquidation_price,
         "liquidationPriceUpdatedAtMs": int(now_ms) - 3_600_000,
         "preferredSpotVenue": "AUTO",
     }
 
 
 def _evt(leg: str, typ: str, qty: str, price: str, now_ms: int) -> dict:
+    # USER_ENTERED executions include their reported fee so the real ledger
+    # can resolve actual entry economics before activation.
+    fee_usd = str(Decimal(str(qty)) * Decimal(str(price)) * Decimal("0.0005"))
     return {
         "schema_version": "hedge-event-v1",
         "leg_type": leg,
@@ -209,8 +218,8 @@ def _evt(leg: str, typ: str, qty: str, price: str, now_ms: int) -> dict:
         "price_currency": "USDT",
         "fee_currency": None,
         "fee_amount": None,
-        "fee_usd": None,
-        "gas_usd": None,
+        "fee_usd": fee_usd,
+        "gas_usd": "0",
         "source": "USER_ENTERED",
         "executed_at_ms": int(now_ms),
         "gross_qty": str(qty),
@@ -226,17 +235,23 @@ def _seed_funding(symbol: str, rate: str | float, days: int, interval_hours: int
     return body
 
 
-def _simulate_btc(now_ms: int) -> dict:
+def _simulate_btc(now_ms: int, decision_id: str | None = None) -> dict:
     # Honest BTC simulate with liquidation + stop binding (hash-aligned with
-    # protection triggerPrice 70000 / MARK so six-item protection can PASS).
-    return {
+    # protection triggerPrice 70000 / MARK. The liquidation level leaves room
+    # for the real configured upside stress cases instead of making them all
+    # liquidation-crossing scenarios.
+    body = {
         "symbol": "BTCUSDT", "mode": "ABSOLUTE",
-        "futuresNotionalUsd": "10000", "preferredSpotVenue": "AUTO",
-        "liquidationPrice": "70000",
+        "futuresNotionalUsd": "10000", "plannedHoldDays": 30,
+        "preferredSpotVenue": "AUTO",
+        "liquidationPrice": "150000",
         "liquidationPriceUpdatedAtMs": int(now_ms) - 3_600_000,
         "stopTriggerPrice": "70000",
         "stopTriggerBasis": "MARK",
     }
+    if decision_id:
+        body["decisionId"] = decision_id
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -361,9 +376,23 @@ def _full_chain_once(tag: str, scenario: str):
     # Decision (1000PEPE valid request shape).
     st, dec = _post("/api/short/hedge/decisions", _decision_body(now_ms))
     assert st == 201, f"{tag} decision {dec}"
+    btc_decision_id = None
+    if scenario not in ("negative-funding", "unknown-schedule"):
+        st, btc_decision = _post(
+            "/api/short/hedge/decisions",
+            _decision_body(now_ms, symbol="BTCUSDT", liquidation_price="150000",
+                           max_scenario_loss_usd="2000"),
+        )
+        assert st == 201, f"{tag} BTC decision {btc_decision}"
+        btc_decision_id = btc_decision.get("decisionId") or btc_decision.get("decision_id")
+        assert btc_decision_id
     # Simulation (BTC ABSOLUTE with liquidationPrice/UpdatedAtMs + stop binding).
-    st, sim = _post("/api/short/hedge/simulate", _simulate_btc(now_ms))
+    st, sim = _post("/api/short/hedge/simulate", _simulate_btc(now_ms, btc_decision_id))
     assert st == 200, f"{tag} simulate {sim}"
+    st, transport_state = _get("/test/harness/state")
+    assert st == 200
+    assert transport_state["rawHttpSendCount"] > 0
+    assert transport_state["actualBudgetSendCount"] > 0, transport_state
     sim_id = sim.get("simulationId") or sim.get("simulation_id")
     assert sim_id
     st, sim_get = _get(f"/api/short/hedge/simulations/{sim_id}")
@@ -424,7 +453,7 @@ def _full_chain_once(tag: str, scenario: str):
     # Stale version activate -> strict 409 (CR20: stale-200 no longer accepted).
     st, _stale = _post(f"/api/short/hedge/plans/{pid}/activate", {"expected_version": 999999})
     assert st == 409, f"stale activate must be 409, got {st} {_stale}"
-    st, act = _post(f"/api/short/hedge/plans/{pid}/activate", {})
+    st, act = _post(f"/api/short/hedge/plans/{pid}/activate", {"expected_version": pver})
     if scenario == "negative-funding":
         assert st == 422, f"{tag} negative activate must be 422, got {st} {act}"
         detail = str(act.get("detail") or act.get("error") or "")
@@ -506,7 +535,8 @@ def _full_chain_once(tag: str, scenario: str):
         "client_event_id": f"e-{tag}-cs2", "expected_version": ver,
     })
     assert st == 200, c4
-    st, closed = _post(f"/api/short/hedge/plans/{pid}/close", {})
+    ver = c4.get("planVersion", ver + 1)
+    st, closed = _post(f"/api/short/hedge/plans/{pid}/close", {"expected_version": ver})
     assert st == 200, closed
     assert closed.get("status") == "CLOSED"
     return {"planId": pid, "scenario": scenario}
@@ -746,7 +776,7 @@ def test_r15b_evidence_six_strategies_clock(tmp_path):
             clock_ms = int(FIXTURE_NOW)
             out = await capture_strategy_entries(cap, repo, _Market(), _evidence_ctx())
             assert out.status == "COMPLETE"
-            assert tuple(out.entry_ids) == tuple(f"dec-R15B-E2E:{s}" for s in strategies)
+            assert tuple(out.entry_ids) == tuple(f"USER_DECISION:dec-R15B-E2E:{s}" for s in strategies)
             rows = await repo.list_strategy_entries("USER_DECISION", int(FIXTURE_NOW) - 1000, int(FIXTURE_NOW) + 30000)
             mine = [r for r in rows if r.get("source_snapshot_id") == "dec-R15B-E2E"]
             assert len(mine) == 6

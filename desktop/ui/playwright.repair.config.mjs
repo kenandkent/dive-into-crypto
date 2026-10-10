@@ -1,11 +1,15 @@
 import { defineConfig } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
 const backendDir = join(repoRoot, 'desktop', 'backend');
-const dataDir = join(here, 'test', '.tmp', 'repair-browser-data');
+// Each Playwright invocation gets a fresh repository. The acceptance FakeClock
+// is intentionally deterministic, so sharing a DB across runs would reuse the
+// same immutable simulation ids and turn a valid replay into a snapshot conflict.
+const dataDir = join(here, 'test', '.tmp', `repair-browser-data-${randomUUID()}`);
 
 // R15b repair browser acceptance (D16/D19, V12).
 // - outputDir test/.tmp/repair-browser (project-local, git-ignored)

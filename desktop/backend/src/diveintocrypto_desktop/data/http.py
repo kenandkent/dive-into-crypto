@@ -11,7 +11,7 @@ place the base URL is defined. Only that explicit mirror origin shares the
 fapi budget; any other host never inherits fapi rights (D19.3).
 
 R11a (D11/D19.3/D19.4): budgeted sends resolve ``host + full path`` to a
-versioned family (``endpoint-weights-v2``), validate limit buckets, deny
+versioned family (``endpoint-weights-v3``), validate limit buckets, deny
 unknown host/path/limit as ``UNBUDGETED_ENDPOINT`` without transport, check
 ``deadline_ms`` before each transport, count one real transport per permit
 (retry = new permit/ID, cache never reserves), and re-read the UTC month
@@ -291,7 +291,7 @@ async def get_json(
     page) atomically reserves via ``try_acquire`` and is recorded by
     ``Permit.mark_sent``; cancellation before the send releases, an
     already-sent attempt is never refunded. Unknown host/path/limit
-    (``endpoint-weights-v2``) raises :class:`UnbudgetedEndpointError`
+    (``endpoint-weights-v3``) raises :class:`UnbudgetedEndpointError`
     without sending; unknown ``job_type`` raises ``BudgetExhausted`` with
     ``JOB_TYPE_UNKNOWN``; past-``deadline_ms`` raises ``BudgetExhausted``
     with ``DEADLINE_EXCEEDED`` before transport. ``None`` preserves the

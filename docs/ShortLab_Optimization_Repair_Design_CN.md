@@ -684,7 +684,7 @@ RequestContext由request_budget.py唯一声明；R00增量字段必须兼容原�
 
 数据源配置的DIVE_FAPI_BASE镜像若存在，只有该明确配置的HTTPS origin作为fapi允许别名且共用fapi预算；任意其他host不因path相同获准。
 
-权重版本升级endpoint-weights-v2；识别URL使用允许host+完整path，不用路径含exchangeInfo就接受任意host。既有families与limit桶保留，新增/补齐以下本地保守权重。权重是本地请求token；平台官方IP限额另按已知资料执行，不宣称Alpha/CoinGecko token为Binance官方IP权重。发送次数、权重窗口、单轮240、Funding80/300s、provider RPS/月额均独立约束。FAPI/Spot最终权重取max(本地保守token,Fixture冻结的已核对官方IP权重)，资料未知不能默认为0；Alpha/CoinGecko/0x不套用FAPI的官方IP桶，使用独立host本地RPS/token限额并诚实标平台限额未知。
+权重版本升级endpoint-weights-v3；识别URL使用允许host+完整path，不用路径含exchangeInfo就接受任意host。既有families与limit桶保留，新增/补齐以下本地保守权重。权重是本地请求token；平台官方IP限额另按已知资料执行，不宣称Alpha/CoinGecko token为Binance官方IP权重。发送次数、权重窗口、单轮240、Funding80/300s、provider RPS/月额均独立约束。FAPI/Spot最终权重取max(本地保守token,Fixture冻结的已核对官方IP权重)，资料未知不能默认为0；Alpha/CoinGecko/0x不套用FAPI的官方IP桶，使用独立host本地RPS/token限额并诚实标平台限额未知。
 
 | host/path | family | 本地权重 |
 |---|---|---|
@@ -693,10 +693,14 @@ RequestContext由request_budget.py唯一声明；R00增量字段必须兼容原�
 | fapi /fapi/v1/depth | futuresDepth | limit<=100:20；<=500:30；<=1000:50 |
 | api.binance.com /api/v3/klines | spotKlines | 与klines limit桶相同；limit1..1000 |
 | api.binance.com /api/v3/depth | spotDepth | limit<=100:20；<=500:30；<=1000:50 |
-| api.binance.com /api/v3/ticker/24hr | spotTicker | 单symbol2，全列表40 |
+| api.binance.com /api/v3/ticker/24hr | spotTicker | 单symbol2；symbols数组1..100本地40，101以上80；无参数80；symbol与symbols互斥 |
+| api.binance.com /api/v3/ticker/bookTicker | spotBookTicker | 单symbol2；symbols参数或不传symbol时4；symbol与symbols互斥 |
 | www.binance.com五个既有公开Alpha路径 | alphaTokenList/alphaExchangeInfo/alphaTicker/alphaDepth/alphaKlines | 每次10；具体path从data/binance_alpha.py五个PATH常量冻结到Fixture |
 | api.coingecko.com或pro-api.coingecko.com /api/v3/coins/list、/coins/markets、/coins/{id}、/simple/price | cgDirectory/cgMarkets/cgCoin/cgFx | 每次1，另占月/RPM限制；coins/list/markets优先于动态{id}匹配 |
 | api.0x.org只读allowance-holder price路径（适配器PRICE_PATH及公开v2 header无后缀路径） | onchainPrice | 1，另1RPS/并发1 |
+
+`spotBookTicker` 权重于2026-10-10按Binance官方接口定义核验：[Symbol Order Book Ticker](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market#symbol-order-book-ticker)。
+`spotTicker` 的24hr官方权重于2026-10-10按Binance官方接口定义核验：[24hr Ticker Price Change Statistics](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market#24hr-ticker-price-change-statistics)。单symbol为2；symbols数组1..20为2、21..100为40、101以上为80；无symbol参数为80。批量列表按max(本地保守40, 官方权重)计费；无参数按max(本地保守40, 官方80)计费。畸形JSON、空数组及symbol与symbols同时提供均拒绝发送。
 
 新代码所有URL/params在R00 endpoint-contract Fixture中有样本，R11a实现registry并通过未知host/path/limit拒绝测试。R03/R14开发时用合同HTTP Fake，不先发真实未注册请求；R10b绑定前必须已合并R11a，实际启动不得UNBUDGETED_ENDPOINT。不因host匹配允许交易/approve/calldata路径。网络404/451/429、缺key保持诚实不可用，不以注册family认定平台PoC通过。
 

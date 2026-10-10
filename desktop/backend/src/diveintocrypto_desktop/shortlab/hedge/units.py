@@ -33,6 +33,8 @@ __all__ = [
     "STOP_PRICE_UNREPRESENTABLE",
     "canonical_price_usd",
     "canonical_qty",
+    "canonical_to_contract_qty",
+    "contract_to_canonical_qty",
     "contract_notional_usd",
     "unscaled_notional_usd",
     "quote_volume_usd",
@@ -166,6 +168,29 @@ def canonical_qty(
         ctx.prec = 80
         out = qty * mult
     return _dec_str(out)
+
+
+def canonical_to_contract_qty(
+    canonical_quantity: str | Decimal | int,
+    multiplier: str | Decimal | int | None,
+) -> str | None:
+    """Convert a canonical coin quantity to native futures contracts."""
+    if multiplier is None:
+        return None
+    canonical = _parse_decimal(canonical_quantity, "canonical_quantity")
+    mult = _parse_multiplier(multiplier)
+    assert mult is not None
+    with localcontext() as ctx:
+        ctx.prec = 80
+        return _dec_str(canonical / mult)
+
+
+def contract_to_canonical_qty(
+    contract_quantity: str | Decimal | int,
+    multiplier: str | Decimal | int | None,
+) -> str | None:
+    """Convert native futures contracts to canonical coin quantity."""
+    return canonical_qty(contract_quantity, multiplier)
 
 
 def contract_notional_usd(

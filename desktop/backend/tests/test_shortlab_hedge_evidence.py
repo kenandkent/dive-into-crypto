@@ -248,6 +248,7 @@ async def repo(tmp_path):
     handle = await ShortLabRepository.open(tmp_path / "h10.duckdb")
     await handle.migrate(target_version=4)
     await handle.migrate(target_version=5)
+    await handle.migrate(target_version=6)
     yield handle
     await handle.close()
 
@@ -277,6 +278,26 @@ def _fcs_row(snapshot_id: str, symbol: str = "BTCUSDT",
 async def _save_fcs(repo, snapshot_id: str, as_of: int = NOW,
                     venue: str = "BINANCE_SPOT") -> None:
     await repo.save_funding_capture_snapshot(_fcs_row(snapshot_id, as_of=as_of, venue=venue))
+    # Grading requires an archived, verified settlement schedule. The fixture
+    # uses a confirmed 8h schedule whose anchor matches these frozen events.
+    try:
+        await repo.save_funding_schedule({
+            "schedule_id": "test-btcusdt-8h",
+            "symbol": "BTCUSDT",
+            "effective_from_ms": 0,
+            "effective_to_ms": None,
+            "known_at_ms": 0,
+            "schedule_json": {
+                "interval_hours": 8,
+                "anchor_ms": NOW % (8 * HOUR_MS),
+                "source": "test fixture",
+                "evidence_ref": "test receipt",
+                "verification": "CONFIRMED",
+            },
+        })
+    except Exception as exc:
+        if "immutable" not in str(exc).lower() and "conflict" not in str(exc).lower():
+            raise
 
 
 async def _save_venue(repo, snapshot_id: str, canonical: str,
@@ -836,6 +857,441 @@ async def test_ledger_separate_and_hedge_summary(repo):
     assert summary.median_net_return is not None
     # Ledger fills never leak into the fixed-strategy bucket.
     assert summary.sample_count != 3
+
+
+@pytest.mark.asyncio
+async def test_entry_cohort_summary_and_paired_baseline_are_visible(repo):
+    """Entry-backed cohorts must be visible and paired on exact source id."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_metrics import hedge_summary
+
+    strategies = ("UNHEDGED_0", "ABSOLUTE_100", "RELATIVE_75",
+                  "RELATIVE_50", "RELATIVE_25", "SYSTEM_POLICY")
+    for cohort in ("USER_DECISION", "RESEARCH_CANDIDATE",
+                   "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY"):
+        src = f"decision-paired-{cohort}"
+        for strategy in strategies:
+            await repo.save_strategy_entry({
+                "entry_id": f"{src}:{strategy}",
+                "cohort": cohort,
+                "symbol": "BTCUSDT",
+                "source_snapshot_id": src,
+                "strategy": strategy,
+                "decision_as_of_ms": NOW,
+                "executed_as_of_ms": NOW,
+                "entry_json": {"status": "ENTRY_COMPLETE",
+                               "actual_ratio": "0" if strategy == "UNHEDGED_0" else "0.5",
+                               "canonical_futures_qty": "1", "futures_entry_vwap_native": "100"},
+            }, references=())
+        for strategy, outcome_status, net in (
+            ("UNHEDGED_0", "COMPLETE", "0.1"),
+            ("ABSOLUTE_100", "COMPLETE", "0.2"),
+            ("RELATIVE_75", "COMPLETE", "0.15"),
+            ("RELATIVE_50", "COMPLETE", "0.14"),
+            ("RELATIVE_25", "UNAVAILABLE", None),
+            ("SYSTEM_POLICY", "CENSORED", None),
+        ):
+            await repo.save_hedge_outcome({
+                "outcome_id": f"{src}:{cohort}:{strategy}",
+                "fcs_snapshot_id": src,
+                "strategy": strategy,
+                "horizon_days": 7,
+                "outcome_status": outcome_status,
+                "reason_code": "CONTRACT_DELISTED" if outcome_status == "CENSORED" else None,
+                "evidence_version": "hedge_evidence_v3",
+                "cost_config_hash": GOLDEN_COST,
+                "outcome_json": {"pnl": {"net_return": net}},
+                "updated_at_ms": NOW + 8 * DAY_MS,
+            })
+
+    summaries = {}
+    for strategy in strategies:
+        summaries[strategy] = await hedge_summary(
+            {"strategy": strategy, "cohort": "USER_DECISION", "horizon": "7D",
+             "now_ms": NOW + 8 * DAY_MS},
+            repo, None,
+        )
+        assert summaries[strategy].sample_count == 1
+    assert summaries["ABSOLUTE_100"].paired_count == 1
+    assert summaries["ABSOLUTE_100"].paired_mean_diff == "0.1"
+    integrated_report = summaries["ABSOLUTE_100"].evaluation_report
+    assert integrated_report is not None
+    assert integrated_report["status_counts"]["COMPLETE"] == 1
+    assert integrated_report["paired"]["n_paired"] == 1
+    assert integrated_report["bootstrap"]["status"] == "INSUFFICIENT_SAMPLE"
+    assert integrated_report["paired_bootstrap"]["status"] == "INSUFFICIENT_SAMPLE"
+    assert integrated_report["walk_forward"]["mode"] == "RULES_ONLY"
+    assert integrated_report["bucket"]["cohort"] == "USER_DECISION"
+    assert integrated_report["bucket"]["cost_config_hash"] == GOLDEN_COST
+    assert summaries["SYSTEM_POLICY"].censored_count == 1
+    assert summaries["SYSTEM_POLICY"].paired_count == 0
+    assert summaries["SYSTEM_POLICY"].paired_missing_count == 1
+    assert summaries["RELATIVE_25"].unavailable_count == 1
+    for cohort in ("USER_DECISION", "RESEARCH_CANDIDATE",
+                   "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY"):
+        cohort_summary = await hedge_summary(
+            {"strategy": "ABSOLUTE_100", "cohort": cohort, "horizon": "7D",
+             "now_ms": NOW + 8 * DAY_MS},
+            repo, None,
+        )
+        assert cohort_summary.cohort == cohort
+        assert cohort_summary.sample_count == 1
+
+
+@pytest.mark.asyncio
+async def test_unfiltered_summary_separates_cohort_and_profile_returns(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_metrics import hedge_summary
+
+    source = "shared-source-mixed-populations"
+    cases = (
+        ("RESEARCH_CANDIDATE", "PROFILE_A", "FORMULA_A", "0.1", "0.05"),
+        ("USER_DECISION", "PROFILE_B", "FORMULA_B", "0.9", "0.1"),
+    )
+    for cohort, profile, formula, net, baseline_net in cases:
+        for strategy, outcome_net in (("ABSOLUTE_100", net), ("UNHEDGED_0", baseline_net)):
+            entry_id = f"{cohort}:{source}:{strategy}"
+            await repo.save_strategy_entry({
+                "entry_id": entry_id, "cohort": cohort, "symbol": "BTCUSDT",
+                "source_snapshot_id": source, "strategy": strategy,
+                "decision_as_of_ms": NOW, "executed_as_of_ms": NOW,
+                "entry_json": {"status": "ENTRY_COMPLETE", "profile": profile,
+                               "formula_version": formula, "goal": "CARRY"},
+            }, references=())
+            await repo.save_hedge_outcome({
+                "outcome_id": f"mixed:{cohort}:{strategy}", "fcs_snapshot_id": entry_id,
+                "strategy": strategy, "horizon_days": 7,
+                "outcome_status": "COMPLETE", "reason_code": None,
+                "evidence_version": "hedge_evidence_v3", "cost_config_hash": GOLDEN_COST,
+                "outcome_json": {"pnl": {"net_return": outcome_net}},
+                "updated_at_ms": NOW + 8 * DAY_MS,
+            })
+
+    summary = await hedge_summary(
+        {"strategy": "ABSOLUTE_100", "horizon": "7D", "now_ms": NOW + 8 * DAY_MS},
+        repo, None,
+    )
+    assert summary.sample_count == 2
+    assert summary.complete_count == 2
+    assert summary.avg_net_return is None
+    report = summary.evaluation_report
+    assert report["sample_status"] == "MIXED_BUCKETS"
+    assert report["mean_net"] is None
+    buckets = report["sub_buckets"]
+    assert len(buckets) == 2
+    got = {
+        (item["bucket"]["cohort"], item["bucket"]["profile"]): item["evaluation"]["mean_net"]
+        for item in buckets
+    }
+    assert got == {
+        ("RESEARCH_CANDIDATE", "PROFILE_A"): pytest.approx(0.1),
+        ("USER_DECISION", "PROFILE_B"): pytest.approx(0.9),
+    }
+    paired = {
+        (item["bucket"]["cohort"], item["bucket"]["profile"]): item["evaluation"]["paired"]["mean_diff"]
+        for item in buckets
+    }
+    assert paired == {
+        ("RESEARCH_CANDIDATE", "PROFILE_A"): pytest.approx(0.05),
+        ("USER_DECISION", "PROFILE_B"): pytest.approx(0.8),
+    }
+
+
+@pytest.mark.asyncio
+async def test_cluster_bootstrap_uses_frozen_canonical_identity_not_symbol(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_metrics import hedge_summary
+
+    await repo.save_identity_snapshot({
+        "identity_snapshot_id": "identity-btc-usdt",
+        "futures_symbol": "BTCUSDT", "canonical_id": "BTC",
+        "mapping_version": "test-v1", "observed_at_ms": NOW,
+        "identity_json": {"canonical_id": "BTC"},
+    })
+    await repo.save_identity_snapshot({
+        "identity_snapshot_id": "identity-btc-usdc",
+        "futures_symbol": "BTCUSDC", "canonical_id": "BTC",
+        "mapping_version": "test-v1", "observed_at_ms": NOW,
+        "identity_json": {"canonical_id": "BTC"},
+    })
+    for i in range(100):
+        symbol = "BTCUSDT" if i % 2 else "BTCUSDC"
+        identity_id = "identity-btc-usdt" if i % 2 else "identity-btc-usdc"
+        source = f"identity-cluster-{i}"
+        await repo.save_strategy_entry({
+            "entry_id": f"{source}:UNHEDGED_0", "cohort": "RESEARCH_CANDIDATE",
+            "symbol": symbol, "source_snapshot_id": source, "strategy": "UNHEDGED_0",
+            "decision_as_of_ms": NOW, "executed_as_of_ms": NOW,
+            "entry_json": {"status": "ENTRY_COMPLETE", "identity_snapshot_id": identity_id},
+        }, references=())
+        await repo.save_hedge_outcome({
+            "outcome_id": f"{source}:UNHEDGED_0:7d", "fcs_snapshot_id": source,
+            "strategy": "UNHEDGED_0", "horizon_days": 7, "outcome_status": "COMPLETE",
+            "reason_code": None, "evidence_version": "hedge_evidence_v3",
+            "cost_config_hash": GOLDEN_COST,
+            "outcome_json": {"pnl": {"net_return": str(i / 1000)}},
+            "updated_at_ms": NOW + 8 * DAY_MS,
+        })
+
+    result = await hedge_summary({
+        "strategy": "UNHEDGED_0", "cohort": "RESEARCH_CANDIDATE", "horizon": "7D",
+        "now_ms": NOW + 8 * DAY_MS,
+    }, repo, None)
+    assert result.sample_count == 100
+    assert result.evaluation_report["bootstrap"]["n_assets"] == 1
+    assert result.evaluation_report["bootstrap"]["status"] == "INSUFFICIENT_SAMPLE"
+
+
+@pytest.mark.asyncio
+async def test_repository_lists_quote_tasks_with_decoded_terminal_results(repo):
+    await repo.save_strategy_entry({
+        "entry_id": "entry-task-read", "cohort": "USER_DECISION",
+        "symbol": "BTCUSDT", "source_snapshot_id": "decision-task-read",
+        "strategy": "ABSOLUTE_100", "decision_as_of_ms": NOW,
+        "executed_as_of_ms": NOW,
+        "entry_json": {"status": "ENTRY_COMPLETE", "actual_ratio": "1"},
+    }, references=())
+    await repo.save_strategy_quote_task({
+        "task_id": "task-read", "entry_id": "entry-task-read",
+        "horizon_days": 7, "purpose": "EXIT", "due_ms": NOW + 7 * DAY_MS,
+        "status": "PENDING", "task_json": {"deadline_ms": NOW + 8 * DAY_MS},
+    })
+    claimed = await repo.claim_due_quote_tasks(NOW + 7 * DAY_MS)
+    assert claimed[0]["task_id"] == "task-read"
+    await repo.save_market_observation({
+        "observation_id": "m-task-exit", "symbol": "BTCUSDT", "kind": "MARK",
+        "source_as_of_ms": NOW + 7 * DAY_MS, "known_at_ms": NOW + 7 * DAY_MS,
+        "value_json": {"price": "110"}, "meta_json": {"status": "OK"},
+    })
+    await repo.save_fx_observation({
+        "fx_id": "fx-task-exit", "currency": "USDT",
+        "source_as_of_ms": NOW + 7 * DAY_MS, "known_at_ms": NOW + 7 * DAY_MS,
+        "rate_str": "1", "source_json": {"source": "test"},
+    })
+    await repo.finish_quote_task("task-read", "COMPLETE", {
+        "exit_as_of_ms": NOW + 7 * DAY_MS,
+        "spot_exit_vwap_native": "110", "quote_refs": {"book": "m-task-exit"},
+        "fx_refs": {"USDT": "fx-task-exit"},
+    })
+
+    task = await repo.get_strategy_quote_task("task-read")
+    fx = await repo.get_fx_observation("fx-task-exit")
+    tasks = await repo.list_strategy_quote_tasks(
+        "entry-task-read", NOW, NOW + 7 * DAY_MS, limit=10, offset=0,
+    )
+    assert task["status"] == "COMPLETE"
+    assert task["task_json"]["spot_exit_vwap_native"] == "110"
+    assert fx["rate_str"] == "1"
+    assert len(tasks) == 1 and tasks[0]["task_id"] == "task-read"
+    pins = repo._hedge_pinned_sync(repo._require_con())
+    assert ("MARKET_OBSERVATION", "m-task-exit") in pins
+    assert ("FX", "fx-task-exit") in pins
+
+
+@pytest.mark.asyncio
+async def test_grader_uses_entry_vwaps_quantities_and_completed_quote_task(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    src = "fcs-entry-task-grade"
+    due = NOW + 7 * DAY_MS
+    await _save_fcs(repo, src, NOW)
+    fake = _complete_fake(NOW, due, entry_qty="1", entry_price="100", exit_price="200")
+    # Historical quotes intentionally disagree with the captured Entry/Task.
+    fake.quotes[0]["requested_canonical_qty"] = "1"
+    fake.quotes[0]["buy_vwap"] = "900"
+    fake.quotes[1]["requested_canonical_qty"] = "1"
+    fake.quotes[1]["sell_vwap"] = "900"
+    entry_id = f"{src}:ABSOLUTE_100"
+    await repo.save_strategy_entry({
+        "entry_id": entry_id, "cohort": "USER_DECISION", "symbol": "BTCUSDT",
+        "source_snapshot_id": src, "strategy": "ABSOLUTE_100",
+        "decision_as_of_ms": NOW, "executed_as_of_ms": NOW,
+        "entry_json": {
+            "status": "ENTRY_COMPLETE", "actual_ratio": "0.5",
+            "native_futures_qty": "2", "canonical_futures_qty": "2",
+            "spot_net_qty": "1", "spot_venue": "BINANCE_SPOT",
+            "futures_entry_vwap_native": "100", "spot_entry_vwap_native": "100",
+            "futures_quote_currency": "USD", "spot_quote_currency": "USD",
+            "quote_refs": {}, "fx_refs": {},
+        },
+    }, references=())
+    await repo.save_strategy_quote_task({
+        "task_id": "task-entry-grade", "entry_id": entry_id,
+        "horizon_days": 7, "purpose": "EXIT", "due_ms": due,
+        "status": "PENDING", "task_json": {
+            "deadline_ms": due + HOUR_MS,
+            "requested_futures_qty": "2", "requested_spot_qty": "1",
+        },
+    })
+    await repo.claim_due_quote_tasks(due)
+    await repo.finish_quote_task("task-entry-grade", "COMPLETE", {
+        "exit_as_of_ms": due, "futures_exit_vwap_native": "120",
+        "quoted_futures_qty": "2", "quoted_spot_qty": "1",
+        "futures_exit_fx_to_usd": "1", "futures_exit_quote_currency": "USD",
+        "spot_exit_vwap_native": "120", "spot_exit_fx_to_usd": "1",
+        "spot_exit_quote_currency": "USD", "quote_refs": {}, "fx_refs": {},
+    })
+
+    outcome = await grade_hedge(src, "ABSOLUTE_100", 7, NOW + 8 * DAY_MS,
+                                repo, fake, None)
+    assert outcome.outcome_status == "COMPLETE"
+    pnl = outcome.outcome_json["pnl"]
+    assert outcome.outcome_json["entry"]["canonical_futures_qty"] == "2"
+    assert outcome.outcome_json["entry"]["spot_qty"] == "1"
+    assert pnl["futures_pnl_usd"] == "-40"
+    assert pnl["spot_pnl_usd"] == "20"
+    assert outcome.outcome_json["exit"]["futures_exit_price_usd"] == "120"
+    assert outcome.outcome_json["exit"]["spot_exit_price_usd"] == "120"
+
+
+@pytest.mark.asyncio
+async def test_entry_grader_1000_multiplier_fx_and_task_native_quantities(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    source = "fcs-multiplier-1000"
+    fcs = _fcs_row(source, as_of=NOW)
+    fcs["risk_json"] = {
+        "history_class": "FULL_90D",
+        "identity": {"contract_multiplier": "1000", "multiplier_source": "EXCHANGE"},
+    }
+    await repo.save_funding_capture_snapshot(fcs)
+    await repo.save_funding_schedule({
+        "schedule_id": "multiplier-btc-8h", "symbol": "BTCUSDT",
+        "effective_from_ms": 0, "effective_to_ms": None, "known_at_ms": 0,
+        "schedule_json": {
+            "interval_hours": 8, "anchor_ms": NOW % (8 * HOUR_MS),
+            "source": "fixture", "evidence_ref": "actual-receipt-8h",
+            "verification": "CONFIRMED",
+        },
+    })
+    await repo.save_fx_observation({
+        "fx_id": "fx-eur-entry-2", "currency": "EUR",
+        "source_as_of_ms": NOW, "known_at_ms": NOW,
+        "rate_str": "2", "source_json": {"source": "fixture-receipt"},
+    })
+    entry_id = "RESEARCH_CANDIDATE:fcs-multiplier-1000:ABSOLUTE_100"
+    await repo.save_strategy_entry({
+        "entry_id": entry_id, "cohort": "RESEARCH_CANDIDATE",
+        "symbol": "BTCUSDT", "source_snapshot_id": source,
+        "strategy": "ABSOLUTE_100", "decision_as_of_ms": NOW,
+        "executed_as_of_ms": NOW,
+        "entry_json": {
+            "status": "ENTRY_COMPLETE", "actual_ratio": "1",
+            "native_futures_qty": "1000", "canonical_futures_qty": "1000000",
+            "spot_net_qty": "1000000", "spot_venue": "BINANCE_SPOT",
+            "contract_multiplier": "1000",
+            "futures_entry_vwap_native": "0.006", "spot_entry_vwap_native": "0.000006",
+            "futures_quote_currency": "EUR", "spot_quote_currency": "EUR",
+            "quote_refs": {}, "fx_refs": {"EUR": "fx-eur-entry-2"},
+        },
+    }, references=())
+    due = NOW + 7 * DAY_MS
+    task_id = f"{entry_id}:7:EXIT"
+    await repo.save_strategy_quote_task({
+        "task_id": task_id, "entry_id": entry_id, "horizon_days": 7,
+        "purpose": "EXIT", "due_ms": due, "status": "PENDING",
+        "task_json": {
+            "deadline_ms": due + HOUR_MS,
+            "requested_futures_qty": "1000", "requested_spot_qty": "1000000",
+        },
+    })
+    await repo.claim_due_quote_tasks(due)
+    await repo.finish_quote_task(task_id, "COMPLETE", {
+        "exit_as_of_ms": due, "quoted_futures_qty": "1000", "quoted_spot_qty": "1000000",
+        "futures_exit_vwap_native": "0.003", "futures_exit_fx_to_usd": "3",
+        "futures_exit_quote_currency": "EUR",
+        "spot_exit_vwap_native": "0.000003", "spot_exit_fx_to_usd": "3",
+        "spot_exit_quote_currency": "EUR", "quote_refs": {}, "fx_refs": {},
+    })
+    fake = _complete_fake(NOW, due, entry_qty="1000000", entry_price="0.000006", exit_price="0.000003")
+    fake.fundings["BTCUSDT"] = [
+        _funding("BTCUSDT", NOW + h * HOUR_MS, "0.001", "0.006", "2")
+        for h in range(8, 7 * 24 + 1, 8)
+    ]
+
+    outcome = await grade_hedge(
+        entry_id, "ABSOLUTE_100", 7, NOW + 8 * DAY_MS,
+        repo, fake, None, cohort="RESEARCH_CANDIDATE",
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    assert outcome.fcs_snapshot_id == entry_id
+    pnl = outcome.outcome_json["pnl"]
+    assert pnl["futures_pnl_usd"] == "9"
+    assert pnl["spot_pnl_usd"] == "-3"
+    assert pnl["basis_pnl_usd"] == "6"
+    assert pnl["funding_carry_usd"] == "0.252"
+    assert pnl["fees_usd"] == pnl["fees_usd_exit_based"]
+    assert Decimal(pnl["fees_usd"]) > 0
+    assert Decimal(pnl["net_pnl_usd"]) == Decimal("6.252") - Decimal(pnl["fees_usd"])
+    assert outcome.outcome_json["exit"]["futures_exit_price_usd"] == "0.000009"
+    assert outcome.outcome_json["exit"]["spot_exit_price_usd"] == "0.000009"
+
+
+@pytest.mark.asyncio
+async def test_schedule_coverage_requires_all_confirmed_actual_slots(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import _schedule_funding_coverage
+
+    start = NOW
+    end = NOW + 24 * HOUR_MS
+    await repo.save_funding_schedule({
+        "schedule_id": "sched-4h", "symbol": "BTCUSDT",
+        "effective_from_ms": start, "effective_to_ms": None,
+        "known_at_ms": start, "schedule_json": {
+            "interval_hours": 4, "anchor_ms": start,
+            "source": "test", "evidence_ref": "receipt-4h",
+            "verification": "CONFIRMED",
+        },
+    })
+    events = [
+        {"funding_time_ms": start + h * HOUR_MS, "rate": "0.001",
+         "mark_price": "100", "fx_to_usd": "1", "known_at_ms": end}
+        for h in (4, 8, 16, 20, 24)
+    ]
+    coverage = await _schedule_funding_coverage(repo, "BTCUSDT", events, start, end, end)
+    assert coverage.expected_count == 6
+    assert coverage.received_count == 5
+    assert coverage.coverage_fraction == "0.83333333"
+    assert coverage.reasons == ("COVERAGE_GAP",)
+
+
+@pytest.mark.asyncio
+async def test_grader_rejects_missing_scheduled_funding_event(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    due = NOW + 7 * DAY_MS
+    await _save_fcs(repo, "fcs-missing-scheduled-event", NOW)
+    fake = _complete_fake(NOW, due)
+    # One missing 8h payment creates only a 16h spacing; the old <=24h gap
+    # heuristic incorrectly treated this history as complete.
+    fake.fundings["BTCUSDT"].pop(3)
+    outcome = await grade_hedge("fcs-missing-scheduled-event", "ABSOLUTE_100", 7,
+                                NOW + 8 * DAY_MS, repo, fake, None)
+    assert outcome.outcome_status == "UNAVAILABLE"
+    assert outcome.reason_code == "FUNDING_HISTORY_INCOMPLETE"
+    assert Decimal(str(outcome.outcome_json["funding_coverage"])) < Decimal("1")
+    assert len(outcome.outcome_json["funding_schedule_coverage"]["missing_slots"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_grader_keeps_unknown_schedule_as_unavailable(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await repo.save_funding_capture_snapshot(_fcs_row("fcs-no-schedule", as_of=NOW))
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS)
+    outcome = await grade_hedge("fcs-no-schedule", "ABSOLUTE_100", 7,
+                                NOW + 8 * DAY_MS, repo, fake, None)
+    assert outcome.outcome_status == "UNAVAILABLE"
+    assert outcome.reason_code == "FUNDING_SCHEDULE_UNKNOWN"
+    assert outcome.outcome_json["funding_coverage"] is None
+    assert outcome.outcome_json["funding_schedule_coverage"]["reasons"] == ["FUNDING_SCHEDULE_UNKNOWN"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_schedule_never_claims_funding_complete(repo):
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import _schedule_funding_coverage
+
+    coverage = await _schedule_funding_coverage(
+        repo, "BTCUSDT", [], NOW, NOW + 24 * HOUR_MS, NOW + DAY_MS,
+    )
+    assert coverage.coverage_fraction is None
+    assert "FUNDING_SCHEDULE_UNKNOWN" in coverage.reasons
 
 
 @pytest.mark.asyncio

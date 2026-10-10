@@ -455,7 +455,20 @@ def validate_protection_confirmation(
             "UNKNOWN", ("PROTECTION_POSITIONS_UNKNOWN",), int(now_ms), {"plan": plan_id}
         )
     try:
-        if Decimal(fut_conf_qty) != Decimal(cur_fut) or Decimal(spot_conf_qty) != Decimal(cur_spot):
+        # The ledger stores Futures remaining quantity in canonical coin
+        # units; a protection confirmation binds exchange-native contracts.
+        # Production plan maps carry a verified multiplier. Legacy pure
+        # callers without one retain the historical unit-multiplier check.
+        multiplier = _field(plan, "contract_multiplier", _field(plan, "multiplier", None))
+        if multiplier is not None:
+            from diveintocrypto_desktop.shortlab.hedge.units import canonical_to_contract_qty
+
+            native_fut = canonical_to_contract_qty(str(cur_fut), multiplier)
+            if native_fut is None:
+                raise ValueError("contract multiplier unknown")
+        else:
+            native_fut = str(cur_fut)
+        if Decimal(fut_conf_qty) != Decimal(native_fut) or Decimal(spot_conf_qty) != Decimal(cur_spot):
             return GateResult(
                 "FAIL", ("PROTECTION_QTY_MISMATCH",), int(now_ms), {"plan": plan_id}
             )

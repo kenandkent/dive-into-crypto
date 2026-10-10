@@ -41,6 +41,11 @@ _GROUP_SKEW_MS = 5_000  # D15 quote_group_skew_sec
 _FX_MAX_AGE_MS = 60_000  # D14.2
 _EXIT_DELAY_MS = 300_000  # D15 exit_delay_sec (5min deadline window)
 _QUOTE_BATCH = 20  # D15 quote_task_batch / D14.2 20/round
+
+
+def _entry_id_for(cohort: str, source_snapshot_id: str, strategy: str) -> str:
+    """Give the same source/strategy a separate immutable ID per cohort."""
+    return f"{cohort}:{source_snapshot_id}:{strategy}"
 _HORIZONS = (7, 30, 90)
 _ENTRY_VERSION = "entry-v3"
 _EVIDENCE_VERSION = "hedge_evidence_v3"
@@ -234,11 +239,11 @@ async def capture_strategy_entries(
     # SYSTEM_POLICY only with USER_DECISION + selected (D14.1/D18).
     if "SYSTEM_POLICY" in strategies:
         if cohort != "USER_DECISION":
-            entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+            entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
             return CaptureResult(entry_ids, "UNAVAILABLE", None, ("SYSTEM_POLICY_COHORT_MISMATCH",))
         if decision is None or _get(decision, "selected_proposal") is None:
             # No market calls: cannot fabricate from current model.
-            entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+            entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
             # Save UNAVAILABLE snapshots for deterministically failed SYSTEM?
             # For single-SYSTEM stub tests return without saving (fresh repo, no day conflict).
             # For mixed groups the per-strategy path below handles partial.
@@ -249,17 +254,17 @@ async def capture_strategy_entries(
     # USER_DECISION group id = decision_id (D14.1).
     if cohort == "USER_DECISION":
         if decision is None:
-            entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+            entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
             return CaptureResult(entry_ids, "UNAVAILABLE", None, ("USER_DECISION_MISSING",))
         did = _get(decision, "decision_id")
         if did != source_snapshot_id:
-            entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+            entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
             return CaptureResult(entry_ids, "UNAVAILABLE", None, ("GROUP_ID_MISMATCH",))
 
     # Cohort status bucket (D14.1).
     eligible, bucket_reason = _cohort_eligible(cohort, policy if isinstance(policy, Mapping) else {})
     if not eligible:
-        entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+        entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
         return CaptureResult(entry_ids, "UNAVAILABLE", None, (bucket_reason,))
 
     # Day-first-sample (D14.1): same cohort/symbol/UTC-day first group wins.
@@ -271,7 +276,7 @@ async def capture_strategy_entries(
     same_symbol = [r for r in (existing or ()) if _get(r, "symbol") == symbol]
     for row in same_symbol:
         if _get(row, "source_snapshot_id") != source_snapshot_id:
-            entry_ids = tuple(f"{source_snapshot_id}:{s}" for s in strategies)
+            entry_ids = tuple(_entry_id_for(cohort, source_snapshot_id, s) for s in strategies)
             return CaptureResult(entry_ids, "UNAVAILABLE", None, ("DAY_SAMPLE_ALREADY_EXISTS",))
     existing_keys = {
         (_get(r, "source_snapshot_id"), _get(r, "strategy")): _get(r, "entry_id")
@@ -318,7 +323,7 @@ async def capture_strategy_entries(
         # All deterministically unavailable; save snapshots once.
         saved_ids: list[str] = []
         for s in strategies:
-            eid = f"{source_snapshot_id}:{s}"
+            eid = _entry_id_for(cohort, source_snapshot_id, s)
             if (source_snapshot_id, s) in existing_keys:
                 saved_ids.append(existing_keys[(source_snapshot_id, s)])
                 continue
@@ -488,7 +493,7 @@ async def capture_strategy_entries(
         return row
 
     for s in strategies:
-        eid = f"{source_snapshot_id}:{s}"
+        eid = _entry_id_for(cohort, source_snapshot_id, s)
         if (source_snapshot_id, s) in existing_keys:
             saved_ids_ordered.append(existing_keys[(source_snapshot_id, s)])
             # Count existing COMPLETE for group status (read from listed rows).
@@ -1070,7 +1075,7 @@ async def _save_entry(
     book_id: str | None,
     group_skew: int | None,
 ) -> str:
-    entry_id = f"{source_snapshot_id}:{strategy}"
+    entry_id = _entry_id_for(cohort, source_snapshot_id, strategy)
     decision_id = _get(decision, "decision_id") if decision is not None else None
     goal = None
     try:
@@ -1486,10 +1491,25 @@ async def collect_due_quotes(
         spot_ccy_val = _get(spot_q, "quote_currency") if needs_spot else None
         result_payload: dict[str, Any] = {
             "exit_as_of_ms": int(exit_as_of),
+            "quoted_futures_qty": normalize_decimal_str(str(fut_req)),
+            "quoted_spot_qty": normalize_decimal_str(str(spot_req)) if needs_spot else "0",
             "futures_exit_vwap_native": buy_vwap,
             "futures_exit_side": "BUY",
+            "futures_exit_quote_currency": fut_ccy,
+            "futures_exit_fx_to_usd": (
+                str(fut_fx_q) if fut_fx_q is not None else "1" if fut_ccy == "USD" else None
+            ),
             "spot_exit_vwap_native": exit_spot_vwap,
             "spot_exit_side": "SELL" if needs_spot else None,
+            "spot_exit_quote_currency": (
+                _get(spot_q, "quote_currency") if needs_spot else None
+            ),
+            "spot_exit_fx_to_usd": (
+                str(_get(spot_q, "quote_to_usd"))
+                if needs_spot and _get(spot_q, "quote_to_usd") is not None
+                else "1" if needs_spot and _get(spot_q, "quote_currency") == "USD"
+                else None
+            ),
             "quote_refs": _quote_refs_for(futures_quote, spot_q, needs_spot),
             "fx_refs": fx_refs,
             "reason_code": "EXIT_COMPLETE",

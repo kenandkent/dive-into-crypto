@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
@@ -18,6 +19,8 @@ from typing import Any
 from .monitor import compute_monitor, should_persist
 from .alerts import evaluate_alerts
 from .funding_score import (score_fcs, compute_funding_std_30d, compute_longest_negative_streak, compute_rolling_7d_aprs, compute_p25, resolve_history_class)
+
+log = logging.getLogger(__name__)
 
 #: R11b tick bounds (D11): per-tick deep quotes, concurrency, deadline.
 R11B_DEEP_LIMIT = 10
@@ -548,6 +551,11 @@ class HedgeJobs:
                         from .protection import validate_protection_confirmation as _vpc
 
                         _plan_map: dict[str, Any] = dict(plan) if isinstance(plan, Mapping) else {}
+                        _plan_cfg = mapping(_plan_map.get("plan_config_json"))
+                        _identity_cfg = mapping(_plan_cfg.get("identity"))
+                        _multiplier_cfg = _plan_cfg.get("contract_multiplier") or _identity_cfg.get("contract_multiplier")
+                        if _multiplier_cfg is not None:
+                            _plan_map["contract_multiplier"] = _multiplier_cfg
                         protection = _vpc(_rec, _plan_map, list(positions or ()), int(now_ms))
                     except Exception:
                         # Keep the raw record as an UNKNOWN view (never PASS).
@@ -713,15 +721,77 @@ class HedgeJobs:
             try:
                 await self._save_quote(state['plan'],quote,now)
                 refreshed+=1
-            except Exception: failed+=1
+            except Exception as _opportunity_exc:
+                failed+=1
+                log.debug("funding opportunity failed for %s: %s", symbol, type(_opportunity_exc).__name__)
         return JobStatus(str(job_id or context.trace_id),'hedge_venue_refresh','FAILED' if failed and not refreshed else 'SUCCEEDED',error_code='VENUE_REFRESH_UNAVAILABLE' if failed and not refreshed else None,stats={'refreshed':refreshed,'failed':failed},started_at_ms=now,finished_at_ms=int(context.clock_ms()))
 
     async def _save_quote(self,plan,quote,now):
         await self._db(self.service._repository.save_spot_venue_snapshot({'snapshot_id':quote.get('snapshot_id') or f"{plan['symbol']}:{quote.get('venue','BINANCE_SPOT')}:{now}",'canonical_id':plan['canonical_id'],'venue':quote.get('venue','BINANCE_SPOT'),'venue_symbol':quote.get('venue_symbol'),'as_of_ms':quote['as_of_ms'],'fetched_at_ms':quote['fetched_at_ms'],'expires_at_ms':quote.get('expires_at_ms'),'reference_notional_usd':quote.get('reference_notional_usd') or plan.get('futures_notional_usd') or '10000','quote_json':quote,'status':quote.get('status','UNAVAILABLE'),'reason_code':quote.get('reason_code')}))
 
+    async def _capture_funding_entry(
+        self, *, context: Any, request_context: Any, symbol: str, snapshot_id: str,
+        identity: Mapping[str, Any], canonical_qty: Any, mark: Mapping[str, Any],
+        quote: Mapping[str, Any], as_of_ms: int,
+    ) -> None:
+        """Capture the daily FUNDING_CARRY sample only after both frozen Gates pass."""
+        from decimal import Decimal as _Dec
+        service = self.service
+        funding_context = await service._build_repair_funding_context(
+            str(symbol), int(as_of_ms), request_context=request_context)
+        gate_fn = service._require_repair_port("evaluate_funding_entry_gate")
+        gate = gate_fn(funding_context, service._config, int(as_of_ms))
+        gate_status = str(getattr(gate, "status", "UNKNOWN")).upper()
+        if gate_status != "PASS":
+            return
+        multiplier = _Dec(str(identity.get("contract_multiplier")))
+        if not multiplier.is_finite() or multiplier <= 0:
+            return
+        native_qty = _Dec(str(canonical_qty)) / multiplier
+        market = self._resolve_market_port()
+        if market is None or not callable(getattr(market, "collect_futures", None)):
+            return
+        futures_out = await market.collect_futures(str(symbol), format(native_qty, "f"), request_context)
+        futures_quote = mapping(
+            futures_out.get("futures_quote", futures_out.get("futuresQuote"))
+            if isinstance(futures_out, Mapping) else futures_out)
+        spot = dict(quote)
+        try:
+            future_ok = (
+                futures_quote.get("buy_vwap_native") is not None
+                and futures_quote.get("sell_vwap_native") is not None
+                and _Dec(str(futures_quote.get("buy_executable_qty"))) >= native_qty
+                and _Dec(str(futures_quote.get("sell_executable_qty"))) >= native_qty
+                and int(futures_quote.get("expires_at_ms") or 0) > int(as_of_ms)
+            )
+            spot_ok = (
+                str(spot.get("status") or "").upper() in ("OK", "PARTIAL")
+                and spot.get("buy_vwap") is not None and spot.get("sell_vwap") is not None
+                and _Dec(str(spot.get("buy_executable_qty"))) >= _Dec(str(canonical_qty))
+                and _Dec(str(spot.get("sell_executable_qty"))) >= _Dec(str(canonical_qty))
+                and int(spot.get("expires_at_ms") or 0) > int(as_of_ms)
+            )
+        except Exception:
+            future_ok = spot_ok = False
+        if not (future_ok and spot_ok):
+            return
+        catalog = getattr(service, "_identity_catalog", None)
+        if catalog is None:
+            return
+        identity_snapshot_id = str(catalog.snapshot_id_for(str(symbol), identity, int(as_of_ms)))
+        source_refs = {"fcs_snapshot_id": str(snapshot_id),
+                       "identity_snapshot_id": identity_snapshot_id}
+        await service._capture_market_entry_cohort(
+            cohort="FUNDING_CARRY", source_snapshot_id=str(snapshot_id),
+            symbol=str(symbol), decision_as_of_ms=int(as_of_ms),
+            policy={"funding_gate": "PASS", "execution_gate": "PASS",
+                    "spot_venue": str(spot.get("venue") or "BINANCE_SPOT")},
+            source_refs=source_refs, funding_context=funding_context,
+        )
+
     async def opportunity(self,context,job_id=None):
         from ..service import JobStatus, _maybe_await
-        now=int(context.clock_ms()); computed=0; failed=0
+        now=int(context.clock_ms()); computed=0; failed=0; capture_attempted=0; capture_failed=0
         await self.service._ensure_hedge_available()
         # CR14 (D11/D19.3): opportunity is BACKGROUND (never monitor), so its
         # sends never eat the 20% monitor reserve. The immutable caller
@@ -914,9 +984,26 @@ class HedgeJobs:
                 data['risk_json'] = _risk
                 await self._db(self.service._repository.save_funding_capture_snapshot(data))
                 await self._save_quote({'symbol':symbol,'canonical_id':identity['canonical_id']},quote,now)
+                # CR15 (D14): FCS producer-triggered FUNDING_CARRY sampling.
+                # Bound attempts by the existing EntryTop10 head; the cohort
+                # function enforces Gate + exact public execution PASS and
+                # UTC-day first-sample semantics before it makes market calls.
+                if (callable(getattr(self.service, "_capture_market_entry_cohort", None))
+                        and capture_attempted < max(1, int(self.service._config.universe.entry_depth_top))):
+                    capture_attempted += 1
+                    try:
+                        await self._capture_funding_entry(
+                            context=context, request_context=request_context,
+                            symbol=str(symbol), snapshot_id=str(result.snapshot_id),
+                            identity=dict(identity), canonical_qty=qty, mark=mark,
+                            quote=quote, as_of_ms=int(now),
+                        )
+                    except Exception as _capture_exc:
+                        capture_failed += 1
+                        log.debug("funding cohort capture unavailable for %s: %s", symbol, type(_capture_exc).__name__)
                 computed+=1
             except Exception: failed+=1
-        return JobStatus(str(job_id or context.trace_id),'funding_capture_refresh','FAILED' if failed and not computed else 'SUCCEEDED',error_code='FCS_REFRESH_UNAVAILABLE' if failed and not computed else None,stats={'computed':computed,'failed':failed},started_at_ms=now,finished_at_ms=int(context.clock_ms()))
+        return JobStatus(str(job_id or context.trace_id),'funding_capture_refresh','FAILED' if failed and not computed else 'SUCCEEDED',error_code='FCS_REFRESH_UNAVAILABLE' if failed and not computed else None,stats={'computed':computed,'failed':failed,'cohort_capture_attempted':capture_attempted,'cohort_capture_failed':capture_failed},started_at_ms=now,finished_at_ms=int(context.clock_ms()))
 
     async def settlement(self,context,job_id=None):
         from ..service import JobStatus

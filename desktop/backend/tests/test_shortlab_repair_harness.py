@@ -231,6 +231,91 @@ def test_create_repair_test_app_uses_frozen_factory_seam(tmp_path: Path) -> None
         runtime_mod.ShortLabRuntime.stop = orig_stop  # type: ignore[method-assign]
 
 
+def test_acceptance_blocks_unknown_public_http_before_send(tmp_path: Path) -> None:
+    """Unknown public hosts/IPs fail closed while the harness API stays local."""
+    import asyncio
+    import socket
+
+    import aiohttp
+    from diveintocrypto_desktop.data import funding, http, orderbook, spot, universe
+
+    raw_originals = (
+        funding.premium_index,
+        funding.funding_history_range,
+        http.get_json,
+        orderbook.get_json,
+        spot.get_json,
+        universe.get_json,
+        universe.contract_metadata_all,
+        aiohttp.ClientSession._request,
+        socket.getaddrinfo,
+        socket.socket.connect,
+        socket.socket.connect_ex,
+        http.get_session,
+    )
+    try:
+        from tests.repair_harness import create_repair_acceptance_app
+    except ModuleNotFoundError:
+        from repair_harness import create_repair_acceptance_app
+
+    clock = _import_harness()["FakeClock"]()
+    app = create_repair_acceptance_app(tmp_path / "public-network-guard", "normal", clock)
+    assert raw_originals == (
+        funding.premium_index,
+        funding.funding_history_range,
+        http.get_json,
+        orderbook.get_json,
+        spot.get_json,
+        universe.get_json,
+        universe.contract_metadata_all,
+        aiohttp.ClientSession._request,
+        socket.getaddrinfo,
+        socket.socket.connect,
+        socket.socket.connect_ex,
+        http.get_session,
+    ), "constructing an acceptance app must not patch shared transport globals"
+
+    async def _unknown_public_get() -> None:
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(aiohttp.ClientConnectionError, match="HARNESS_PUBLIC_NETWORK_DISABLED"):
+                await session.get("https://public.example.invalid/market-data")
+
+    def _unknown_public_ip() -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with pytest.raises(OSError, match="HARNESS_PUBLIC_NETWORK_DISABLED"):
+                sock.connect(("203.0.113.10", 443))
+
+    with TestClient(app) as client:
+        state = client.get("/test/harness/state")
+        assert state.status_code == 200
+        asyncio.run(_unknown_public_get())
+        _unknown_public_ip()
+        updated = client.get("/test/harness/state").json()
+        assert updated["blockedPublicRequestCount"] >= 2
+        assert "public.example.invalid" in updated["blockedPublicHosts"]
+        assert "203.0.113.10" in updated["blockedPublicHosts"]
+
+    assert raw_originals == (
+        funding.premium_index,
+        funding.funding_history_range,
+        http.get_json,
+        orderbook.get_json,
+        spot.get_json,
+        universe.get_json,
+        universe.contract_metadata_all,
+        aiohttp.ClientSession._request,
+        socket.getaddrinfo,
+        socket.socket.connect,
+        socket.socket.connect_ex,
+        http.get_session,
+    ), "acceptance raw HTTP/network patches must be restored after lifespan shutdown"
+
+    second = create_repair_acceptance_app(tmp_path / "public-network-guard-2", "normal", clock)
+    with TestClient(second) as client:
+        assert client.get("/test/harness/state").status_code == 200
+    assert http.get_session is raw_originals[-1], "sequential lifespans must restore the original sender"
+
+
 def test_test_fake_bindings_gate(tmp_path: Path) -> None:
     h = _import_harness()
     FakeClock = h["FakeClock"]
@@ -238,7 +323,10 @@ def test_test_fake_bindings_gate(tmp_path: Path) -> None:
 
     clock = FakeClock()
     # Explicit TEST_FAKE bindings are accepted with allow True.
-    from tests.repair_fixtures import make_ports  # type: ignore[import-not-found]
+    try:
+        from tests.repair_fixtures import make_ports  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        from repair_fixtures import make_ports  # type: ignore[import-not-found]
 
     fakes = make_ports()
     app = h["create_repair_test_app"](tmp_path / "fake-ok", "normal", clock, bindings=fakes)

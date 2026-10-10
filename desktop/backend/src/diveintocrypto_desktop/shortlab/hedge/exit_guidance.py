@@ -410,20 +410,31 @@ def build_pair_exit_guidance(
         remaining = by_leg[leg_type]["remaining"]
         if remaining == 0:
             continue
+        is_fut = leg_type == "FUTURES_SHORT"
+        raw_multiplier = _plan_field(plan, "contract_multiplier", "contractMultiplier", default="1")
+        multiplier = _parse_optional_decimal(
+            raw_multiplier,
+            "contract_multiplier",
+        ) if is_fut else Decimal("1")
+        if multiplier is None or multiplier <= 0:
+            dust[leg_type] = _fmt(remaining)
+            top_reasons.append("CONTRACT_MULTIPLIER_UNKNOWN")
+            continue
+        native_remaining = remaining / multiplier
         leg_rules = _rules_for_leg(rules, leg_type)
         step = _step_for_leg(leg_rules)
         try:
-            floored = _floor_to_step(remaining, step)
+            floored_native = _floor_to_step(native_remaining, step)
         except ValueError:
-            floored = remaining
-        if floored == 0 and remaining > 0:
+            floored_native = native_remaining
+        if floored_native == 0 and native_remaining > 0:
             # Sub-step dust: separate column, never zeroed.
-            dust[leg_type] = _fmt(remaining)
+            dust[leg_type] = _fmt(native_remaining)
             top_reasons.append("DUST_BELOW_STEP")
             continue
-        if floored < 0 or floored > remaining:
+        if floored_native < 0 or floored_native > native_remaining:
             raise ValueError(f"floored qty out of range for {leg_type}")
-        is_fut = leg_type == "FUTURES_SHORT"
+        floored_canonical = floored_native * multiplier
         side = "BUY" if is_fut else "SELL"
         vwap = fut_vwap if is_fut else spot_vwap
         fx = fut_fx if is_fut else spot_fx
@@ -465,7 +476,8 @@ def build_pair_exit_guidance(
             try:
                 with localcontext() as ctx:
                     ctx.prec = 80
-                    notional = _fmt(floored * vwap * fx)
+                    qty_for_native_price = floored_native if is_fut else floored_canonical
+                    notional = _fmt(qty_for_native_price * vwap * fx)
             except (InvalidOperation, ValueError, ArithmeticError):
                 notional = None
         # Coverage string for transparency.
@@ -476,7 +488,7 @@ def build_pair_exit_guidance(
             except (InvalidOperation, ValueError, ArithmeticError):
                 coverage_str = None
         leg_reasons: list[str] = []
-        if floored != remaining:
+        if floored_native != native_remaining:
             leg_reasons.append("STEP_FLOORED")
         if orphan_kind is not None:
             # Only the surviving leg carries the orphan tag.
@@ -507,7 +519,7 @@ def build_pair_exit_guidance(
             "leg_type": leg_type,
             "venue": venue,
             "side": side,
-            "native_qty": _fmt(floored),
+            "native_qty": _fmt(floored_native),
             "qty_currency": qty_currency,
             "price_currency": price_currency,
             "vwap_native": _fmt(vwap) if vwap is not None else None,

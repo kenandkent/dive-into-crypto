@@ -6,9 +6,13 @@ fetched directly from the public ``/futures/data/*`` endpoints (rate-limited).
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import math
+import time
+from typing import Any, Callable
 
 from diveintocrypto_desktop.data.http import FAPI_DATA, get_json
+from diveintocrypto_desktop.shortlab import observations as _obs
+from diveintocrypto_desktop.shortlab.request_budget import RequestContext
 
 # Binance publishes long-short ratios for these periods only (9 of the 12 TFs).
 RATIO_PERIODS = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
@@ -44,6 +48,65 @@ async def top_position_ls(symbol: str, period: str = "5m", limit: int = 48) -> l
 
 async def taker_ls(symbol: str, period: str = "5m", limit: int = 48) -> list[float]:
     return await _series("takerlongshortRatio", symbol, period, limit, "buySellRatio")
+
+
+async def fetch_taker_ratio_observed(
+    symbol: str,
+    period: str = "5m",
+    limit: int = 1,
+    *,
+    now_ms: int | None = None,
+    clock_ms: Callable[[], int] | None = None,
+    request_context: RequestContext | None = None,
+) -> _obs.Observed[float | None]:
+    """Fetch the newest taker buy/sell ratio with its source and receipt time.
+
+    This is the cutoff-frozen squeeze confirm input. It uses the same public
+    futures/data endpoint as :func:`taker_ls`, while retaining the endpoint's
+    timestamp and forwarding the caller's request budget context.
+    """
+    chosen_period = period if period in RATIO_PERIODS else "5m"
+    url = f"{FAPI_DATA}/futures/data/takerlongshortRatio"
+    payload = await get_json(
+        url,
+        {"symbol": symbol, "period": chosen_period, "limit": int(limit)},
+        rate_limited=True,
+        request_context=request_context,
+    )
+    rows = payload if isinstance(payload, list) else []
+    valid: list[tuple[int, float]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            source_ms = int(row["timestamp"])
+            value = float(row["buySellRatio"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            valid.append((source_ms, value))
+    completed = (
+        int(now_ms) if now_ms is not None
+        else int(clock_ms() if clock_ms is not None else time.time() * 1000)
+    )
+    if not valid:
+        return _obs.make_observation(
+            None,
+            source="binance-futures-data:takerlongshortRatio",
+            source_as_of_ms=None,
+            fetched_at_ms=completed,
+            known_at_ms=completed,
+            status="UNAVAILABLE",
+            reason_code="TAKER_RATIO_UNAVAILABLE",
+        )
+    source_ms, value = max(valid, key=lambda item: item[0])
+    return _obs.make_observation(
+        value,
+        source="binance-futures-data:takerlongshortRatio",
+        source_as_of_ms=source_ms,
+        fetched_at_ms=completed,
+        known_at_ms=completed,
+    )
 
 
 async def position_ls_timeseries(symbol: str, period: str, limit: int = 60) -> dict[str, list]:

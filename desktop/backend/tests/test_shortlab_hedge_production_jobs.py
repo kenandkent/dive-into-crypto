@@ -54,7 +54,7 @@ async def test_opportunity_persists_real_fcs_and_quote_for_shortlist():
     svc=SimpleNamespace(_repository=repo,_config=cfg,_ensure_hedge_available=AsyncMock(),_universe_fn=lambda n:[{'symbol':'1000PEPEUSDT','quote_volume':100}],_hedge_identity_for=AsyncMock(return_value={'canonical_id':'pepe','contract_multiplier':1000,'identity_confidence':'VERIFIED'}),_hedge_mark_for=AsyncMock(return_value={'price':'0.00001','canonical_price_usd':'0.00001'}),_hedge_funding_for=AsyncMock(return_value=FundingMetrics('1000PEPEUSDT')),_hedge_quote_for=AsyncMock(return_value={'snapshot_id':'q','venue':'BINANCE_SPOT','mid_price':'0.00001','as_of_ms':100000,'fetched_at_ms':100000,'status':'OK'}))
     jobs=HedgeJobs(svc)
     result=await jobs.opportunity(SimpleNamespace(trace_id='t',clock_ms=lambda:100000))
-    assert result.stats=={'computed':1,'failed':0}
+    assert result.stats['computed']==1 and result.stats['failed']==0
     assert svc._hedge_quote_for.call_args.args[1]=='1.0000E+9'
     record=repo.save_funding_capture_snapshot.call_args.args[0]
     assert record['fcs'] is None
@@ -100,7 +100,7 @@ async def test_real_repository_jobs_persist_prices_fcs_and_negative_funding_aler
     jobs=HedgeJobs(svc); ctx=SimpleNamespace(trace_id='real',clock_ms=lambda:clock[0])
     try:
         result=await svc.run_hedge_opportunity(ctx)
-        assert result.stats['computed']==1
+        assert result.stats['computed']==1, result.stats
         saved=await repo.list_fcs('BTCUSDT')
         assert saved[0]['fcs'] is not None
         await repo.save_hedge_simulation(_sim())
@@ -191,7 +191,7 @@ async def test_opportunity_writes_projection_v2_queryable_without_manual_seed(tm
                               _hedge_quote_for=AsyncMock(return_value=dict(quote)))
         jobs = HedgeJobs(svc)
         result = await jobs.opportunity(SimpleNamespace(trace_id='t', clock_ms=lambda: NOW))
-        assert result.stats == {'computed': 1, 'failed': 0}
+        assert result.stats['computed'] == 1 and result.stats['failed'] == 0
         # Raw row carries the frozen envelope (identity + projection_v2).
         rows = await repo.list_fcs('BTCUSDT')
         assert len(rows) == 1
@@ -293,7 +293,9 @@ async def test_cr14_opportunity_forwards_caller_context_to_market():
     jobs = HedgeJobs(svc)
     ctx = SimpleNamespace(trace_id='t', clock_ms=lambda: 100000, request_budget=None)
     result = await jobs.opportunity(ctx, job_id='funding_capture_refresh')
-    assert result.stats == {'computed': 1, 'failed': 0}
+    assert result.stats['computed'] == 1 and result.stats['failed'] == 0
+    assert result.stats['cohort_capture_attempted'] == 0
+    assert result.stats['cohort_capture_failed'] == 0
     assert seen.get('jt') == 'opportunity', seen
     assert seen.get('jid') == 'funding_capture_refresh', seen
     assert isinstance(seen.get('dl'), int), seen

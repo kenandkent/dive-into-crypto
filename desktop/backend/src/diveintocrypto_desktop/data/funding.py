@@ -11,9 +11,11 @@ explicit ``None`` — never a zero dressed as data.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from aiolimiter import AsyncLimiter
 
@@ -421,6 +423,15 @@ def funding_lens(
 _FUNDING_SOURCE = "binance-futures-funding"
 
 
+def _completion_ms(
+    now_ms: int | None, clock_ms: Callable[[], int] | None
+) -> int:
+    """Read receipt time after transport; ``now_ms`` remains test injection."""
+    if now_ms is not None:
+        return int(now_ms)
+    return int(clock_ms() if clock_ms is not None else time.time() * 1000)
+
+
 async def fetch_funding_history_observed(
     symbol: str,
     start_ms: int,
@@ -429,6 +440,7 @@ async def fetch_funding_history_observed(
     *,
     as_of_ms: int | None = None,
     now_ms: int | None = None,
+    clock_ms: Callable[[], int] | None = None,
     identity_snapshot_id: str | None = None,
     request_context: RequestContext | None = None,
 ) -> _obs.Observed[list[dict]]:
@@ -446,7 +458,7 @@ async def fetch_funding_history_observed(
     events = await funding_history_range(
         symbol, start_ms, end_ms, limit=limit, request_context=request_context
     )
-    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    completed = _completion_ms(now_ms, clock_ms)
     cov = funding_coverage(events, start_ms, end_ms)
     source_as_of = cov.last_event_ms
     ok = bool(cov.complete)
@@ -466,11 +478,81 @@ async def fetch_funding_history_observed(
     )
 
 
+async def persist_funding_event_receipts(
+    observed: _obs.Observed[list[dict[str, Any]]],
+    repository: Any,
+    *,
+    symbol: str | None = None,
+) -> tuple[str, ...]:
+    """Persist one immutable receipt per event in an observed response.
+
+    Every row keeps the response's original ``known_at``/``fetched_at`` and
+    source time. Event rates are copied from that response into ``raw_json``;
+    no interval is inferred or stamped here. Reusing canonical archive rows
+    is not an observation and must not be passed to this function.
+    """
+    meta = getattr(observed, "meta", None)
+    if meta is None:
+        raise ValueError("observed funding response must carry metadata")
+    known_at = getattr(meta, "known_at_ms", None)
+    fetched_at = getattr(meta, "fetched_at_ms", None)
+    if isinstance(known_at, bool) or not isinstance(known_at, int):
+        raise ValueError("funding response known_at_ms must be an integer")
+    if isinstance(fetched_at, bool) or not isinstance(fetched_at, int):
+        raise ValueError("funding response fetched_at_ms must be an integer")
+    save = getattr(repository, "save_funding_observation", None)
+    if not callable(save):
+        raise ValueError("repository must implement save_funding_observation")
+
+    source = str(getattr(meta, "source", "") or "")
+    source_as_of = getattr(meta, "source_as_of_ms", None)
+    window_start = getattr(meta, "window_start_ms", None)
+    window_end = getattr(meta, "window_end_ms", None)
+    ids: list[str] = []
+    for event in getattr(observed, "value", ()) or ():
+        if not isinstance(event, dict):
+            continue
+        event_time = _event_time_ms(event)
+        if event_time is None:
+            continue
+        event_symbol = event.get("symbol") or symbol
+        if not isinstance(event_symbol, str) or not event_symbol:
+            raise ValueError("funding event receipt requires symbol")
+        receipt = {
+            "source": source,
+            "source_as_of_ms": source_as_of,
+            "fetched_at_ms": fetched_at,
+            "known_at_ms": known_at,
+            "status": getattr(meta, "status", None),
+            "reason_code": getattr(meta, "reason_code", None),
+            "window_start_ms": window_start,
+            "window_end_ms": window_end,
+        }
+        raw_json = {"event": dict(event), "receipt": receipt}
+        canonical = json.dumps(raw_json, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, default=str)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        observation_id = f"funding:{event_symbol}:{event_time}:{known_at}:{digest}"
+        await save({
+            "observation_id": observation_id,
+            "symbol": event_symbol,
+            "funding_time_ms": int(event_time),
+            "known_at_ms": int(known_at),
+            "raw_json": raw_json,
+            "interval_hours": None,
+            "interval_source": None,
+            "observation_status": str(getattr(meta, "status", "OBSERVED") or "OBSERVED"),
+        })
+        ids.append(observation_id)
+    return tuple(ids)
+
+
 async def fetch_premium_index_observed(
     symbol: str,
     *,
     as_of_ms: int | None = None,
     now_ms: int | None = None,
+    clock_ms: Callable[[], int] | None = None,
     identity_snapshot_id: str | None = None,
     request_context: RequestContext | None = None,
 ) -> _obs.Observed[dict]:
@@ -482,7 +564,7 @@ async def fetch_premium_index_observed(
     """
     _ = as_of_ms  # decision cutoff is enforced downstream via validate_observation
     row = await premium_index(symbol, request_context=request_context)
-    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    completed = _completion_ms(now_ms, clock_ms)
     return _obs.make_observation(
         row,
         source=_FUNDING_SOURCE,
@@ -556,7 +638,7 @@ async def fetch_funding_info(
     ctx = request_context if request_context is not None else get_current_request_context()
     rows: Any = await _budgeted_get_json(f"{FAPI_V1}/fundingInfo", None, ctx)
     if rows is None:
-        return []
+        raise ValueError("fundingInfo response payload is missing")
     if isinstance(rows, dict):
         # Some mirrors wrap the list; keep the raw rows verbatim.
         for key in ("data", "rows", "symbols"):
@@ -564,14 +646,22 @@ async def fetch_funding_info(
                 rows = rows[key]
                 break
         else:
-            return [rows]
-    return list(rows) if isinstance(rows, list) else []
+            raise ValueError("fundingInfo response is not a complete list")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict)
+        or not isinstance(row.get("symbol"), str)
+        or not row.get("symbol")
+        for row in rows
+    ):
+        raise ValueError("fundingInfo response has malformed rows")
+    return list(rows)
 
 
 async def fetch_funding_info_observed(
     *,
     as_of_ms: int | None = None,
     now_ms: int | None = None,
+    clock_ms: Callable[[], int] | None = None,
     identity_snapshot_id: str | None = None,
     request_context: RequestContext | None = None,
 ) -> _obs.Observed[list[dict]]:
@@ -583,7 +673,7 @@ async def fetch_funding_info_observed(
     """
     _ = as_of_ms
     rows = await fetch_funding_info(request_context=request_context)
-    completed = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    completed = _completion_ms(now_ms, clock_ms)
     return _obs.make_observation(
         rows,
         source=_FUNDING_INFO_SOURCE,
@@ -934,6 +1024,7 @@ def default_8h_segments(
         candidates.append(s)
     candidates.sort()
     version = _default_regime_version(default_regime) if default_regime is not None else None
+    default_source = _default_regime_source(default_regime) if default_regime is not None else None
     segments: list[Any] = []
     statuses: Any = symbol_statuses if isinstance(symbol_statuses, dict) else {}
     # Support Mapping-like statuses with .get
@@ -954,9 +1045,13 @@ def default_8h_segments(
         verification = "CONFIRMED" if confirmed else "UNKNOWN"
         schedule_id = f"{symbol}:{observed}:{DEFAULT_FUNDING_INTERVAL_HOURS}"
         if version:
-            evidence_ref = f"{evidence_ref_prefix}:{symbol}:{known}:default:{version}"
+            evidence_ref = (
+                f"{evidence_ref_prefix}:{symbol}:{known}:default:{version}"
+                f":{default_source}"
+            )
         else:
             evidence_ref = f"{evidence_ref_prefix}:{symbol}:{known}"
+        segment_source = default_source if confirmed and default_source else source
         if FundingScheduleSegment is None:
             segments.append(
                 {
@@ -967,7 +1062,7 @@ def default_8h_segments(
                     "interval_hours": DEFAULT_FUNDING_INTERVAL_HOURS,
                     "anchor_ms": observed,
                     "known_at_ms": known,
-                    "source": source,
+                    "source": segment_source,
                     "evidence_ref": evidence_ref,
                     "verification": verification,
                 }
@@ -982,7 +1077,7 @@ def default_8h_segments(
                     interval_hours=DEFAULT_FUNDING_INTERVAL_HOURS,
                     anchor_ms=observed,
                     known_at_ms=known,
-                    source=source,
+                    source=segment_source,
                     evidence_ref=evidence_ref,
                     verification=verification,
                 )
@@ -1308,6 +1403,7 @@ async def collect_and_archive_funding_schedules(
     default_regime: Any | None = None,
     observed_at_ms: int | None = None,
     now_ms: int | None = None,
+    clock_ms: Callable[[], int] | None = None,
     identity_snapshot_id: str | None = None,
     request_context: RequestContext | None = None,
     persist_raw_observation: bool = True,
@@ -1324,8 +1420,9 @@ async def collect_and_archive_funding_schedules(
        (``known_at``/``fetched_at``) is preserved verbatim in every saved
        segment (never restamped with save time).
     2. Build adjusted + default-8h segments with ``effective_from`` equal to
-       the observation boundary (``known_at`` unless ``observed_at_ms`` is
-       explicitly injected for tests). History is never backfilled.
+       the response receipt boundary (``known_at``). The legacy
+       ``observed_at_ms`` is ignored so a pre-request cutoff cannot backdate
+       this response. History is never backfilled.
     3. Idempotent archive: a CONFIRMED segment is skipped when a covering
        CONFIRMED row with the same interval already exists
        (``effective_from <= observed`` and open). Stale open CONFIRMED rows
@@ -1352,6 +1449,7 @@ async def collect_and_archive_funding_schedules(
     try:
         observed = await fetch_funding_info_observed(
             now_ms=now_ms,
+            clock_ms=clock_ms,
             identity_snapshot_id=identity_snapshot_id,
             request_context=request_context,
         )
@@ -1380,20 +1478,27 @@ async def collect_and_archive_funding_schedules(
         known_at = int(getattr(getattr(observed, "meta", None), "known_at_ms"))
     except (AttributeError, TypeError, ValueError):
         known_at = int(now_ms) if now_ms is not None else int(time.time() * 1000)
-    observed_at = int(observed_at_ms) if observed_at_ms is not None else int(known_at)
+    observed_at = int(known_at)
     adjusted_set = _adjusted_symbols_of(rows)
 
     # 2. Build (adjusted + defaults). response_ok=True here (fetch succeeded).
     universe: Any | None = symbols
     if universe is None and isinstance(symbol_statuses, dict):
         universe = tuple(symbol_statuses.keys())
+    observed_default_regime: Any = default_regime
+    if isinstance(default_regime, dict):
+        # The verified FAQ + this complete response become jointly known at
+        # this actual response receipt. Caller request-start timestamps must
+        # never make the default rule available earlier than it was checked.
+        observed_default_regime = dict(default_regime)
+        observed_default_regime["known_at_ms"] = int(known_at)
     segments = build_funding_schedule_segments(
         rows,
         observed_at_ms=observed_at,
         known_at_ms=known_at,
         symbols=universe,
         symbol_statuses=symbol_statuses,
-        default_regime=default_regime,
+        default_regime=observed_default_regime,
         response_ok=True,
         evidence_ref_prefix=evidence_ref_prefix,
     )

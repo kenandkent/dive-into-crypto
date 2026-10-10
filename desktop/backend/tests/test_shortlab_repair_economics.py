@@ -208,6 +208,16 @@ def test_compute_contract_vwap_weighted_and_partial() -> None:
     assert part["coverage"] == "0.2"
 
 
+def test_1000_multiplier_canonical_position_converts_to_native_contract_qty() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.units import (
+        canonical_to_contract_qty,
+        contract_to_canonical_qty,
+    )
+
+    assert canonical_to_contract_qty("1234", "1000") == "1.234"
+    assert contract_to_canonical_qty("1.234", "1000") == "1234"
+
+
 # ---------------------------------------------------------------------------
 # V07: economics.
 # ---------------------------------------------------------------------------
@@ -403,3 +413,43 @@ def test_build_ratio_proposal_unknown_spot_for_h1() -> None:
     assert prop.spot_venue is None
     assert prop.execution_gate.status != "PASS"
     assert "spot" not in prop.quote_refs
+
+
+def test_position_scenarios_use_exact_remaining_pair_and_fx_shocks() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.economics import evaluate_position_scenarios
+
+    scenarios = evaluate_position_scenarios(
+        futures_qty="2", spot_qty="1", futures_mark="100", liquidation_price="250",
+        futures_entry_price="100", futures_entry_fx="1.02",
+        futures_exit_price="100", futures_exit_fx="1.01",
+        spot_entry_price="100", spot_entry_fx="1.01",
+        spot_exit_price="100", spot_exit_fx="1.01",
+        futures_exit_fee_rate="0.0005", spot_exit_fee_rate="0.001",
+        entry_cost_usd="0", slippage_usd="0", gas_usd="0",
+        policy={"exit_stress_bps": 100},
+    )
+    assert len(scenarios) == 6
+    by_id = {row.scenario_id: row for row in scenarios}
+    # A balanced quantity assumption would hide this loss: exact remaining
+    # futures qty is twice spot qty, and the +100% shock loses on the net short.
+    assert by_id["UP_100"].status == "VALID"
+    assert Decimal(by_id["UP_100"].loss_usd or "0") > Decimal("100")
+    assert by_id["FX_DOWN"].status == "VALID"
+    assert by_id["FX_DOWN"].net_pnl_usd is not None
+
+
+def test_position_scenarios_do_not_zero_fill_unknown_fx_or_stop() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.economics import evaluate_position_scenarios
+
+    scenarios = evaluate_position_scenarios(
+        futures_qty="1", spot_qty="1", futures_mark="10", liquidation_price="100",
+        futures_entry_price="10", futures_entry_fx=None,
+        futures_exit_price="10", futures_exit_fx="1",
+        spot_entry_price="10", spot_entry_fx="1",
+        spot_exit_price="10", spot_exit_fx="1",
+        futures_exit_fee_rate="0.0005", spot_exit_fee_rate="0.001",
+        entry_cost_usd="0", slippage_usd="0", gas_usd="0",
+        policy={"exit_stress_bps": 100},
+    )
+    assert len(scenarios) == 6
+    assert all(row.status == "UNKNOWN" and row.loss_usd is None for row in scenarios)

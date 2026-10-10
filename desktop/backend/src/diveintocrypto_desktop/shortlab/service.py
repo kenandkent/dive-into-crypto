@@ -656,6 +656,7 @@ class ShortLabService:
             from diveintocrypto_desktop.data import universe as _universe
 
             self._metadata_fn = _universe.contract_metadata_all
+        self._uses_default_funding_history = funding_history_fn is None
         if funding_history_fn is not None:
             self._funding_history_fn = funding_history_fn
         else:
@@ -719,6 +720,7 @@ class ShortLabService:
         # unit tests inject fakes without them.
         self._identity_catalog = identity_catalog
         self._request_budget = request_budget
+        self._micro_taker_calls_this_generation = 0
         self._observed_cache = observed_cache
         self._quality_policy = quality_policy
         if self._quality_policy is None:
@@ -1396,25 +1398,10 @@ class ShortLabService:
                             if isinstance(e.get("t"), int) and e.get("funding_rate") is not None
                         ]
                     )
-                    latest_t = max(int(e.get("t")) for e in events if isinstance(e.get("t"), int))
-                    try:
-                        await repo.save_funding_observation(
-                            {
-                                "observation_id": f"obs-{sym}-{int(cutoff_ms)}",
-                                "symbol": sym,
-                                "funding_time_ms": int(latest_t),
-                                "known_at_ms": int(cutoff_ms),
-                                "raw_json": {
-                                    "event_count": len(events),
-                                    "window": "90d",
-                                },
-                                "interval_hours": 8.0,
-                                "interval_source": "fundingRate",
-                                "observation_status": "OBSERVED",
-                            }
-                        )
-                    except Exception:
-                        pass
+                    # Do not turn a canonical event archive into a synthetic
+                    # observation receipt.  Only the actual response receipt
+                    # persisted by ``persist_funding_event_receipts`` may
+                    # assert when an exchange event became known.
             except Exception as exc:  # noqa: BLE001 - funding persistence never fails scoring
                 log.debug("persist funding events skipped for %s: %s", sym, str(exc)[:100])
             # Fundamental snapshot (immutable per as_of; feature references it).
@@ -1724,12 +1711,38 @@ class ShortLabService:
                 )
             else:
                 _sched_ctx = None
+            # Confirmation of the versioned official unadjusted 8h regime
+            # requires a complete current fundingInfo response plus a fresh
+            # exchangeInfo status of TRADING for that symbol. The collector
+            # binds the receipt/effective start to its actual response time.
+            _symbol_statuses: dict[str, str] = {}
+            try:
+                from diveintocrypto_desktop.shortlab.request_budget import scoped_request_context as _scoped_status
+                _status_ctx = _mk_sched_ctx(
+                    budget, job_type="funding_backfill", host="fapi",
+                    endpoint_family="exchangeInfo", trace_id=f"{context.trace_id}:statuses",
+                ) if budget is not None else None
+                with _scoped_status(_status_ctx):
+                    _status_rows = await _maybe_await(self._metadata_fn())
+                if isinstance(_status_rows, Mapping):
+                    for _status_symbol, _status_raw in _status_rows.items():
+                        _status_meta = _contract_meta_dict(_status_raw)
+                        if _status_meta.get("status") is not None:
+                            _symbol_statuses[str(_status_symbol).upper()] = str(_status_meta.get("status")).upper()
+            except Exception:
+                _symbol_statuses = {}
             _sched_res = await _collect_sched(
                 repository=repo,
                 symbols=list(tracked) if tracked else None,
                 observed_at_ms=cutoff_ms,
-                now_ms=cutoff_ms,
                 request_context=_sched_ctx,
+                clock_ms=self._clock,
+                symbol_statuses=_symbol_statuses,
+                default_regime={
+                    "interval_hours": 8,
+                    "version": "binance-faq-360033525031@2026-10-09",
+                    "source": "binance-faq:360033525031",
+                },
             )
             if isinstance(_sched_res, Mapping):
                 schedules_saved = len(_sched_res.get("saved_ids") or ())
@@ -1768,6 +1781,7 @@ class ShortLabService:
                 processed.append(symbol)
                 continue
             try:
+                response_observed = None
                 if budget is not None:
                     from diveintocrypto_desktop.shortlab.request_budget import (
                         make_request_context,
@@ -1777,8 +1791,21 @@ class ShortLabService:
                     ctx = make_request_context(budget, job_type="funding_backfill",
                                                host="fapi", endpoint_family="fundingRate",
                                                trace_id=context.trace_id)
-                    with scoped_request_context(ctx):
-                        events = await _maybe_await(self._funding_history_fn(symbol, start_ms, cutoff_ms))
+                else:
+                    ctx = None
+                if self._uses_default_funding_history:
+                    from diveintocrypto_desktop.data.funding import (
+                        fetch_funding_history_observed as _fetch_funding_observed,
+                        persist_funding_event_receipts as _persist_funding_receipts,
+                    )
+                    response_observed = await _fetch_funding_observed(
+                        symbol, start_ms, cutoff_ms, clock_ms=self._clock,
+                        request_context=ctx)
+                    events = list(getattr(response_observed, "value", ()) or ())
+                    # Receipt rows are persisted before canonical event upsert;
+                    # if this fails the response is deferred and no event is
+                    # promoted as having an auditable known_at.
+                    await _persist_funding_receipts(response_observed, repo, symbol=symbol)
                 else:
                     events = await _maybe_await(self._funding_history_fn(symbol, start_ms, cutoff_ms))
             except Exception:
@@ -1789,16 +1816,29 @@ class ShortLabService:
             events = list(events or [])
             if events:
                 try:
+                    def _event_field(event: Any, *names: str) -> Any:
+                        for name in names:
+                            if isinstance(event, Mapping):
+                                value = event.get(name)
+                            else:
+                                value = getattr(event, name, None)
+                            if value is not None:
+                                return value
+                        return None
+                    _event_rows = []
+                    for e in events:
+                        t = _event_field(e, "t", "funding_time_ms", "fundingTime")
+                        rate = _event_field(e, "funding_rate", "fundingRate", "rate")
+                        if isinstance(t, int) and rate is not None:
+                            _event_rows.append({
+                                "symbol": symbol, "funding_time_ms": int(t),
+                                "funding_rate": str(rate),
+                                "mark_price": _event_field(e, "mark_price", "markPrice"),
+                            })
                     await repo.upsert_funding_events(
-                        [
-                            {"symbol": symbol, "funding_time_ms": int(e.get("t")),
-                             "funding_rate": float(e.get("funding_rate")),
-                             "mark_price": e.get("mark_price")}
-                            for e in events
-                            if isinstance(e.get("t"), int) and e.get("funding_rate") is not None
-                        ]
+                        _event_rows
                     )
-                    persisted_events += len(events)
+                    persisted_events += len(_event_rows)
                 except Exception:
                     pass
                 # Populate the shared cache (identical Observed, original known_at).
@@ -1811,7 +1851,7 @@ class ShortLabService:
                             ttl_ms = int(self._config.quality_freshness_sec["funding_history"].ttl) * 1000
                         except Exception:
                             pass
-                        observed = _obs.make_observation(
+                        observed = response_observed or _obs.make_observation(
                             list(events), source="binance-funding",
                             source_as_of_ms=max(int(e.get("t")) for e in events if isinstance(e.get("t"), int)),
                             fetched_at_ms=self._now(), known_at_ms=self._now(),
@@ -1934,8 +1974,9 @@ class ShortLabService:
             try:
                 from diveintocrypto_desktop.shortlab.request_budget import make_request_context
 
-                ctx = make_request_context(None, job_type="metadata", host="coingecko",
-                                           endpoint_family="coingecko-directory",
+                ctx = make_request_context(
+                    context.request_budget if context.request_budget is not None else self._request_budget,
+                    job_type="metadata", host="coingecko", endpoint_family="cgDirectory",
                                            trace_id=context.trace_id)
                 result = await catalog.refresh(ctx)
                 catalog_status = str(getattr(result, "status", None))
@@ -1979,6 +2020,158 @@ class ShortLabService:
         must not be used as production proof.
         """
         return await self._hedge_job_owner().capture_entries(context, capture_context, job_id=job_id)
+
+    async def _capture_market_entry_cohort(
+        self, *, cohort: str, source_snapshot_id: str, symbol: str,
+        decision_as_of_ms: int, policy: Mapping[str, Any], source_refs: Mapping[str, str],
+        funding_context: Any | None = None,
+    ) -> Any:
+        """Capture one frozen score/FCS cohort through the production job owner.
+
+        The three non-user cohorts have different immutable source snapshots,
+        but share the same real identity, funding, rules and evidence MarketPort
+        chain. This is deliberately best-effort at the caller: a sampling gap
+        cannot rewrite the score/FCS result.
+        """
+        from decimal import Decimal as _Dec
+        from diveintocrypto_desktop.shortlab.repair_contracts import CaptureContext as _CaptureContext
+        from diveintocrypto_desktop.shortlab.models import AssetIdentity as _AssetIdentity
+        from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _make_request_context
+
+        sym = str(symbol).upper()
+        identity_raw = await self._hedge_identity_for(sym)
+        if isinstance(identity_raw, _AssetIdentity):
+            identity = identity_raw
+        elif isinstance(identity_raw, Mapping):
+            identity = _AssetIdentity(
+                canonical_id=str(identity_raw.get("canonical_id") or sym.lower()),
+                display_symbol=str(identity_raw.get("display_symbol") or sym),
+                binance_futures_symbol=str(identity_raw.get("binance_futures_symbol") or sym),
+                binance_spot_symbol=identity_raw.get("binance_spot_symbol"),
+                contract_multiplier=identity_raw.get("contract_multiplier"),
+                multiplier_source=identity_raw.get("multiplier_source"),
+                coingecko_id=identity_raw.get("coingecko_id"),
+                mapping_confidence=str(identity_raw.get("mapping_confidence", identity_raw.get("identity_confidence", "UNRESOLVED")) or "UNRESOLVED"),
+                mapping_source=str(identity_raw.get("mapping_source", "OTHER") or "OTHER"),
+            )
+        else:
+            raise ValueError("capture identity unavailable")
+        multiplier = _Dec(str(identity.contract_multiplier)) if identity.contract_multiplier is not None else None
+        if multiplier is None or not multiplier.is_finite() or multiplier <= 0:
+            raise ValueError("capture contract multiplier unavailable")
+        trace = f"capture-{cohort.lower()}-{source_snapshot_id}"
+        request_context = _make_request_context(
+            getattr(self, "_request_budget", None), job_type="evidence", host="fapi",
+            trace_id=trace,
+        )
+        market = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+        mark = None
+        if market is not None and callable(getattr(market, "mark", None)):
+            import inspect as _inspect_capture
+            try:
+                if "request_context" in _inspect_capture.signature(market.mark).parameters:
+                    mark = await _maybe_await(market.mark(sym, request_context=request_context))
+                else:
+                    mark = await _maybe_await(market.mark(sym))
+            except (TypeError, ValueError):
+                mark = await _maybe_await(market.mark(sym))
+        if mark is None:
+            mark = await self._hedge_mark_for(sym)
+        mark_value = getattr(mark, "value", mark)
+        if isinstance(mark_value, Mapping):
+            price_usd = mark_value.get("canonical_price_usd")
+            if price_usd is None:
+                native = mark_value.get("native_price", mark_value.get("mark_price", mark_value.get("price")))
+                fx = mark_value.get("quote_to_usd", mark_value.get("quoteToUsd"))
+                if native is not None and fx is not None:
+                    price_usd = _Dec(str(native)) * _Dec(str(fx)) / multiplier
+        else:
+            price_usd = getattr(mark_value, "canonical_price_usd", None)
+        if price_usd is None or _Dec(str(price_usd)) <= 0:
+            raise ValueError("capture mark unavailable")
+        reference = getattr(getattr(self._config, "funding_capture", None), "reference_notional_usd", "10000")
+        canonical_qty = _Dec(str(reference)) / _Dec(str(price_usd))
+        futures_qty = canonical_qty / multiplier
+        if funding_context is None:
+            funding_context = await self._build_repair_funding_context(sym, int(decision_as_of_ms))
+        identity_snapshot_id = str(source_refs.get("identity_snapshot_id") or "")
+        if not identity_snapshot_id:
+            catalog = getattr(self, "_identity_catalog", None)
+            if catalog is None:
+                raise ValueError("capture identity snapshot reference unavailable")
+            identity_snapshot_id = str(catalog.snapshot_id_for(sym, identity, int(decision_as_of_ms)))
+        repo = self._repository
+        if repo is None:
+            raise ValueError("capture repository unavailable")
+        if await repo.get_identity_snapshot(identity_snapshot_id) is None:
+            catalog = getattr(self, "_identity_catalog", None)
+            mapping_version = str(getattr(catalog, "mapping_version", "overrides-v0+dir-none"))
+            await repo.save_identity_snapshot({
+                "identity_snapshot_id": identity_snapshot_id,
+                "futures_symbol": sym,
+                "canonical_id": identity.canonical_id,
+                "mapping_version": mapping_version,
+                "observed_at_ms": int(decision_as_of_ms),
+                "identity_json": {
+                    "canonical_id": identity.canonical_id,
+                    "display_symbol": identity.display_symbol,
+                    "coingecko_id": identity.coingecko_id,
+                    "contract_multiplier": str(identity.contract_multiplier),
+                    "multiplier_source": identity.multiplier_source,
+                    "mapping_confidence": identity.mapping_confidence,
+                    "mapping_source": identity.mapping_source,
+                },
+            })
+        rule_refs: dict[str, str] = {}
+        if market is not None and callable(getattr(market, "rules", None)):
+            import dataclasses as _dc_rules
+            import hashlib as _hash_rules
+            import json as _json_rules
+            for kind in ("futures", "spot"):
+                try:
+                    if "request_context" in _inspect_capture.signature(market.rules).parameters:
+                        rules_obj = await _maybe_await(market.rules(kind, sym, request_context=request_context))
+                    else:
+                        rules_obj = await _maybe_await(market.rules(kind, sym))
+                    if rules_obj is None:
+                        continue
+                    rules_data = (_dc_rules.asdict(rules_obj) if _dc_rules.is_dataclass(rules_obj)
+                                  else dict(rules_obj) if isinstance(rules_obj, Mapping) else {})
+                    source_ms = rules_data.get("source_as_of_ms")
+                    known_ms = rules_data.get("known_at_ms")
+                    if source_ms is None or known_ms is None:
+                        continue
+                    content = _json_rules.dumps(rules_data, sort_keys=True, separators=(",", ":"), default=str)
+                    rule_id = f"rules-{sym}-{kind}-{int(source_ms)}-{_hash_rules.sha256(content.encode()).hexdigest()[:16]}"
+                    await repo.save_contract_rules_snapshot({
+                        "snapshot_id": rule_id, "symbol": sym,
+                        "source_as_of_ms": int(source_ms), "known_at_ms": int(known_ms),
+                        "rules_json": rules_data,
+                    })
+                    if await repo.get_contract_rules_snapshot(rule_id) is not None:
+                        rule_refs[kind] = rule_id
+                except Exception:
+                    continue
+        if not rule_refs.get("futures"):
+            raise ValueError("capture futures rules snapshot reference unavailable")
+        context = _CaptureContext(
+            cohort=str(cohort), source_snapshot_id=str(source_snapshot_id), symbol=sym,
+            identity=identity, identity_snapshot_id=identity_snapshot_id,
+            funding_context=funding_context,
+            futures_contract_qty=format(futures_qty, "f"),
+            canonical_futures_qty=format(canonical_qty, "f"),
+            strategies=("UNHEDGED_0", "ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25"),
+            decision_as_of_ms=int(decision_as_of_ms), policy=dict(policy),
+            rule_refs=rule_refs,
+            source_refs={str(k): str(v) for k, v in source_refs.items()},
+        )
+        job_context = JobContext(
+            repository=self._repository, config=self._config, clock_ms=self._clock,
+            request_budget=self._request_budget, trace_id=trace,
+        )
+        return await self._hedge_job_owner().capture_entries(
+            job_context, context, job_id=trace,
+        )
 
     async def run_strategy_quote_collection(
         self, context: JobContext, as_of_ms: int, *, job_id: str | None = None
@@ -2232,6 +2425,7 @@ class ShortLabService:
         from diveintocrypto_desktop.shortlab.repository import ScoreSnapshotRecord
 
         repo = self._require_available()
+        self._micro_taker_calls_this_generation = 0
         started_ms = self._now()
         wall_start = time.monotonic()
         await repo.create_job_run(job_id, job_type, started_ms)
@@ -2321,6 +2515,7 @@ class ShortLabService:
                 # build FeatureInputs downstream (observations are F02 Observed).
                 outcome.setdefault("decision_cutoff_ms", int(decision_cutoff))
                 outcome["identity_snapshot_id"] = base_ids.get("identity_snapshot_id")
+                outcome["rules_snapshot_id"] = base_ids.get("rules_snapshot_id")
             except Exception as exc:  # noqa: BLE001 - base tables never fail scoring
                 log.debug("base tables skipped for %s: %s", symbol, str(exc)[:100])
             scored.append(outcome)
@@ -2456,6 +2651,53 @@ class ShortLabService:
             finished_at_ms=finished_ms,
             stats=stats,
         )
+        # CR15: real RESEARCH_CANDIDATE and EXECUTABLE_DIRECTIONAL producer
+        # triggers. Use committed score snapshot IDs and frozen status inputs;
+        # capture's UTC-day gate avoids sampling every refresh. Bound to the
+        # existing EntryTop10 head so the background evidence path cannot add
+        # an unbounded request fanout to a score generation.
+        _score_ids = {str(r.symbol): str(r.snapshot_id) for r in records}
+        _capture_attempted = _capture_failed = 0
+        _capture_cap = max(1, int(self._config.universe.entry_depth_top))
+        for _outcome in ranked[:_capture_cap]:
+            _sym_c = str(_outcome.get("symbol") or "").upper()
+            _score_id = _score_ids.get(_sym_c)
+            _state_c = _outcome.get("state")
+            if not _score_id or _state_c is None:
+                continue
+            _identity_c = _outcome.get("identity")
+            _identity_id_c = str(_outcome.get("identity_snapshot_id") or "")
+            _policy_c = {
+                "candidate_status": str(getattr(_state_c, "candidate_status", "UNKNOWN")),
+                "execution_status": str(getattr(_state_c, "execution_status", "UNKNOWN")),
+                "readiness": "READY" if (
+                    str(getattr(_state_c, "execution_status", "")) == "READY"
+                    and not tuple(getattr(_state_c, "vetoes", ()) or ())
+                    and not tuple(getattr(_state_c, "pauses", ()) or ())
+                ) else "NOT_READY",
+                "vetoes": list(getattr(_state_c, "vetoes", ()) or ()),
+                "pauses": list(getattr(_state_c, "pauses", ()) or ()),
+            }
+            _refs_c = {"score_snapshot_id": _score_id}
+            if _identity_id_c:
+                _refs_c["identity_snapshot_id"] = _identity_id_c
+            _rules_id_c = str(_outcome.get("rules_snapshot_id") or "")
+            if _rules_id_c:
+                _refs_c["rules_snapshot_id"] = _rules_id_c
+            try:
+                for _cohort_c in ("RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL"):
+                    _capture_attempted += 1
+                    await self._capture_market_entry_cohort(
+                        cohort=_cohort_c, source_snapshot_id=_score_id, symbol=_sym_c,
+                        decision_as_of_ms=int(_outcome.get("decision_cutoff_ms", as_of_ms)),
+                        policy=_policy_c, source_refs=_refs_c,
+                    )
+            except Exception as _capture_exc:
+                _capture_failed += 1
+                log.debug("hedge entry cohort capture unavailable for %s: %s: %s",
+                          _sym_c, type(_capture_exc).__name__, _capture_exc)
+        stats["cohort_capture_attempted"] = _capture_attempted
+        stats["cohort_capture_failed"] = _capture_failed
         by_status: dict[str, int] = {}
         for outcome in scored:
             by_status[outcome["state"].status] = by_status.get(outcome["state"].status, 0) + 1
@@ -2571,6 +2813,51 @@ class ShortLabService:
             except Exception:
                 pass
         funding = await self._fetch_funding(symbol, exchange_meta, as_of_ms, now)
+
+        # CR23: collect the real taker-ratio confirmation only when both
+        # price/OI squeeze prerequisites already hold. Cap these same-round
+        # attempts at EntryTop10; the endpoint still passes through the shared
+        # ratio budget. It is attached before the final cutoff is frozen, so
+        # its actual receipt time is never backdated or used to refreeze a
+        # later result.
+        try:
+            probe_inputs = self._build_inputs(
+                symbol, row, identity, exchange_meta, fund_data, spot_result,
+                market, funding, int(as_of_ms),
+            )
+            price_7d = _finite(probe_inputs.get("price_change_7d"))
+            oi_7d = _finite(probe_inputs.get("oi_change_7d"))
+            observations = market.get("observations", {})
+            if not isinstance(observations, dict):
+                observations = dict(observations) if isinstance(observations, Mapping) else {}
+            micro_raw = observations.get("micro_score")
+            micro_val = getattr(micro_raw, "value", micro_raw)
+            micro_known = getattr(getattr(micro_raw, "meta", None), "known_at_ms", None)
+            try:
+                micro_confirmed = micro_val is not None and (
+                    micro_known is None or int(micro_known) <= int(as_of_ms))
+            except (TypeError, ValueError):
+                micro_confirmed = False
+            if (price_7d is not None and oi_7d is not None
+                    and price_7d >= 0.10 and oi_7d >= 0.10
+                    and not micro_confirmed
+                    and observations.get("taker_buy_ratio") is None
+                    and self._micro_taker_calls_this_generation < max(1, int(self._config.universe.entry_depth_top))):
+                self._micro_taker_calls_this_generation += 1
+                from diveintocrypto_desktop.data.ratios import fetch_taker_ratio_observed
+                from diveintocrypto_desktop.shortlab.request_budget import make_request_context
+                taker_context = make_request_context(
+                    self._request_budget, job_type="entry", host="fapi",
+                    endpoint_family="ratio", trace_id=f"taker-confirm-{symbol}-{int(as_of_ms)}",
+                )
+                taker_observed = await fetch_taker_ratio_observed(
+                    str(symbol).upper(), period="5m", limit=1,
+                    clock_ms=self._clock, request_context=taker_context,
+                )
+                observations["taker_buy_ratio"] = taker_observed
+                market["observations"] = observations
+        except Exception as _taker_exc:
+            log.debug("same-round taker confirmation unavailable for %s: %s", symbol, type(_taker_exc).__name__)
 
         # Collection precedes the decision freeze. Never call the batch
         # start time the time at which late network responses were known.
@@ -2840,7 +3127,18 @@ class ShortLabService:
                     ctx = make_request_context(self._request_budget, job_type="score_refresh",
                         host="fapi", endpoint_family="fundingRate", trace_id=f"funding-{symbol}-{as_of_ms}")
                     with scoped_request_context(ctx):
-                        fetched = await _maybe_await(self._funding_history_fn(symbol, missing_start, as_of_ms))
+                        if self._uses_default_funding_history:
+                            from diveintocrypto_desktop.data.funding import (
+                                fetch_funding_history_observed as _fetch_observed,
+                                persist_funding_event_receipts as _persist_receipts,
+                            )
+                            fetched_observed = await _fetch_observed(
+                                symbol, missing_start, as_of_ms, clock_ms=self._clock,
+                                request_context=ctx)
+                            await _persist_receipts(fetched_observed, self._repository, symbol=symbol)
+                            fetched = list(getattr(fetched_observed, "value", ()) or ())
+                        else:
+                            fetched = await _maybe_await(self._funding_history_fn(symbol, missing_start, as_of_ms))
                     fetch_succeeded = True
                     events = list({int(e["t"]): e for e in existing + list(fetched or [])}.values())
                     if fetched and self._repository is not None and hasattr(self._repository, "upsert_funding_events"):
@@ -5458,9 +5756,23 @@ class ShortLabService:
         plan_config = {"target_hedge_ratio": str(target_ratio) if target_ratio is not None else "1",
                        "identity": identity_dict, "contract_multiplier": identity_dict.get("contract_multiplier"),
                        "multiplier_source": identity_dict.get("multiplier_source"), "source_meta": meta}
+        for _econ_key in ("leverage", "margin_mode", "margin_usd", "planned_hold_days"):
+            if snake.get(_econ_key) is not None:
+                plan_config[_econ_key] = snake.get(_econ_key)
         try:
             if isinstance(sim_input, Mapping):
                 plan_config["simulation_input"] = dict(sim_input)
+                # Protection confirmation and activation must hash the same
+                # frozen safety inputs. Keep them top-level in plan config as
+                # well as inside the simulation receipt so the confirmation
+                # path never substitutes triggerPrice for liquidationPrice.
+                for _safety_key in (
+                    "liquidation_price", "liquidation_price_source",
+                    "liquidation_price_updated_at_ms", "stop_trigger_price",
+                    "stop_trigger_basis", "stop_policy",
+                ):
+                    if sim_input.get(_safety_key) is not None:
+                        plan_config[_safety_key] = sim_input.get(_safety_key)
         except Exception:
             pass
         # R10b: persist the decision link + goal for Gate/version/reference checks.
@@ -5496,6 +5808,9 @@ class ShortLabService:
         }
         if snake.get("fcs_snapshot_id") is not None:
             record["fcs_snapshot_id"] = snake.get("fcs_snapshot_id")
+        for _plan_key in ("leverage", "margin_mode", "margin_usd"):
+            if snake.get(_plan_key) is not None:
+                record[_plan_key] = snake.get(_plan_key)
         if snake.get("planned_hold_days") is not None:
             try:
                 record["planned_hold_days"] = int(snake.get("planned_hold_days"))  # type: ignore[assignment]
@@ -5783,6 +6098,7 @@ class ShortLabService:
                 _fx_map_one: dict[str, Any] = {}
                 if _sym_fx and _exec_ms is not None:
                     async def _one_fx(_ccy: Any) -> tuple[Any | None, Any | None]:
+                        nonlocal _known_by
                         try:
                             if not isinstance(_ccy, str) or not _ccy.strip():
                                 return None, None
@@ -5792,6 +6108,62 @@ class ShortLabService:
                             if not hasattr(repo, "get_fx_at"):
                                 return None, None
                             _row = await repo.get_fx_at(_c, int(_exec_ms), int(_known_by), 60000)
+                            if not isinstance(_row, Mapping) and int(_known_by) - int(_exec_ms) <= 60000:
+                                # A manual fill may be the first consumer of a
+                                # live quote currency. Freeze the provider's
+                                # actual source timestamp and receipt with the
+                                # fill so later PnL reads the same auditable FX
+                                # observation; never backdate a response whose
+                                # market timestamp follows the execution.
+                                _market_fx = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+                                _fx_fn = getattr(_market_fx, "_fx", None) if _market_fx is not None else None
+                                if callable(_fx_fn) and hasattr(repo, "save_fx_observation"):
+                                    try:
+                                        from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mk_fx_ctx
+
+                                        _fx_ctx = _mk_fx_ctx(
+                                            getattr(self, "_request_budget", None),
+                                            job_type="interactive", host="api.coingecko.com",
+                                            trace_id=f"hedge-event-fx-{_eid_save}-{_c.lower()}",
+                                        )
+                                        try:
+                                            _rate_raw = await _fx_fn(_c, request_context=_fx_ctx)
+                                        except TypeError:
+                                            _rate_raw = await _fx_fn(_c)
+                                        # The response receipt occurs after
+                                        # request dispatch. Advance only the
+                                        # knowledge cutoff; source_as_of must
+                                        # still be <= the fill execution time.
+                                        _known_by = max(int(_known_by), int(self._now()))
+                                        _prov = getattr(_market_fx, "_fx_provenance", {}).get(_c, {})
+                                        _source_ms = _prov.get("source_as_of_ms") if isinstance(_prov, Mapping) else None
+                                        _receipt_ms = _prov.get("known_at_ms") if isinstance(_prov, Mapping) else None
+                                        _rate_saved = _prov.get("rate_str") if isinstance(_prov, Mapping) else None
+                                        if (
+                                            _source_ms is not None and _receipt_ms is not None
+                                            and _rate_saved is not None
+                                            and int(_source_ms) <= int(_exec_ms)
+                                            and int(_receipt_ms) <= int(_known_by)
+                                        ):
+                                            _fxid = f"fx-{_c.lower()}-{int(_source_ms)}-{int(_receipt_ms)}"
+                                            await repo.save_fx_observation({
+                                                "fx_id": _fxid, "currency": _c,
+                                                "source_as_of_ms": int(_source_ms),
+                                                "known_at_ms": int(_receipt_ms),
+                                                "rate_str": str(_rate_saved),
+                                                "source_json": {
+                                                    "provider": str(_prov.get("provider") or "coingecko"),
+                                                    "source": f"coingecko:{_c.lower()}:USD",
+                                                    "endpoint_family": "cgFx",
+                                                    "rate": str(_rate_raw),
+                                                },
+                                            })
+                                            _row = await repo.get_fx_at(_c, int(_exec_ms), int(_known_by), 60000)
+                                    except Exception:
+                                        # FX is optional evidence for the event
+                                        # write; missing/stale/budget-limited
+                                        # observations remain UNKNOWN.
+                                        pass
                             if not isinstance(_row, Mapping):
                                 return None, None
                             _rate = _row.get("rate_str", _row.get("rate", _row.get("price")))
@@ -5860,15 +6232,17 @@ class ShortLabService:
         if not pid:
             raise HedgeValidationError("plan_id is required", reason_code="HEDGE_INPUT_INVALID")
         expected: int | None = None
+        if payload is None or not isinstance(payload, Mapping):
+            raise HedgeValidationError("expected_version is required", reason_code="HEDGE_INPUT_INVALID")
         if payload:
             allowed = frozenset({"expected_version", "expected_plan_version"})
             snake = self._hedge_normalize(dict(payload), allowed)
             raw = snake.get("expected_version") if snake.get("expected_version") is not None else snake.get("expected_plan_version")
-            if raw is not None:
-                try:
-                    expected = int(raw)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    raise HedgeValidationError("expected_version must be an int", reason_code="HEDGE_INPUT_INVALID")
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+                raise HedgeValidationError("expected_version must be an int >= 1", reason_code="HEDGE_INPUT_INVALID")
+            expected = raw
+        else:
+            raise HedgeValidationError("expected_version is required", reason_code="HEDGE_INPUT_INVALID")
         try:
             row = await repo.get_hedge_plan(pid)
         except Exception as exc:
@@ -5925,8 +6299,17 @@ class ShortLabService:
                     _cfg_act = _jsa.loads(_cfg_act)
                 except Exception:
                     _cfg_act = {}
-            if isinstance(_cfg_act, Mapping) and str(_cfg_act.get("decision_id") or "").strip():
-                _did_act = str(_cfg_act.get("decision_id")).strip()
+            _sim_input_act = (_cfg_act.get("simulation_input")
+                              if isinstance(_cfg_act, Mapping) else None)
+            if not isinstance(_sim_input_act, Mapping):
+                _sim_input_act = {}
+            _did_act = str(
+                (_cfg_act.get("decision_id") if isinstance(_cfg_act, Mapping) else None)
+                or _sim_input_act.get("decision_id")
+                or row.get("decision_id")
+                or ""
+            ).strip()
+            if _did_act:
                 try:
                     _dec_act = await repo.get_hedge_decision(_did_act)
                     if _dec_act is not None:
@@ -5985,6 +6368,12 @@ class ShortLabService:
                 except Exception:
                     _cfgm = {}
             if isinstance(_cfgm, Mapping):
+                _plan_map_act["contract_multiplier"] = (
+                    _cfgm.get("contract_multiplier")
+                    or (_cfgm.get("identity") or {}).get("contract_multiplier")
+                    if isinstance(_cfgm.get("identity") or {}, Mapping)
+                    else _cfgm.get("contract_multiplier")
+                )
                 for _k in ("liquidation_price", "liquidationPrice", "stop_trigger_price", "stopTriggerPrice",
                            "stop_trigger_basis", "stopTriggerBasis", "rule_ids", "ruleIds",
                            "rule_version", "ruleVersion", "spot_venue", "spotVenue"):
@@ -6049,6 +6438,7 @@ class ShortLabService:
             _fut_rem_s, _spot_rem_s = "0", "0"
 
         # 1) Identity / multiplier (D04.1 Catalog->Resolver, same as scoring).
+        _mult: Any = None
         try:
             _ident = await self._hedge_identity_for(_sym_act)
             _conf = str(_dto_get(_ident, "mapping_confidence", "identity_confidence", default="UNRESOLVED") or "UNRESOLVED").upper()
@@ -6075,7 +6465,7 @@ class ShortLabService:
 
             _mark_px_raw = _dto_get(_mark_act, "mark_price", "native_price", "price", "markPrice", default=None) if _mark_act is not None else None
             _mark_exp_raw = _dto_get(_mark_act, "expires_at_ms", "expiresAtMs", default=None) if _mark_act is not None else None
-            _mark_asof_raw = _dto_get(_mark_act, "as_of_ms", "source_as_of_ms", "fetched_at_ms", default=None) if _mark_act is not None else None
+            _mark_asof_raw = _dto_get(_mark_act, "as_of_ms", "source_as_of_ms", "source_timestamp_ms", default=None) if _mark_act is not None else None
             _liq_raw = _plan_map_act.get("liquidation_price")
             if _mark_px_raw is None or _liq_raw is None:
                 _mark_status, _mark_reasons = "UNKNOWN", ["MARK_OR_LIQ_UNKNOWN"]
@@ -6119,6 +6509,8 @@ class ShortLabService:
             _mark_status, _mark_reasons, _mark_detail = "UNKNOWN", ["MARK_ERROR"], {}
 
         # 3) Exact-remaining two-way depth (Futures BUY + Spot SELL, same cutoff).
+        _depth_market: dict[str, Any] = {}
+        _depth_detail_l: dict[str, Any] = {}
         try:
             from decimal import Decimal as _DecD
 
@@ -6134,11 +6526,11 @@ class ShortLabService:
                 _depth_status, _depth_reasons, _depth_detail = "UNKNOWN", ["DEPTH_REMAINING_UNKNOWN"], {}
             else:
                 _depth_reasons_l: list[str] = []
-                _depth_detail_l: dict[str, Any] = {}
                 _depth_ok = True
                 # Spot SELL depth via real quote (Mapping or SpotVenueQuote DTO).
                 try:
                     _sq = await self._hedge_quote_for(_sym_act, str(_spot_qty_s), _spot_venue_act)
+                    _depth_market["spot_quote"] = _sq
                     _sq_sell = _dto_get(_sq, "sell_vwap", "sellVwap", "mid_price", "midPrice", default=None)
                     _sq_exec = _dto_get(_sq, "sell_executable_qty", "sellExecutableQty", default=None)
                     _sq_exp = _dto_get(_sq, "expires_at_ms", "expiresAtMs", default=None)
@@ -6153,6 +6545,9 @@ class ShortLabService:
                         _sq_exp_i = None
                     _depth_detail_l["spot_venue"] = str(_sq_venue) if _sq_venue is not None else _spot_venue_act
                     _depth_detail_l["spot_expires_at_ms"] = _sq_exp_i
+                    _depth_detail_l["spot_source_as_of_ms"] = _dto_get(_sq, "source_as_of_ms", "source_timestamp_ms", "as_of_ms", "asOf", default=None)
+                    _depth_detail_l["spot_known_at_ms"] = _dto_get(_sq, "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt", default=None)
+                    _depth_detail_l["spot_quote_fx"] = _dto_get(_sq, "quote_to_usd", "quoteToUsd", default=None)
                     if _sq_sell is None or _sq_exec_d is None:
                         _depth_ok = False
                         _depth_reasons_l.append("SPOT_DEPTH_UNKNOWN")
@@ -6175,6 +6570,10 @@ class ShortLabService:
                     _got_fut = False
                     if _mp is not None and hasattr(_mp, "collect_futures"):
                         try:
+                            from diveintocrypto_desktop.shortlab.hedge.units import canonical_to_contract_qty as _to_contract_qty
+                            _contract_qty_s = _to_contract_qty(str(_fut_qty_s), _mult)
+                            if _contract_qty_s is None:
+                                raise ValueError("contract multiplier unavailable")
                             from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mkc
 
                             try:
@@ -6183,11 +6582,12 @@ class ShortLabService:
                                              trace_id=f"repair-activate-{_sym_act}-{int(_cutoff)}")
                             except Exception:
                                 _rctx = None
-                            _bund = await _mp.collect_futures(_sym_act, str(_fut_qty_s), _rctx)
+                            _bund = await _mp.collect_futures(_sym_act, str(_contract_qty_s), _rctx)
                             _fq_obj = None
                             if isinstance(_bund, Mapping):
                                 _fq_obj = _bund.get("futures_quote", _bund.get("futuresQuote"))
                             if _fq_obj is not None:
+                                _depth_market["futures_quote"] = _fq_obj
                                 _fq_buy = _dto_get(_fq_obj, "buy_vwap_native", "buyVwapNative", "buy_vwap", "buyVwap", default=None)
                                 _fq_exec = _dto_get(_fq_obj, "buy_executable_qty", "buyExecutableQty", default=None)
                                 _fq_exp = _dto_get(_fq_obj, "expires_at_ms", "expiresAtMs", default=None)
@@ -6198,12 +6598,17 @@ class ShortLabService:
                     if not _got_fut:
                         # Offline/test fallback: same quote fn BUY side (still checks qty/expiry).
                         _fq2 = await self._hedge_quote_for(_sym_act, str(_fut_qty_s), _spot_venue_act)
+                        _depth_market["futures_quote"] = _fq2
                         _fq_buy = _dto_get(_fq2, "buy_vwap", "buyVwap", "mid_price", default=None)
                         _fq_exec = _dto_get(_fq2, "buy_executable_qty", "buyExecutableQty", default=None)
                         _fq_exp = _dto_get(_fq2, "expires_at_ms", "expiresAtMs", default=None)
                         _fq_ref = _dto_get(_fq2, "venue", default=None)
                     try:
                         _fq_exec_d = _DecD(str(_fq_exec)) if _fq_exec is not None else None
+                        if _got_fut and _fq_exec_d is not None:
+                            _fq_exec_can = _DecD(str(_fq_exec_d)) * _DecD(str(_mult))
+                        else:
+                            _fq_exec_can = _fq_exec_d
                     except Exception:
                         _fq_exec_d = None
                     try:
@@ -6211,6 +6616,12 @@ class ShortLabService:
                     except Exception:
                         _fq_exp_i = None
                     _depth_detail_l["futures_expires_at_ms"] = _fq_exp_i
+                    _depth_detail_l["futures_source_as_of_ms"] = _dto_get(_depth_market.get("futures_quote"), "source_as_of_ms", "as_of_ms", "asOf", default=None)
+                    _depth_detail_l["futures_known_at_ms"] = _dto_get(_depth_market.get("futures_quote"), "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt", default=None)
+                    _depth_detail_l["futures_quote_fx"] = _dto_get(_depth_market.get("futures_quote"), "quote_to_usd", "quoteToUsd", default=None)
+                    _depth_detail_l["futures_requested_contract_qty"] = _dto_get(
+                        _depth_market.get("futures_quote"), "requested_contract_qty", "requestedContractQty", default=None
+                    )
                     if _fq_ref is not None:
                         _depth_detail_l["futures_quote_ref"] = str(_fq_ref)
                     if _fq_buy is None or _fq_exec_d is None:
@@ -6219,7 +6630,7 @@ class ShortLabService:
                     elif _fq_exp_i is not None and int(_fq_exp_i) <= int(_cutoff):
                         _depth_ok = False
                         _depth_reasons_l.append("FUTURES_QUOTE_EXPIRED")
-                    elif _fq_exec_d < _fut_rem_d:
+                    elif _fq_exec_can < _fut_rem_d:
                         _depth_ok = False
                         _depth_reasons_l.append("FUTURES_DEPTH_INSUFFICIENT")
                     else:
@@ -6344,6 +6755,35 @@ class ShortLabService:
                 _fund_status, _fund_reasons = "UNKNOWN", ["FUNDING_CONTEXT_UNKNOWN"]
                 _fund_detail = {}
             else:
+                # Freeze the activation cutoff after every fresh read has
+                # completed, then validate source/receipt/expiry at this one
+                # instant. A quote without timestamp evidence cannot PASS.
+                _cutoff = int(self._now())
+                _known_at = int(_cutoff)
+                try:
+                    _mark_known_raw = _dto_get(_mark_act, "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt", default=None)
+                    _mark_known_i = int(_mark_known_raw) if _mark_known_raw is not None else None
+                    _mark_source_i = int(_mark_asof_raw) if _mark_asof_raw is not None else None
+                    _mark_exp_i = int(_mark_exp_raw) if _mark_exp_raw is not None else None
+                    if (_mark_known_i is None or _mark_source_i is None or _mark_exp_i is None
+                            or _mark_known_i > _cutoff or _mark_source_i > _cutoff
+                            or _cutoff - _mark_source_i > 60_000 or _mark_exp_i <= _cutoff):
+                        _mark_status, _mark_reasons = "UNKNOWN", ["MARK_TIMESTAMP_UNVERIFIED_OR_STALE"]
+                except Exception:
+                    _mark_status, _mark_reasons = "UNKNOWN", ["MARK_TIMESTAMP_UNVERIFIED_OR_STALE"]
+                _depth_timestamp_reasons: list[str] = []
+                for _leg_label, _prefix in (("SPOT", "spot"), ("FUTURES", "futures")):
+                    try:
+                        _source_i = int(_depth_detail_l.get(f"{_prefix}_source_as_of_ms"))
+                        _known_i = int(_depth_detail_l.get(f"{_prefix}_known_at_ms"))
+                        _expiry_i = int(_depth_detail_l.get(f"{_prefix}_expires_at_ms"))
+                        if (_source_i > _cutoff or _known_i > _cutoff
+                                or _cutoff - _source_i > 60_000 or _expiry_i <= _cutoff):
+                            _depth_timestamp_reasons.append(f"{_leg_label}_DEPTH_STALE_OR_EXPIRED")
+                    except Exception:
+                        _depth_timestamp_reasons.append(f"{_leg_label}_DEPTH_TIMESTAMP_UNKNOWN")
+                if _depth_timestamp_reasons:
+                    _depth_status, _depth_reasons = "UNKNOWN", sorted(set(_depth_reasons + _depth_timestamp_reasons))
                 _gate_fn = self._require_repair_port("evaluate_funding_entry_gate")
                 _gate = _gate_fn(_fund_ctx_act, self._config, int(_cutoff))
                 if hasattr(_gate, "status"):
@@ -6360,28 +6800,402 @@ class ShortLabService:
         except Exception:
             _fund_status, _fund_reasons, _fund_detail = "UNKNOWN", ["FUNDING_GATE_ERROR"], {}
 
-        # 5) Actual-remaining capital/risk/horizon economics (never 0-fill).
+        # 5) Actual-remaining capital/risk/horizon economics (D12/D06.2).
+        # Conservative APR presence alone is not an economics PASS. The gate
+        # uses the exact remaining native contracts, frozen fee ledger,
+        # executable exits, planned hold and capital/risk limits.
         try:
+            _eco_status, _eco_reasons, _eco_detail = "UNKNOWN", ["ECONOMICS_INPUT_UNKNOWN"], {}
             if _fund_ctx_act is None or _mark_act is None:
-                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_INPUT_UNKNOWN"]
-                _eco_detail = {}
-            elif _fund_status != "PASS":
-                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_FUNDING_UNKNOWN"]
-                _eco_detail = {"funding_gate": _fund_status}
-            elif _mark_status != "PASS":
-                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_MARK_UNKNOWN"]
-                _eco_detail = {"mark": _mark_status}
+                _eco_reasons = ["ECONOMICS_INPUT_UNKNOWN"]
+            elif _fund_status != "PASS" or _mark_status != "PASS" or _depth_status != "PASS":
+                _eco_reasons = ["ECONOMICS_MARKET_GATE_NOT_PASS"]
             else:
-                # Conservative carry present and horizon configured; missing stays UNKNOWN.
-                _cons = _dto_get(getattr(_fund_ctx_act, "metrics", None), "conservative_apr", default=None)
-                if _cons is None and isinstance(_fund_ctx_act, Mapping):
-                    _cons = (_fund_ctx_act.get("metrics") or {}).get("conservative_apr") if isinstance(_fund_ctx_act.get("metrics"), Mapping) else None
-                if _cons is None:
-                    _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_CARRY_UNKNOWN"]
-                    _eco_detail = {}
+                from decimal import Decimal as _DecEco
+                from diveintocrypto_desktop.shortlab.hedge.economics import evaluate_economics as _eval_economics
+                from diveintocrypto_desktop.shortlab.hedge.units import canonical_to_contract_qty as _to_contract_eco
+
+                _market_mult = _dto_get(_ident, "contract_multiplier", "multiplier", default=None)
+                _fut_contract_eco = _to_contract_eco(str(_fut_rem_s), _market_mult)
+                _mark_native_eco = _dto_get(_mark_act, "mark_price", "native_price", "price", default=None)
+                _mark_fx_eco = _dto_get(_mark_act, "quote_to_usd", "quoteToUsd", default=None)
+                _fut_fx_eco = _dto_get(_depth_market.get("futures_quote") if isinstance(_depth_market, Mapping) else None,
+                                       "quote_to_usd", "quoteToUsd", default=_mark_fx_eco)
+                _spot_fx_eco = _dto_get(_depth_market.get("spot_quote") if isinstance(_depth_market, Mapping) else None,
+                                        "quote_to_usd", "quoteToUsd", default=None)
+                _fut_buy_eco = _depth_detail_l.get("futures_buy_vwap") if isinstance(_depth_detail_l, Mapping) else None
+                _spot_sell_eco = _depth_detail_l.get("spot_sell_vwap") if isinstance(_depth_detail_l, Mapping) else None
+                if any(v is None for v in (_fut_contract_eco, _mark_native_eco, _mark_fx_eco,
+                                           _fut_buy_eco, _spot_sell_eco, _spot_fx_eco)):
+                    _eco_reasons = ["ECONOMICS_EXIT_PRICE_UNKNOWN"]
                 else:
-                    _eco_status, _eco_reasons = "PASS", []
-                    _eco_detail = {"conservative_apr": str(_cons)}
+                    _ledger_econ: Any = None
+                    try:
+                        _jobs_econ = self._hedge_job_owner()
+                        _ledger_econ, _ = await _jobs_econ._tick_ledger_and_protection(
+                            pid, dict(_plan_map_act), list(positions or ()),
+                            {"futures_mark": _mark_act,
+                             "spot_quote": _depth_market.get("spot_quote") if isinstance(_depth_market, Mapping) else None},
+                            int(_cutoff),
+                        )
+                    except Exception:
+                        _ledger_econ = None
+                    _unknown_costs = tuple(str(x) for x in (getattr(_ledger_econ, "unknown_components", ()) or ()))
+                    _known_entry_cost = getattr(_ledger_econ, "known_cost_usd", None) if _ledger_econ is not None else None
+                    if _known_entry_cost is None or any("FEE" in x or "GAS" in x or "FX" in x for x in _unknown_costs):
+                        _eco_reasons = ["ECONOMICS_ACTUAL_FEE_UNKNOWN"]
+                    else:
+                        _plan_cfg_econ = row.get("plan_config_json") or {}
+                        if isinstance(_plan_cfg_econ, str):
+                            try:
+                                import json as _js_econ
+                                _plan_cfg_econ = _js_econ.loads(_plan_cfg_econ)
+                            except Exception:
+                                _plan_cfg_econ = {}
+                        if not isinstance(_plan_cfg_econ, Mapping):
+                            _plan_cfg_econ = {}
+                        _sim_input_econ = _plan_cfg_econ.get("simulation_input") or {}
+                        if not isinstance(_sim_input_econ, Mapping):
+                            _sim_input_econ = {}
+                        # Decision-authored plans carry the capital/risk/hold
+                        # inputs on their immutable decision request, not
+                        # necessarily on the earlier simulation request.
+                        _decision_req_econ: Mapping[str, Any] = {}
+                        _decision_id_econ = str(
+                            _plan_cfg_econ.get("decision_id")
+                            or _sim_input_econ.get("decision_id")
+                            or row.get("decision_id")
+                            or ""
+                        ).strip()
+                        if _decision_id_econ:
+                            try:
+                                _decision_row_econ = await repo.get_hedge_decision(_decision_id_econ)
+                                _decision_json_econ = (_decision_row_econ or {}).get("decision_json") or {}
+                                if isinstance(_decision_json_econ, str):
+                                    import json as _json_econ
+                                    _decision_json_econ = _json_econ.loads(_decision_json_econ)
+                                _candidate_req = (_decision_json_econ.get("request")
+                                                  if isinstance(_decision_json_econ, Mapping) else None)
+                                if isinstance(_candidate_req, Mapping):
+                                    _decision_req_econ = _candidate_req
+                            except Exception:
+                                _decision_req_econ = {}
+                        def _econ_input(*keys: str) -> Any:
+                            for _source in (_sim_input_econ, _decision_req_econ):
+                                for _key in keys:
+                                    if _source.get(_key) is not None:
+                                        return _source.get(_key)
+                            return None
+                        _hold_econ = row.get("planned_hold_days")
+                        if _hold_econ is None:
+                            _hold_econ = _econ_input("planned_hold_days", "plannedHoldDays")
+                        _leverage_econ = row.get("leverage")
+                        if _leverage_econ is None:
+                            _leverage_econ = _econ_input("leverage", "futures_leverage", "futuresLeverage")
+                        _margin_econ = row.get("margin_usd", _sim_input_econ.get("margin_usd"))
+                        if _margin_econ is None:
+                            _margin_econ = _econ_input("margin_usd", "marginUsd")
+                        if _margin_econ is None and _leverage_econ is not None:
+                            try:
+                                _margin_econ = _DecEco(str(row.get("futures_notional_usd"))) / _DecEco(str(_leverage_econ))
+                            except Exception:
+                                _margin_econ = None
+                        _available_econ = _econ_input("available_capital_usd", "availableCapitalUsd")
+                        _max_loss_econ = _econ_input("max_scenario_loss_usd", "maxScenarioLossUsd")
+                        _fut_n = _DecEco(str(_fut_contract_eco)) * _DecEco(str(_mark_native_eco)) * _DecEco(str(_mark_fx_eco))
+                        _spot_n = _DecEco(str(_spot_rem_s)) * _DecEco(str(_spot_sell_eco)) * _DecEco(str(_spot_fx_eco))
+                        _fut_exit_n = _DecEco(str(_fut_contract_eco)) * _DecEco(str(_fut_buy_eco)) * _DecEco(str(_fut_fx_eco))
+                        _fut_rate = self._config.hedge.costs.get("futures_exit_fee_rate") if isinstance(self._config.hedge.costs, Mapping) else None
+                        _spot_venue_econ = str(_plan_map_act.get("spot_venue") or row.get("spot_venue") or "BINANCE_SPOT")
+                        _spot_rate_key = "alpha_exit_fee_rate" if _spot_venue_econ == "BINANCE_ALPHA" else "spot_exit_fee_rate"
+                        _spot_rate = self._config.hedge.costs.get(_spot_rate_key) if isinstance(self._config.hedge.costs, Mapping) else None
+                        _gas_econ = None if _spot_venue_econ == "ONCHAIN_DEX" else "0"
+                        _spot_quote_obj = _depth_market.get("spot_quote") if isinstance(_depth_market, Mapping) else None
+                        if _gas_econ is None:
+                            _gas_econ = _dto_get(_spot_quote_obj, "estimated_gas_usd", "estimatedGasUsd", default=None)
+                        if _fut_rate is None or _spot_rate is None or _gas_econ is None:
+                            _eco_reasons = ["ECONOMICS_EXIT_COST_UNKNOWN"]
+                        else:
+                            _slippage = (_DecEco(str(_fut_buy_eco)) - _DecEco(str(_mark_native_eco))) * _DecEco(str(_fut_contract_eco)) * _DecEco(str(_fut_fx_eco)) + (_DecEco(str(_mark_native_eco)) / _DecEco(str(_market_mult)) - _DecEco(str(_spot_sell_eco))) * _DecEco(str(_spot_rem_s)) * _DecEco(str(_spot_fx_eco))
+                            _exit_fee = _fut_exit_n * _DecEco(str(_fut_rate)) + _spot_n * _DecEco(str(_spot_rate))
+                            _proposal_econ = {
+                                "actual_futures_notional_usd": str(_fut_n),
+                                "spot_cash_usd": str(_spot_n),
+                                "margin_usd": str(_margin_econ) if _margin_econ is not None else None,
+                                "entry_fee_usd": str(_known_entry_cost),
+                                "exit_fee_usd": str(_exit_fee),
+                                "slippage_usd": str(_slippage),
+                                "gas_usd": str(_gas_econ),
+                                "fees_included": False,
+                                "reserve_fraction": "0",
+                            }
+                            _econ_result = _eval_economics(
+                                _proposal_econ, _fund_ctx_act,
+                                int(_hold_econ) if _hold_econ is not None else None,
+                                self._config.hedge.costs,
+                            )
+                            _eco_status = str(_econ_result.gate.status).upper()
+                            _eco_reasons = [str(r) for r in (_econ_result.gate.reasons or ())]
+                            _scenario_details: list[dict[str, Any]] = []
+                            # Re-run the same six frozen shocks against the
+                            # actual remaining pair. The simple notional delta
+                            # is not a scenario-loss bound (basis/FX shocks can
+                            # lose money with a perfectly balanced pair).
+                            if _eco_status == "PASS":
+                                try:
+                                    from diveintocrypto_desktop.shortlab.hedge.economics import build_ratio_proposal as _build_activation_proposal
+                                    from diveintocrypto_desktop.shortlab.hedge.models import (
+                                        FuturesExecutionQuote as _FQ,
+                                        SpotVenueQuote as _SQ,
+                                        TradingRulesSnapshot as _TRS,
+                                    )
+                                    from diveintocrypto_desktop.shortlab.repair_contracts import (
+                                        DecisionContext as _DC,
+                                        DecisionRequest as _DR,
+                                    )
+                                    from diveintocrypto_desktop.shortlab import observations as _activation_obs
+                                    from diveintocrypto_desktop.shortlab.models import AssetIdentity as _ActivationIdentity
+
+                                    _fquote_raw = _depth_market.get("futures_quote")
+                                    _squote_raw = _depth_market.get("spot_quote")
+                                    _frules_raw = await self._hedge_resolve_rules("futures", _sym_act)
+                                    _srules_raw = await self._hedge_resolve_rules("spot", _sym_act)
+                                    _identity_dto = _ident
+                                    if not isinstance(_identity_dto, _ActivationIdentity):
+                                        if not isinstance(_identity_dto, Mapping):
+                                            raise ValueError("scenario identity unknown")
+                                        _identity_dto = _ActivationIdentity(
+                                            canonical_id=str(_identity_dto.get("canonical_id") or _sym_act.lower()),
+                                            display_symbol=str(_identity_dto.get("display_symbol") or _sym_act),
+                                            binance_futures_symbol=_sym_act,
+                                            binance_spot_symbol=_identity_dto.get("binance_spot_symbol"),
+                                            contract_multiplier=float(str(_market_mult)),
+                                            multiplier_source=_identity_dto.get("multiplier_source"),
+                                            coingecko_id=_identity_dto.get("coingecko_id"),
+                                            mapping_confidence=str(_identity_dto.get("mapping_confidence", _identity_dto.get("identity_confidence", "UNRESOLVED"))),
+                                            mapping_source=str(_identity_dto.get("mapping_source", "OTHER")),
+                                        )
+                                    if not isinstance(_frules_raw, _TRS) or not isinstance(_srules_raw, _TRS):
+                                        raise ValueError("scenario trading rules unknown")
+                                    if any(_frules_raw.lot_rules.get(k) is None for k in ("step_size", "min_qty")):
+                                        raise ValueError("scenario futures lot rules unknown")
+                                    if any(_srules_raw.lot_rules.get(k) is None for k in ("step_size", "min_qty")):
+                                        raise ValueError("scenario spot lot rules unknown")
+                                    _fut_step_actual = _DecEco(str(_frules_raw.lot_rules["step_size"]))
+                                    _spot_step_actual = _DecEco(str(_srules_raw.lot_rules["step_size"]))
+                                    _fut_min_actual = _DecEco(str(_frules_raw.lot_rules["min_qty"]))
+                                    _spot_min_actual = _DecEco(str(_srules_raw.lot_rules["min_qty"]))
+                                    if (_fut_step_actual <= 0 or _spot_step_actual <= 0
+                                            or _DecEco(str(_fut_contract_eco)) < _fut_min_actual
+                                            or _DecEco(str(_spot_rem_s)) < _spot_min_actual
+                                            or _DecEco(str(_fut_contract_eco)) % _fut_step_actual != 0
+                                            or _DecEco(str(_spot_rem_s)) % _spot_step_actual != 0):
+                                        raise ValueError("actual remaining qty violates exchange lot step/minimum")
+                                    if not isinstance(_fquote_raw, _FQ):
+                                        if not isinstance(_fquote_raw, Mapping):
+                                            raise ValueError("scenario futures quote unknown")
+                                        _fquote_raw = _FQ(
+                                            quote_id=str(_dto_get(_fquote_raw, "quote_id", "quoteId", default="")),
+                                            symbol=_sym_act,
+                                            requested_contract_qty=str(_dto_get(_fquote_raw, "requested_contract_qty", "requestedContractQty", default=_fut_contract_eco)),
+                                            buy_vwap_native=str(_dto_get(_fquote_raw, "buy_vwap_native", "buyVwapNative", "buy_vwap", "buyVwap", default="")),
+                                            sell_vwap_native=str(_dto_get(_fquote_raw, "sell_vwap_native", "sellVwapNative", "sell_vwap", "sellVwap", default="")),
+                                            buy_executable_qty=str(_dto_get(_fquote_raw, "buy_executable_qty", "buyExecutableQty", default="0")),
+                                            sell_executable_qty=str(_dto_get(_fquote_raw, "sell_executable_qty", "sellExecutableQty", default="0")),
+                                            quote_currency=str(_dto_get(_fquote_raw, "quote_currency", "quoteCurrency", default="USDT")),
+                                            quote_to_usd=str(_dto_get(_fquote_raw, "quote_to_usd", "quoteToUsd", default="")),
+                                            as_of_ms=int(_dto_get(_fquote_raw, "source_as_of_ms", "as_of_ms", "asOf", default=0)),
+                                            known_at_ms=int(_dto_get(_fquote_raw, "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt", default=0)),
+                                            expires_at_ms=int(_dto_get(_fquote_raw, "expires_at_ms", "expiresAtMs", default=0)),
+                                            book_observation_id=str(_dto_get(_fquote_raw, "book_observation_id", "bookObservationId", "quote_id", "quoteId", default="unknown")),
+                                            fees_included=_dto_get(_fquote_raw, "fees_included", "feesIncluded", default=None),
+                                        )
+                                    if _DecEco(str(_fquote_raw.requested_contract_qty)) != _DecEco(str(_fut_contract_eco)):
+                                        raise ValueError("futures depth request does not match actual native remaining qty")
+                                    if not isinstance(_squote_raw, _SQ):
+                                        if not isinstance(_squote_raw, Mapping):
+                                            raise ValueError("scenario spot quote unknown")
+                                        _squote_raw = _SQ(
+                                            venue=str(_dto_get(_squote_raw, "venue", default=_spot_venue_econ)),
+                                            canonical_id=str(_dto_get(_squote_raw, "canonical_id", "canonicalId", default=_sym_act.lower())),
+                                            symbol=str(_dto_get(_squote_raw, "symbol", default=_sym_act)),
+                                            chain=_dto_get(_squote_raw, "chain", default=None),
+                                            contract_address=_dto_get(_squote_raw, "contract_address", "contractAddress", default=None),
+                                            as_of_ms=int(_dto_get(_squote_raw, "source_timestamp_ms", "source_as_of_ms", "as_of_ms", "asOf", default=0)),
+                                            expires_at_ms=int(_dto_get(_squote_raw, "expires_at_ms", "expiresAtMs", default=0)),
+                                            reference_notional_usd=str(_dto_get(_squote_raw, "reference_notional_usd", "referenceNotionalUsd", default="10000")),
+                                            mid_price=str(_dto_get(_squote_raw, "mid_price", "midPrice", default=_spot_sell_eco)),
+                                            buy_vwap=str(_dto_get(_squote_raw, "buy_vwap", "buyVwap", default=_spot_sell_eco)),
+                                            sell_vwap=str(_dto_get(_squote_raw, "sell_vwap", "sellVwap", default=_spot_sell_eco)),
+                                            buy_executable_qty=str(_dto_get(_squote_raw, "buy_executable_qty", "buyExecutableQty", default=_spot_rem_s)),
+                                            sell_executable_qty=str(_dto_get(_squote_raw, "sell_executable_qty", "sellExecutableQty", default=_spot_rem_s)),
+                                            buy_slippage_bps=_dto_get(_squote_raw, "buy_slippage_bps", "buySlippageBps", default=None),
+                                            sell_slippage_bps=_dto_get(_squote_raw, "sell_slippage_bps", "sellSlippageBps", default=None),
+                                            estimated_fee_usd=_dto_get(_squote_raw, "estimated_fee_usd", "estimatedFeeUsd", default=None),
+                                            estimated_gas_usd=_dto_get(_squote_raw, "estimated_gas_usd", "estimatedGasUsd", default=None),
+                                            entry_feasible=True, exit_feasible=True, exit_feasibility="CONFIRMED",
+                                            quote_currency=str(_dto_get(_squote_raw, "quote_currency", "quoteCurrency", default="USDT")),
+                                            quote_to_usd=str(_dto_get(_squote_raw, "quote_to_usd", "quoteToUsd", default="")),
+                                            source_timestamp_ms=int(_dto_get(_squote_raw, "source_timestamp_ms", "source_as_of_ms", "as_of_ms", "asOf", default=0)),
+                                            fetched_at_ms=int(_dto_get(_squote_raw, "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt", default=0)),
+                                            requested_canonical_qty=str(_dto_get(_squote_raw, "requested_canonical_qty", "requestedCanonicalQty", default=_spot_rem_s)),
+                                            trading_rules=dict(_srules_raw.lot_rules),
+                                            capabilities={}, identity_confidence=str(_dto_get(_identity_dto, "mapping_confidence", default="VERIFIED")),
+                                            status="OK", fees_included=_dto_get(_squote_raw, "fees_included", "feesIncluded", default=None),
+                                        )
+                                    _source_i = int(_mark_asof_raw)
+                                    _known_i = int(_dto_get(_mark_act, "known_at_ms", "knownAt", "fetched_at_ms", "fetchedAt"))
+                                    _mark_observed = _activation_obs.make_observation(
+                                        {"price": str(_mark_native_eco)}, source="activation:mark",
+                                        source_as_of_ms=_source_i, fetched_at_ms=_known_i, known_at_ms=_known_i,
+                                    )
+                                    _scen_fut_n = _DecEco(str(_fut_contract_eco)) * _DecEco(str(_fquote_raw.sell_vwap_native)) * _DecEco(str(_fquote_raw.quote_to_usd))
+                                    _scen_ratio = _DecEco(str(_spot_rem_s)) / (_DecEco(str(_fut_contract_eco)) * _DecEco(str(_market_mult)))
+                                    _scenario_req = _DR(
+                                        symbol=_sym_act, goal="CARRY_CAPTURE",
+                                        futures_notional_usd=str(_scen_fut_n),
+                                        planned_hold_days=int(_hold_econ),
+                                        available_capital_usd=str(_available_econ),
+                                        max_scenario_loss_usd=str(_max_loss_econ),
+                                        margin_usd=str(_margin_econ),
+                                        liquidation_price=str(_plan_map_act.get("liquidation_price")),
+                                        liquidation_price_updated_at_ms=int(_plan_map_act.get("liquidation_price_updated_at_ms") or _cutoff),
+                                        preferred_spot_venue=_spot_venue_econ,
+                                    )
+                                    _scenario_context = _DC(
+                                        identity_snapshot_id=f"activation:{pid}:{current_version}",
+                                        directional_score_id=None, fcs_snapshot_id=str(_plan_map_act.get("fcs_snapshot_id") or f"activation:{pid}"),
+                                        funding_context=_fund_ctx_act, identity=_identity_dto,
+                                        futures_mark=_mark_observed, futures_quote=_fquote_raw,
+                                        futures_rules=_frules_raw, venue_quotes=(_squote_raw,),
+                                        source_refs={}, as_of_ms=int(_cutoff),
+                                    )
+                                    _scenario_result = _build_activation_proposal(
+                                        _scenario_req, _scenario_context, str(_scen_ratio),
+                                        self._config, ports=self._repair_ports,
+                                    )
+                                    _scenario_details = [dataclasses.asdict(s) for s in (_scenario_result.scenarios or ())]
+                                    if str(_scenario_result.risk_gate.status).upper() != "PASS":
+                                        _eco_status = str(_scenario_result.risk_gate.status).upper()
+                                        _eco_reasons = [str(r) for r in (_scenario_result.risk_gate.reasons or ())]
+                                    else:
+                                        _scenario_fut = _DecEco(str(_scenario_result.futures_contract_qty))
+                                        _scenario_spot = _DecEco(str(_scenario_result.spot_net_qty))
+                                        _fut_step = _DecEco(str(_frules_raw.lot_rules["step_size"]))
+                                        _spot_step = _DecEco(str(_srules_raw.lot_rules["step_size"]))
+                                        if (abs(_scenario_fut - _DecEco(str(_fut_contract_eco))) >= _fut_step
+                                                or abs(_scenario_spot - _DecEco(str(_spot_rem_s))) >= _spot_step):
+                                            _eco_status, _eco_reasons = "UNKNOWN", ["ACTUAL_REMAINING_QTY_NOT_REPRODUCIBLE"]
+                                except Exception as _scenario_exc:
+                                    _eco_status, _eco_reasons = "UNKNOWN", [f"SCENARIO_RISK_UNKNOWN:{type(_scenario_exc).__name__}"]
+                            # The proposal helper above is only a structural
+                            # consistency check. Recalculate the risk bound
+                            # from the exact remaining open lots and their
+                            # frozen per-event FX; request notional and current
+                            # quote entry prices cannot stand in for fills.
+                            if str(_econ_result.gate.status).upper() == "PASS":
+                                try:
+                                    from diveintocrypto_desktop.shortlab.hedge.economics import evaluate_position_scenarios as _eval_position_scenarios
+                                    from diveintocrypto_desktop.shortlab.hedge.pnl import remaining_open_entry_basis as _entry_basis
+
+                                    _rules_f_actual = await self._hedge_resolve_rules("futures", _sym_act)
+                                    _rules_s_actual = await self._hedge_resolve_rules("spot", _sym_act)
+                                    if _rules_f_actual is None or _rules_s_actual is None:
+                                        raise ValueError("ACTUAL_LOT_RULES_UNKNOWN")
+                                    _lot_f_actual = _dto_get(_rules_f_actual, "lot_rules", "lotRules", default={})
+                                    _lot_s_actual = _dto_get(_rules_s_actual, "lot_rules", "lotRules", default={})
+                                    _step_f_actual = _DecEco(str(_dto_get(_lot_f_actual, "step_size", "stepSize", default="")))
+                                    _min_f_actual = _DecEco(str(_dto_get(_lot_f_actual, "min_qty", "minQty", default="")))
+                                    _step_s_actual = _DecEco(str(_dto_get(_lot_s_actual, "step_size", "stepSize", default="")))
+                                    _min_s_actual = _DecEco(str(_dto_get(_lot_s_actual, "min_qty", "minQty", default="")))
+                                    if (_step_f_actual <= 0 or _step_s_actual <= 0
+                                            or _DecEco(str(_fut_contract_eco)) < _min_f_actual
+                                            or _DecEco(str(_spot_rem_s)) < _min_s_actual
+                                            or _DecEco(str(_fut_contract_eco)) % _step_f_actual != 0
+                                            or _DecEco(str(_spot_rem_s)) % _step_s_actual != 0
+                                            or _depth_detail_l.get("futures_requested_contract_qty") is None
+                                            or _DecEco(str(_depth_detail_l["futures_requested_contract_qty"])) != _DecEco(str(_fut_contract_eco))):
+                                        raise ValueError("ACTUAL_REMAINING_QTY_VIOLATES_EXCHANGE_RULES")
+
+                                    if not hasattr(repo, "_run"):
+                                        raise ValueError("LEDGER_EVENT_READ_UNAVAILABLE")
+                                    def _read_event_basis_rows() -> list[dict[str, Any]]:
+                                        _con_basis = repo._require_con()
+                                        _rows_basis = _con_basis.execute(
+                                            "SELECT event_id, event_json FROM sl_hedge_fill_event "
+                                            "WHERE plan_id = ? ORDER BY executed_at_ms ASC, event_id ASC",
+                                            [pid],
+                                        ).fetchall()
+                                        import json as _json_rows_basis
+                                        return [dict(_json_rows_basis.loads(raw), event_id=str(event_id))
+                                                for event_id, raw in _rows_basis]
+                                    _events_basis = await repo._run(_read_event_basis_rows)
+                                    _fx_rows_basis = await repo.list_market_observations(
+                                        _sym_act, "EVENT_FX", 0, int(_cutoff), int(_cutoff)
+                                    )
+                                    _fx_basis: dict[str, Any] = {}
+                                    for _row_basis in (_fx_rows_basis or ()):
+                                        _value_basis = _dto_get(_row_basis, "value_json", default={})
+                                        if isinstance(_value_basis, str):
+                                            import json as _json_basis
+                                            _value_basis = _json_basis.loads(_value_basis)
+                                        if isinstance(_value_basis, Mapping) and _value_basis.get("event_id") is not None:
+                                            _fx_basis[str(_value_basis["event_id"])] = _value_basis
+
+                                    _fut_entry_native = _entry_basis(
+                                        _events_basis, _fx_basis, "FUTURES_SHORT", _fut_contract_eco,
+                                        contract_multiplier=_market_mult,
+                                    )
+                                    _spot_entry_usd = _entry_basis(
+                                        _events_basis, _fx_basis, "SPOT_LONG", _spot_rem_s
+                                    )
+                                    _actual_scenarios = _eval_position_scenarios(
+                                        futures_qty=str(_fut_contract_eco), spot_qty=str(_spot_rem_s),
+                                        futures_mark=str(_mark_native_eco), liquidation_price=str(_plan_map_act.get("liquidation_price")),
+                                        futures_entry_price=str(_fut_entry_native), futures_entry_fx=str(_fut_fx_eco),
+                                        futures_exit_price=str(_fut_buy_eco), futures_exit_fx=str(_fut_fx_eco),
+                                        spot_entry_price=str(_spot_entry_usd), spot_entry_fx="1",
+                                        spot_exit_price=str(_spot_sell_eco), spot_exit_fx=str(_spot_fx_eco),
+                                        futures_exit_fee_rate=str(_fut_rate), spot_exit_fee_rate=str(_spot_rate),
+                                        entry_cost_usd=str(_known_entry_cost), slippage_usd=str(_slippage),
+                                        gas_usd=str(_gas_econ), policy=self._config,
+                                    )
+                                    _scenario_details = [dataclasses.asdict(s) for s in _actual_scenarios]
+                                    _scenario_unknown = [s for s in _actual_scenarios if s.status == "UNKNOWN"]
+                                    _scenario_liquidation = [s for s in _actual_scenarios if s.status == "INVALID_AFTER_LIQUIDATION"]
+                                    if _scenario_liquidation:
+                                        _eco_status, _eco_reasons = "FAIL", ["SCENARIO_LIQUIDATION"]
+                                    elif _scenario_unknown:
+                                        _eco_status, _eco_reasons = "UNKNOWN", ["SCENARIO_INPUT_UNKNOWN"]
+                                    elif _max_loss_econ is None:
+                                        _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_RISK_LIMIT_UNKNOWN"]
+                                    else:
+                                        _worst_loss = max((_DecEco(str(s.loss_usd or "0")) for s in _actual_scenarios), default=_DecEco("0"))
+                                        if _worst_loss > _DecEco(str(_max_loss_econ)):
+                                            _eco_status, _eco_reasons = "FAIL", ["SCENARIO_LOSS_EXCEEDS_BUDGET"]
+                                        else:
+                                            _eco_status, _eco_reasons = "PASS", []
+                                except Exception as _actual_scenario_exc:
+                                    _eco_status, _eco_reasons = "UNKNOWN", [f"ACTUAL_SCENARIO_INPUT_UNKNOWN:{type(_actual_scenario_exc).__name__}"]
+                            _eco_detail = {
+                                "actual_futures_notional_usd": str(_fut_n),
+                                "remaining_native_contract_qty": str(_fut_contract_eco),
+                                "hold_days": _econ_result.hold_days,
+                                "economics": dataclasses.asdict(_econ_result),
+                                "scenarios": _scenario_details,
+                            }
+                            if _eco_status == "PASS":
+                                if _available_econ is None or _max_loss_econ is None:
+                                    _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_CAPITAL_OR_RISK_LIMIT_UNKNOWN"]
+                                else:
+                                    _capital = _DecEco(str(_econ_result.capital_required_usd)) if _econ_result.capital_required_usd is not None else None
+                                    _max_unhedged = abs(_fut_n - _spot_n) + _DecEco(str(_known_entry_cost)) + _exit_fee
+                                    if _capital is None:
+                                        _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_CAPITAL_UNKNOWN"]
+                                    elif _capital > _DecEco(str(_available_econ)):
+                                        _eco_status, _eco_reasons = "FAIL", ["ECONOMICS_CAPITAL_LIMIT_EXCEEDED"]
+                                    else:
+                                        _eco_status, _eco_reasons = "PASS", []
         except Exception:
             _eco_status, _eco_reasons, _eco_detail = "UNKNOWN", ["ECONOMICS_ERROR"], {}
 
@@ -6499,15 +7313,17 @@ class ShortLabService:
         if not pid:
             raise HedgeValidationError("plan_id is required", reason_code="HEDGE_INPUT_INVALID")
         expected: int | None = None
+        if payload is None or not isinstance(payload, Mapping):
+            raise HedgeValidationError("expected_version is required", reason_code="HEDGE_INPUT_INVALID")
         if payload:
             allowed = frozenset({"expected_version", "expected_plan_version"})
             snake = self._hedge_normalize(dict(payload), allowed)
             raw = snake.get("expected_version") if snake.get("expected_version") is not None else snake.get("expected_plan_version")
-            if raw is not None:
-                try:
-                    expected = int(raw)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    raise HedgeValidationError("expected_version must be an int", reason_code="HEDGE_INPUT_INVALID")
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+                raise HedgeValidationError("expected_version must be an int >= 1", reason_code="HEDGE_INPUT_INVALID")
+            expected = raw
+        else:
+            raise HedgeValidationError("expected_version is required", reason_code="HEDGE_INPUT_INVALID")
         try:
             row = await repo.get_hedge_plan(pid)
         except Exception as exc:
@@ -6941,6 +7757,7 @@ class ShortLabService:
         start_ms = _pick("start_ms", "startMs")
         end_ms = _pick("end_ms", "endMs")
         strategy = _pick("strategy")
+        cohort = _pick("cohort")
         horizon = _pick("horizon")
         venue = _pick("venue")
         history_class = _pick("history_class", "historyClass")
@@ -6949,10 +7766,13 @@ class ShortLabService:
         hedge_evidence_version = _pick("hedge_evidence_version", "hedgeEvidenceVersion")
         cost_config_hash = _pick("cost_config_hash", "costConfigHash")
         # Enum validation first (422 precedes 503).
-        allowed_strategies = ("ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25")
+        allowed_strategies = ("UNHEDGED_0", "ABSOLUTE_100", "RELATIVE_75", "RELATIVE_50", "RELATIVE_25", "SYSTEM_POLICY")
+        allowed_cohorts = ("RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY", "USER_DECISION", "LEGACY_FCS")
         allowed_horizons = ("7D", "30D", "90D")
         if strategy is not None and str(strategy) not in allowed_strategies:
             raise HedgeValidationError(f"unknown strategy {strategy!r}", reason_code="HEDGE_INPUT_INVALID")
+        if cohort is not None and str(cohort) not in allowed_cohorts:
+            raise HedgeValidationError(f"unknown cohort {cohort!r}", reason_code="HEDGE_INPUT_INVALID")
         if horizon is not None and str(horizon) not in allowed_horizons:
             raise HedgeValidationError(f"unknown horizon {horizon!r}", reason_code="HEDGE_INPUT_INVALID")
         if venue is not None and str(venue) not in ("BINANCE_SPOT", "BINANCE_ALPHA", "ONCHAIN_DEX"):
@@ -7089,7 +7909,9 @@ class ShortLabService:
         out["expires_at_ms"] = out["expiresAtMs"]
         return out
 
-    async def _build_repair_funding_context(self, symbol: str, as_of_ms: int) -> Any:
+    async def _build_repair_funding_context(
+        self, symbol: str, as_of_ms: int, request_context: Any | None = None
+    ) -> Any:
         """Build FundingContext via real collection chain (R10b).
 
         Prefers MarketPort.collect_funding (ProductionHedgeMarket, real
@@ -7117,7 +7939,7 @@ class ShortLabService:
                             make_request_context as _mk,
                         )
 
-                        rctx = _mk(
+                        rctx = request_context or _mk(
                             getattr(self, "_request_budget", None),
                             job_type="interactive",
                             host="fapi",
@@ -7144,7 +7966,7 @@ class ShortLabService:
                         make_request_context as _mk2,
                     )
 
-                    rctx2 = _mk2(
+                    rctx2 = request_context or _mk2(
                         getattr(self, "_request_budget", None),
                         job_type="interactive",
                         host="fapi",
@@ -7356,35 +8178,17 @@ class ShortLabService:
             hist, _ = _rhc({"onboard_at_ms": None, "reliable": False} if listing_age is None else {"onboard_at_ms": int(as_of_ms) - int(listing_age) * 86400_000, "reliable": True}, int(as_of_ms))
         except Exception:
             hist = "HISTORY_CLASS_UNKNOWN" if listing_age is None else ("FULL_90D" if (listing_age or 0) >= 90 else ("PARTIAL_90D" if (listing_age or 0) >= 30 else "INSUFFICIENT"))
-        # Observations with receipt (source times preserved, never invented).
-        try:
-            from diveintocrypto_desktop.shortlab import observations as _obs
-
-            cur_obs = _obs.make_observation(
-                {"rate": str(current_rate) if current_rate is not None else None},
-                source="binance:fapi/fundingRate" if current_rate is not None else "unknown",
-                source_as_of_ms=int(as_of_ms) - 60_000 if current_rate is not None else None,
-                fetched_at_ms=int(as_of_ms),
-                known_at_ms=int(as_of_ms),
-                status="OK" if current_rate is not None else "UNAVAILABLE",
-            )
-            last_obs = _obs.make_observation(
-                {"rate": str(last_rate) if last_rate is not None else None},
-                source="binance:fapi/fundingRate" if last_rate is not None else "unknown",
-                # Real last persisted event time (CR09 slot matching); only
-                # without store history fall back to the 8h heuristic.
-                source_as_of_ms=int(_ev_last_t) if _ev_last_t is not None else (int(as_of_ms) - 8 * 3600_000 if last_rate is not None else None),
-                fetched_at_ms=int(as_of_ms),
-                known_at_ms=int(as_of_ms),
-                status="OK" if last_rate is not None else "UNAVAILABLE",
-            ) if last_rate is not None else None
-        except Exception:
-            cur_obs = None
-            last_obs = None
-            try:
-                from diveintocrypto_desktop.shortlab.repair_contracts import _require_observed as _ro  # type: ignore
-            except Exception:
-                pass
+        # This fallback has summary values and canonical events, but not the
+        # real response receipts required to claim a point-in-time observation.
+        # ProductionHedgeMarket restores those receipts from the immutable
+        # per-event archive. Keep the fallback unknown rather than stamping
+        # its values with the caller's cutoff or an assumed 8-hour slot.
+        from diveintocrypto_desktop.shortlab import observations as _fallback_obs
+        cur_obs = _fallback_obs.make_observation(
+            {"rate": None}, source="unknown", status="UNAVAILABLE",
+            reason_code="FUNDING_RECEIPT_UNAVAILABLE",
+        )
+        last_obs = None
         # Assemble via pure builder when possible; fallback to direct DTO.
         try:
             from diveintocrypto_desktop.shortlab.hedge.funding_score import build_funding_context as _bfc
@@ -7405,6 +8209,8 @@ class ShortLabService:
                 last_settled_observation=last_obs,
                 schedule_refs=tuple(str(getattr(s, "schedule_id", s.get("schedule_id") if isinstance(s, Mapping) else "sched-1")) for s in (schedules or [])[:4]) or ("sched-unknown",),
                 input_refs={"funding": f"fcs-{sym}"},
+                schedules=schedules,
+                as_of_ms=int(as_of_ms),
             )
         except Exception:
             return FundingContext(
@@ -7792,6 +8598,7 @@ class ShortLabService:
             except Exception:
                 pass
         # Assemble DecisionContext (frozen DTOs, real refs).
+        _decision_base_refs: dict[str, Any] = {}
         try:
             from diveintocrypto_desktop.shortlab.repair_contracts import DecisionContext as _DC
             from diveintocrypto_desktop.shortlab.hedge.models import TradingRulesSnapshot as _TRS2
@@ -7812,6 +8619,19 @@ class ShortLabService:
                     identity_snapshot_id = "isl-" + _hl.sha256(blob.encode()).hexdigest()[:32]
             except Exception:
                 identity_snapshot_id = f"isl-{sym}-{int(now_ms)}"
+            # Materialize the exact identity and exchangeInfo rule rows before
+            # freezing references into Decision/Capture snapshots. A generated
+            # content ID without a repository row is not an auditable ref.
+            try:
+                _decision_base_refs = await self._persist_base_tables_for_symbol(
+                    symbol=sym, identity=identity, exchange_meta=exchange_meta,
+                    fund_data=None, fund_result=None, funding_events=[],
+                    cutoff_ms=int(now_ms), now_ms=int(now_ms),
+                )
+                identity_snapshot_id = str(
+                    _decision_base_refs.get("identity_snapshot_id") or identity_snapshot_id)
+            except Exception:
+                _decision_base_refs = {}
             # Convert resolver identity (AssetIdentity or mapping) to DTO.
             try:
                 from diveintocrypto_desktop.shortlab.models import AssetIdentity as _AI
@@ -8027,8 +8847,14 @@ class ShortLabService:
                     decision=result,
                     decision_as_of_ms=int(getattr(result, "generated_at_ms", now_ms) or now_ms),
                     policy={},
-                    rule_refs={"futures": f"rules:{sym}:futures:1", "spot": f"rules:{sym}:spot:1"},
-                    source_refs={"identity": str(identity_snapshot_id), "funding": f"fcs-{sym}"},
+                    rule_refs=({"futures": str(_decision_base_refs["rules_snapshot_id"])}
+                               if _decision_base_refs.get("rules_snapshot_id") else {}),
+                    source_refs={
+                        "identity_snapshot_id": str(identity_snapshot_id),
+                        "decision_id": str(result.decision_id),
+                        **{str(k): str(v) for k, v in dict(getattr(funding_context, "input_refs", {}) or {}).items()
+                           if isinstance(v, (str, int))},
+                    },
                 )
             except Exception:
                 _cap_ctx = None  # type: ignore
@@ -8233,11 +9059,13 @@ class ShortLabService:
                 return int(v)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return None
-        def _coverage_x(exec_s: Any, rem_d: Any) -> str | None:
+        def _coverage_x(exec_s: Any, rem_d: Any, multiplier: Any = None) -> str | None:
             try:
                 from decimal import Decimal as _DD
                 _e = _DD(str(exec_s))
                 _r = _DD(str(rem_d))
+                if multiplier is not None:
+                    _e *= _DD(str(multiplier))
                 if not _e.is_finite() or not _r.is_finite() or _r <= 0 or _e < 0:
                     return None
                 _c = _e / _r
@@ -8257,7 +9085,7 @@ class ShortLabService:
             try:
                 ident = await self._hedge_identity_for(str(row.get("symbol") or ""))
             except Exception:
-                ident = {"canonical_id": str(row.get("canonical_id") or ""), "contract_multiplier": "1"}
+                ident = {"canonical_id": str(row.get("canonical_id") or ""), "contract_multiplier": None}
             # Events + FX for real ledger PnL (CR12: historical EVENT_FX per
             # event; missing stays null, never USDT/USDC=1).
             try:
@@ -8339,6 +9167,11 @@ class ShortLabService:
                 _mp_x = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
                 if _mp_x is not None and hasattr(_mp_x, "collect_futures"):
                     try:
+                        from diveintocrypto_desktop.shortlab.hedge.units import canonical_to_contract_qty as _to_contract_qty_x
+                        _mult_x = _xget(ident, "contract_multiplier", "multiplier", default=None)
+                        _fut_contract_x = _to_contract_qty_x(str(_fut_rem_x), _mult_x)
+                        if _fut_contract_x is None:
+                            raise ValueError("contract multiplier unavailable")
                         from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mkx
                         try:
                             _rctxx = _mkx(getattr(self, "_request_budget", None), job_type="interactive",
@@ -8346,7 +9179,7 @@ class ShortLabService:
                                           trace_id=f"repair-exit-fut-{_sym_x}-{int(now_ms)}")
                         except Exception:
                             _rctxx = None
-                        _bundx = await _mp_x.collect_futures(_sym_x, str(_fut_rem_x), _rctxx)
+                        _bundx = await _mp_x.collect_futures(_sym_x, str(_fut_contract_x), _rctxx)
                         _fqo = None
                         if isinstance(_bundx, Mapping):
                             _fqo = _bundx.get("futures_quote", _bundx.get("futuresQuote"))
@@ -8380,7 +9213,8 @@ class ShortLabService:
                     market_context["futures_buy_vwap_native"] = str(_fq_buy)
                 if _fq_fx is not None:
                     market_context["futures_quote_fx"] = str(_fq_fx)
-                _fq_cov = _coverage_x(_fq_exec, _fut_rem_d) if _fq_exec is not None else None
+                _fq_cov = _coverage_x(_fq_exec, _fut_rem_d,
+                                      _mult_x if _got_fq and _mult_x is not None else None) if _fq_exec is not None else None
                 if _fq_cov is not None:
                     market_context["futures_exit_coverage"] = str(_fq_cov)
                 if _fq_id is not None:
@@ -8491,6 +9325,7 @@ class ShortLabService:
                 "plan_version": int(row.get("plan_version") or 1),
                 "symbol": str(row.get("symbol") or ""),
                 "status": str(row.get("status") or ""),
+                "contract_multiplier": _xget(ident, "contract_multiplier", "multiplier", default=None),
                 "spot_venue": str(_spot_venue_x),
                 "futures_venue": "BINANCE_FUTURES",
             }
@@ -8769,6 +9604,10 @@ class ShortLabService:
                 "stop_trigger_price": futures.get("triggerPrice", futures.get("trigger_price")),
                 "stop_trigger_basis": futures.get("triggerBasis", futures.get("trigger_basis", "MARK")),
                 "rule_ids": rule_ids,
+                "contract_multiplier": (
+                    (cfg.get("contract_multiplier") if isinstance(cfg, Mapping) else None)
+                    or ((cfg.get("identity") or {}).get("contract_multiplier") if isinstance(cfg, Mapping) and isinstance(cfg.get("identity") or {}, Mapping) else None)
+                ),
             }
             gate = _vpc(cand_record, plan_map, list(positions or ()), int(now_ms))
             if getattr(gate, "status", None) == "FAIL":

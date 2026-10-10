@@ -503,13 +503,13 @@ async def test_refresh_demo_route_and_params():
     assert params["include_platform"] == "false"
     assert params["x_cg_demo_api_key"] == "DEMO-KEY-1"
     assert "x_cg_pro_api_key" not in params
-    # Traceability travels; CoinGecko sends stay off the Binance send budget
-    # (F03 weights fixture has no CoinGecko family) and use the shared
-    # CoinGecko limiter instead.
+    # Traceability and the shared host-send budget travel with the CoinGecko
+    # host/family context; the monthly ledger is charged by the same sender.
     assert got_ctx.trace_id == "trace-1"
     assert got_ctx.host == "api.coingecko.com"
-    assert got_ctx.budget is None
-    assert budget.sent_attempts == 0
+    assert got_ctx.endpoint_family == "cgDirectory"
+    assert got_ctx.budget is budget
+    assert budget.sent_attempts == 1
 
 
 @pytest.mark.asyncio

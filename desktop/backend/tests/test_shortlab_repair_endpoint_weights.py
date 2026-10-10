@@ -1,6 +1,6 @@
 """R11a endpoint weights v2 registry (D19.3).
 
-- Version is endpoint-weights-v2; every Mark/FundingInfo/Spot/Alpha/
+    - Version is endpoint-weights-v3; every Mark/FundingInfo/Spot/Alpha/
   CoinGecko/0x allowed URL registers a family; unknown host/path/limit
   refuses as UNBUDGETED without transport.
 - FAPI/Spot local conservative tokens are versioned and limit-aware;
@@ -20,7 +20,7 @@ from diveintocrypto_desktop.shortlab.hedge.venues import ethereum_0x as zerox_mo
 
 class TestEndpointWeightsV2:
     def test_version(self):
-        assert rb.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v2"
+        assert rb.ENDPOINT_WEIGHTS_VERSION == "endpoint-weights-v3"
 
     def test_fapi_weights(self):
         # fundingInfo 5, still funding-shared.
@@ -47,7 +47,17 @@ class TestEndpointWeightsV2:
         assert rb.endpoint_weight("spotDepth", {"limit": 100}) == 20
         assert rb.endpoint_weight("spotDepth", {"limit": 1000}) == 50
         assert rb.endpoint_weight("spotTicker", {"symbol": "BTCUSDT"}) == 2
-        assert rb.endpoint_weight("spotTicker", None) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '["BTCUSDT"]'}) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '["BTCUSDT", "ETHUSDT"]'}) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '[' + ','.join('"S' + str(i) + '"' for i in range(20)) + ']'}) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '[' + ','.join('"S' + str(i) + '"' for i in range(21)) + ']'}) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '[' + ','.join('"S' + str(i) + '"' for i in range(100)) + ']'}) == 40
+        assert rb.endpoint_weight("spotTicker", {"symbols": '[' + ','.join('"S' + str(i) + '"' for i in range(101)) + ']'}) == 80
+        assert rb.endpoint_weight("spotTicker", {"symbols": '[' + ','.join('"S' + str(i) + '"' for i in range(1000)) + ']'}) == 80
+        assert rb.endpoint_weight("spotTicker", None) == 80
+        assert rb.endpoint_weight("spotTicker", {"symbol": "BTCUSDT", "symbols": '["BTCUSDT"]'}) is None
+        assert rb.endpoint_weight("spotTicker", {"symbols": "not-json"}) is None
+        assert rb.endpoint_weight("spotTicker", {"symbols": "{}"}) is None
 
     def test_alpha_paths_frozen(self):
         # Five PATH constants frozen to families, each weight 10.

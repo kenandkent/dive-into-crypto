@@ -145,6 +145,41 @@ function ShortLabEvidence({ filters, hedgeFilters, initial, initialHedge, defaul
         {buckets.map((bk, i) => {
           const key = `${bk.strategy || bk.Strategy || "strategy"}|${bk.horizon || bk.Horizon || ""}|${bk.historyClass || bk.history_class || ""}|${i}`;
           const row = (k, v) => <SlStat key={k} k={k} v={v == null ? "—" : String(v)} />;
+          const evaluation = bk.evaluation || bk.evaluationReport || {};
+          const bootstrap = evaluation.bootstrap || {};
+          const pairedBootstrap = evaluation.paired_bootstrap || {};
+          const walkForward = evaluation.walk_forward || {};
+          const renderEvaluation = (ev, testId) => {
+            const evBoot = ev.bootstrap || {};
+            const evPairedBoot = ev.paired_bootstrap || {};
+            const evWalk = ev.walk_forward || {};
+            const coverage = ev.coverage || {};
+            const pathCoverage = ev.liquidation_path_coverage || {};
+            const pathCounts = pathCoverage.counts || {};
+            const knownCosts = ev.known_costs || {};
+            const entryCounts = ev.entry_status_counts || {};
+            const entryTotal = Object.values(entryCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+            const entryComplete = Number(entryCounts.ENTRY_COMPLETE) || 0;
+            const markCoverage = ev.funding_mark_coverage || {};
+            return <div className="reason" data-testid={testId}>
+              {row("sampleStatus", ev.sample_status)}
+              {row("p05NetReturn", ev.p05_net_return)}
+              {row("assetBootstrap", `${evBoot.status || "UNKNOWN"} · ${evBoot.n_assets || 0} assets · ${evBoot.n || 0} samples`)}
+              {row("pairedBootstrap", `${evPairedBoot.status || "UNKNOWN"} · ${evPairedBoot.n_assets || 0} assets · ${evPairedBoot.n || 0} pairs`)}
+              {row("entryStatusCounts", Object.keys(entryCounts).length ? Object.entries(entryCounts).map(([k, v]) => `${k} ${v}`).join(" · ") : "—")}
+              {row("tradableEntryRate", entryTotal ? `${(100 * entryComplete / entryTotal).toFixed(1)}%` : "—")}
+              {row("outcomeCoverage", coverage.total ? `${coverage.complete}/${coverage.total}` : "—")}
+              {row("markCoverage", markCoverage.priced_outcomes ? `${slFmtRatio(markCoverage.mean, 3)} · ${markCoverage.priced_outcomes} priced` : "—")}
+              {row("pathCoverage", Object.keys(pathCounts).length ? Object.entries(pathCounts).map(([k, v]) => `${k} ${v}`).join(" · ") : "—")}
+              {row("pathCompleteFraction", pathCoverage.complete_fraction)}
+              {row("pricedOutcomes", knownCosts.priced_outcomes)}
+              {row("meanFeesUsd", knownCosts.mean_fees_usd)}
+              {row("maxAdverseBasisUsd", ev.max_adverse_basis_usd)}
+              {row("maxPortfolioDrawdownUsd", ev.max_portfolio_drawdown_usd)}
+              {row("walkForwardOOS", `${evWalk.oos_month || "—"} · ${evWalk.oos_label || "UNKNOWN"}`)}
+            </div>;
+          };
+          const subBuckets = Array.isArray(bk.subBuckets) ? bk.subBuckets : [];
           return (
             <div key={key} className="panel" data-testid={`hedge-evidence-bucket-${bk.strategy || "s"}-${bk.horizon || "h"}`}>
               <div className="ph"><span className="tick">▸</span>{bk.strategy || "—"} · {bk.horizon || "—"} · {bk.historyClass || bk.history_class || "—"}
@@ -155,6 +190,36 @@ function ShortLabEvidence({ filters, hedgeFilters, initial, initialHedge, defaul
                 {row("CENSORED", bk.CENSORED != null ? bk.CENSORED : bk.censored)}
                 {row("UNAVAILABLE", bk.UNAVAILABLE != null ? bk.UNAVAILABLE : bk.unavailable)}
                 <SlStat k="meanNetReturn" v={bk.meanNetReturn != null ? slFmtRatio(bk.meanNetReturn, 4) : (bk.mean_net_return != null ? slFmtRatio(bk.mean_net_return, 4) : "—")} />
+                {row("medianNetReturn", bk.medianNetReturn != null ? bk.medianNetReturn : bk.median_net_return)}
+                {bk.pairedCount != null && <div data-testid="hedge-evidence-paired">
+                  {row("paired", `${bk.pairedCount} complete · ${bk.pairedMissingCount || 0} missing`)}
+                  {row("pairedMeanDiff", bk.pairedMeanDiff)}
+                </div>}
+                {bk.evaluation && <div className="reason" data-testid="hedge-evidence-evaluation">
+                  {renderEvaluation(evaluation, "hedge-evidence-evaluation-details")}
+                </div>}
+                {subBuckets.length > 1 && <div className="reason" data-testid="hedge-evidence-sub-buckets">
+                  <div className="kicker">Independent evaluation buckets</div>
+                  {subBuckets.map((sub, si) => {
+                    const dims = sub.bucket || {};
+                    const subEval = sub.evaluation || {};
+                    const subPaired = subEval.paired || {};
+                    const subKey = `${dims.cohort || "UNKNOWN"}|${dims.profile || "UNKNOWN"}|${dims.formula_version || "UNKNOWN"}|${si}`;
+                    return <div key={subKey} className="panel" data-testid="hedge-evidence-sub-bucket">
+                      <div className="ph">{dims.cohort || "UNKNOWN"} · {dims.profile || "UNKNOWN"} · {dims.goal || "UNKNOWN"}</div>
+                      <div className="pb">
+                        {row("subBucketFormula", dims.formula_version)}
+                        {row("subBucketHistory", dims.history_class)}
+                        {row("subBucketVenue", dims.venue)}
+                        {row("subBucketSamples", sub.sampleCount)}
+                        {row("subBucketMeanNet", subEval.mean_net == null ? "—" : slFmtRatio(subEval.mean_net, 4))}
+                        {row("subBucketPaired", `${subPaired.n_paired || 0} complete · ${subPaired.n_missing || 0} missing`)}
+                        {row("subBucketPairedMeanDiff", subPaired.mean_diff)}
+                        {renderEvaluation(subEval, `hedge-evidence-sub-evaluation-${si}`)}
+                      </div>
+                    </div>;
+                  })}
+                </div>}
               </div>
             </div>
           );

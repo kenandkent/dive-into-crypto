@@ -578,7 +578,9 @@ async def test_stale_version_cannot_activate(api_client, active_plan):
 
 **创建：**无新增源文件。
 
-**合同：**RequestContext由R00增量完成；实现job_type档位、endpoint-weights-v2、RepositoryPort月预算，不另建Context。只有R00是合并前置；其他Producer是interface_dependencies，用R00的ports/Fixture测试，不要求其实现先合并。
+**合同：**RequestContext由R00增量完成；实现job_type档位、endpoint-weights-v3、RepositoryPort月预算，不另建Context。新增Spot `/api/v3/ticker/bookTicker` 的 `spotBookTicker` family：单symbol权重2、symbols或无symbol权重4，symbol与symbols同时传入拒绝发送；以官方接口核验记录为准。只有R00是合并前置；其他Producer是interface_dependencies，用R00的ports/Fixture测试，不要求其实现先合并。
+
+Spot `/api/v3/ticker/24hr` 的 `spotTicker` 同步采用已核验官方权重：单个 `symbol` 权重2；`symbols`数组1..100按本地保守权重40计，101个及以上按80计（官方权重分别为1..20个2、21..100个40、101个及以上80）；未提供symbol列表时权重80。畸形JSON、空数组、同时提供 `symbol` 与 `symbols` 均拒绝发送。Futures `ticker/24hr` 维持原权重不变。
 
 - [ ] 冻结monitor/scanner/background映射，interactive在scanner；未知任务拒绝，不静默background
 - [ ] 全部Mark/FundingInfo/Spot/Alpha/CoinGecko/0x允许URL注册family，未知host/path/limit拒绝

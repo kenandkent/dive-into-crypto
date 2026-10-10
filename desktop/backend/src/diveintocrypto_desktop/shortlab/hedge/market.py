@@ -162,7 +162,23 @@ class ProductionHedgeMarket:
         self.spot = BinanceSpotVenue(config, now_ms_fn=clock)
         self.alpha = BinanceAlphaVenue(config, now_ms_fn=clock)
         self.chain = Ethereum0xPriceVenue(config, env=env, now_ms_fn=clock, price_fn=self._chain_transport)
-        self.fx_provider = CoinGeckoProvider(clock=clock, market_ttl_sec=60)
+        _fx_kwargs: dict[str, Any] = {
+            "repository": repo, "clock": clock, "market_ttl_sec": 60,
+        }
+        try:
+            _optimization = getattr(config, "optimization", None)
+            _providers = getattr(_optimization, "providers", None) if _optimization is not None else None
+            _cg_cfg = _providers.get("coingecko") if isinstance(_providers, Mapping) else None
+            if _cg_cfg is not None:
+                _limit = _cg_cfg.get("account_monthly_limit") if isinstance(_cg_cfg, Mapping) else getattr(_cg_cfg, "account_monthly_limit", None)
+                _reserve = _cg_cfg.get("reserve_fraction") if isinstance(_cg_cfg, Mapping) else getattr(_cg_cfg, "reserve_fraction", None)
+                if _limit is not None:
+                    _fx_kwargs["account_monthly_limit"] = int(_limit)
+                if _reserve is not None:
+                    _fx_kwargs["reserve_fraction"] = float(_reserve)
+        except Exception:
+            pass
+        self.fx_provider = CoinGeckoProvider(**_fx_kwargs)
         self.fx_provider._fetcher = self._fx_transport
         self._fx_cache = {}
         self._fx_provenance = {}
@@ -318,8 +334,16 @@ class ProductionHedgeMarket:
                 raise self._unavailable('QUOTE_FX_STALE_OR_TIME_UNKNOWN')
             if result.status != 'OK' or result.stale or price is None or Decimal(str(price)) <= 0:
                 raise self._unavailable('QUOTE_FX_UNAVAILABLE')
+            known_ms = int(getattr(result, 'fetched_at_ms', self.clock()) or self.clock())
             self._fx_cache[currency] = (source_ms, str(price))
-            self._fx_provenance[currency] = {'source_as_of_ms': source_ms, 'known_at_ms': self.clock(), 'currency': currency}
+            self._fx_provenance[currency] = {
+                'source_as_of_ms': source_ms,
+                'known_at_ms': known_ms,
+                'fetched_at_ms': known_ms,
+                'currency': currency,
+                'provider': str(getattr(result, 'source', 'coingecko') or 'coingecko'),
+                'rate_str': str(price),
+            }
             return str(price)
 
     async def mark(self, symbol, request_context: Any | None = None):
@@ -896,4 +920,12 @@ class ProductionHedgeMarket:
             conservative_apr=getattr(metrics, 'conservative_apr', None),
             conservative_method="CONSERVATIVE_P25",
             current_observation=cur_obs, last_settled_observation=last_obs,
-            schedule_refs=(), input_refs={'funding': f"funding:{symbol}:{as_of}"})
+            schedule_refs=tuple(
+                str(s.get('schedule_id') if isinstance(s, Mapping) else getattr(s, 'schedule_id', ''))
+                for s in (schedules or ())
+                if (s.get('schedule_id') if isinstance(s, Mapping) else getattr(s, 'schedule_id', None))
+            ),
+            input_refs={'funding': f"funding:{symbol}:{as_of}"},
+            schedules=schedules,
+            as_of_ms=as_of,
+        )

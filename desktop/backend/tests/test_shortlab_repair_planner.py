@@ -520,6 +520,47 @@ def test_validate_protection_confirmation_two_legs_24h_hash() -> None:
     assert still.status == "PASS"
 
 
+def test_protection_confirmation_futures_qty_is_native_for_1000x_contract() -> None:
+    from diveintocrypto_desktop.shortlab.hedge.protection import (
+        compute_protected_position_hash,
+        validate_protection_confirmation,
+    )
+
+    positions = (
+        {"leg_type": "FUTURES_SHORT", "remaining_qty": "1234"},
+        {"leg_type": "SPOT_LONG", "remaining_qty": "1234"},
+    )
+    h = compute_protected_position_hash(
+        futures_remaining="1234", spot_remaining="1234",
+        liquidation_price="0.025", stop_trigger_price="0.020",
+        stop_trigger_basis="MARK_PRICE", rule_ids=("rules-1000pepe-v1",),
+    )
+    record = {
+        "confirmed_at_ms": NOW, "expires_at_ms": NOW + 86400_000,
+        "source": "USER_CONFIRMED", "protected_position_hash": h,
+        "confirmation_json": {
+            "futures": {"status": "CONFIRMED", "nativeQty": "1.234",
+                         "triggerPrice": "0.020", "triggerBasis": "MARK_PRICE",
+                         "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": "1234",
+                      "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+            "protected_position_hash": h, "source": "USER_CONFIRMED",
+        },
+    }
+    plan = {
+        "plan_id": "plan-1000pepe", "plan_version": 3,
+        "contract_multiplier": "1000", "liquidation_price": "0.025",
+        "stop_trigger_price": "0.020", "stop_trigger_basis": "MARK_PRICE",
+        "rule_ids": ("rules-1000pepe-v1",),
+    }
+    assert validate_protection_confirmation(record, plan, positions, NOW + 1).status == "PASS"
+    wrong_unit = {**record, "confirmation_json": {
+        **record["confirmation_json"],
+        "futures": {**record["confirmation_json"]["futures"], "nativeQty": "1234"},
+    }}
+    assert validate_protection_confirmation(wrong_unit, plan, positions, NOW + 1).status == "FAIL"
+
+
 def test_venue_fees_included_honest_and_indicative() -> None:
     # Spot quotes carry an explicit policy-estimate fee (honest True).
     q = _spot_quote()

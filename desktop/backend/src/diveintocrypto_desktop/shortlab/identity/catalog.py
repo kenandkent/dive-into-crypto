@@ -17,15 +17,11 @@ Three layers, in priority order:
 3. User overlay from ``SHORTLAB_IDENTITY_OVERRIDES_PATH`` -- wins per
    symbol under the same schema + chain validation; syntax errors fail loud.
 
-HTTP discipline: the directory travels on the shared CoinGecko limiter
-(``COINGECKO_MAX_PER_MIN``), not on the Binance ``RequestBudget`` send
-budget (whose F03 weights fixture has no CoinGecko family -- such sends
-would be ``UNBUDGETED_ENDPOINT``). ``refresh`` still takes a
-``RequestContext``: trace/job/host/identity-snapshot provenance travel with
-every call, the budget is explicitly stripped in the derived context, and
-the shared 30s session timeout applies. Tests inject a fake HTTP layer, so
-no live requests ever happen in the suite; the keyless branch is executed
-for real (send-count asserted, never skipped).
+HTTP discipline: every directory and platform-detail send runs through the
+shared CoinGecko provider sender, which owns the CoinGecko host RequestBudget,
+persistent UTC monthly reservation, retry ID and shared rate limiter.
+``RequestContext`` provenance/deadline travels with each send. Tests inject a
+raw fake transport; no live requests happen in the suite.
 
 The directory only yields *candidates*; binding priority (manual override >
 trusted chain+contract > unique exact symbol, conflicts stay UNRESOLVED,
@@ -35,7 +31,6 @@ trusted chain+contract > unique exact symbol, conflicts stay UNRESOLVED,
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import hashlib
 import json
@@ -45,8 +40,6 @@ import urllib.parse
 from typing import Any, Awaitable, Callable, Mapping
 
 import yaml
-from aiolimiter import AsyncLimiter
-
 from diveintocrypto_desktop.shortlab.identity import overrides as _overrides
 from diveintocrypto_desktop.shortlab.identity import resolver as _resolver
 from diveintocrypto_desktop.shortlab.models import ProviderResult, sanitize_error_message
@@ -80,33 +73,15 @@ VERIFIED_ASSETS_PATH = pathlib.Path(__file__).with_name("verified_assets.yaml")
 _HttpGet = Callable[[str, Mapping[str, Any], Any], Awaitable[Any]]
 _Clock = Callable[[], int]
 
-_limiters: dict[asyncio.AbstractEventLoop, AsyncLimiter] = {}
+def _budget_limited(exc: Exception) -> bool:
+    if isinstance(exc, getattr(_cg, "_MonthlyExhausted", ())):
+        return True
+    try:
+        from diveintocrypto_desktop.shortlab.request_budget import BudgetExhausted
 
-
-def _shared_limiter() -> AsyncLimiter:
-    loop = asyncio.get_running_loop()
-    limiter = _limiters.get(loop)
-    if limiter is None:
-        limiter = AsyncLimiter(
-            max_rate=_cg.COINGECKO_MAX_PER_MIN, time_period=_cg.COINGECKO_PERIOD_SEC
-        )
-        _limiters[loop] = limiter
-    return limiter
-
-
-async def _default_http_get(
-    url: str, params: Mapping[str, Any], request_context: RequestContext | None
-) -> Any:
-    """Default transport: shared ``data.http.get_json`` (30s total timeout).
-
-    ``request_context`` travels for traceability; its budget is always
-    stripped by the caller (see :meth:`IdentityCatalog._directory_context`).
-    """
-    from diveintocrypto_desktop.data.http import get_json
-
-    if request_context is not None:
-        return await get_json(url, dict(params), request_context=request_context)
-    return await get_json(url, dict(params))
+        return isinstance(exc, BudgetExhausted)
+    except Exception:
+        return False
 
 
 def _validate_verified_metadata(symbol: Any, entry: Any) -> None:
@@ -258,6 +233,9 @@ class IdentityCatalog:
         clock: _Clock | None = None,
         http_get: _HttpGet | None = None,
         rate_limiter: Any | None = None,
+        repository: Any | None = None,
+        account_monthly_limit: int = _cg.ACCOUNT_MONTHLY_LIMIT,
+        reserve_fraction: float = _cg.COINGECKO_RESERVE_FRACTION,
         directory_ttl_sec: int = DIRECTORY_TTL_SEC,
         directory_grace_sec: int = DIRECTORY_GRACE_SEC,
         max_platform_detail: int = MAX_PLATFORM_DETAIL_PER_REFRESH,
@@ -268,8 +246,11 @@ class IdentityCatalog:
         self._verified = load_verified_assets() if verified is None else _checked_verified(verified)
         self._effective = _overrides.load_effective_overrides(overlay_path, embedded=overrides_doc)
         self._clock = clock or (lambda: int(time.time() * 1000))
-        self._http_get = http_get or _default_http_get
+        self._http_get = http_get
         self._limiter_override = rate_limiter
+        self._repository = repository
+        self._account_monthly_limit = int(account_monthly_limit)
+        self._reserve_fraction = float(reserve_fraction)
         self._directory_ttl_ms = int(directory_ttl_sec) * 1000
         self._directory_grace_ms = int(directory_grace_sec) * 1000
         self._max_platform_detail = int(max_platform_detail)
@@ -453,27 +434,45 @@ class IdentityCatalog:
         return _cg.coingecko_route(self._api_plan, self._api_key or None)
 
     def _directory_context(self, request_context: RequestContext | None) -> RequestContext:
-        """Derived context for directory sends: provenance travels, the
-        Binance send budget is explicitly stripped (CoinGecko sends are
-        governed by the shared CoinGecko limiter -- the F03 weights fixture
-        has no CoinGecko family, so budgeted sends would be denied as
-        ``UNBUDGETED_ENDPOINT``)."""
+        """Derived CoinGecko context preserving the shared send budget."""
         base, _ = self._route()
         host = urllib.parse.urlparse(base).netloc or base
         if request_context is not None:
             return dataclasses.replace(
-                request_context, budget=None, host=host, endpoint_family="coingecko-directory"
+                request_context, host=host, endpoint_family="cgDirectory"
             )
         return make_request_context(
             None,
-            job_type="identity_catalog_refresh",
+            job_type="metadata",
             host=host,
-            endpoint_family="coingecko-directory",
+            endpoint_family="cgDirectory",
         )
 
-    @property
-    def _active_limiter(self) -> Any:
-        return self._limiter_override if self._limiter_override is not None else _shared_limiter()
+    async def _send(self, url: str, params: Mapping[str, Any], ctx: RequestContext) -> Any:
+        """Use the shared CoinGecko sender for per-attempt budget + retries.
+
+        The provider owns both the shared host RequestBudget permit and the
+        persistent UTC monthly reservation. Its default fetcher is the raw
+        aiohttp transport, so the same send is not charged again by
+        ``data.http``. Injected Catalog transports remain raw test/host
+        adapters and receive the frozen caller context.
+        """
+        from diveintocrypto_desktop.shortlab.providers.coingecko import CoinGeckoProvider
+
+        fetcher = None
+        if self._http_get is not None:
+            async def fetcher(request_url: str, request_params: Mapping[str, Any]) -> Any:
+                return await self._http_get(request_url, request_params, ctx)
+
+        sender = CoinGeckoProvider(
+            clock=self._clock,
+            limiter=self._limiter_override,
+            repository=self._repository,
+            account_monthly_limit=self._account_monthly_limit,
+            reserve_fraction=self._reserve_fraction,
+            fetcher=fetcher,
+        )
+        return await sender._transport_with_budget(url, params, ctx)
 
     def _summary(self, *, stale: bool) -> dict[str, Any]:
         _, key_param = self._route()
@@ -587,9 +586,15 @@ class IdentityCatalog:
         )
         ctx = self._directory_context(request_context)
         try:
-            async with self._active_limiter:
-                payload = await self._http_get(url, params, ctx)
+            payload = await self._send(url, params, ctx)
         except Exception as exc:  # noqa: BLE001 - encapsulated, never raised
+            if _budget_limited(exc):
+                return self._failure_result(
+                    now,
+                    status="UNAVAILABLE",
+                    reason_code=_cg.BUDGET_LIMITED,
+                    detail=f"CoinGecko request budget denied send: {exc}",
+                )
             status_hint = getattr(exc, "status", None)
             retry_after = getattr(exc, "retry_after", None)
             if status_hint == 429 or "429" in f"{type(exc).__name__} {exc}":
@@ -678,12 +683,15 @@ class IdentityCatalog:
         ctx = self._directory_context(request_context)
         fetched = 0
         errors = 0
+        budget_limited = False
         for coin_id in wanted:
             url, params = _cg.build_coin_detail_request(base, self._api_key, self._api_plan, coin_id)
             try:
-                async with self._active_limiter:
-                    payload = await self._http_get(url, params, ctx)
-            except Exception:  # noqa: BLE001 - per-id failure keeps prior data
+                payload = await self._send(url, params, ctx)
+            except Exception as exc:  # noqa: BLE001 - per-id failure keeps prior data
+                if _budget_limited(exc):
+                    budget_limited = True
+                    break
                 errors += 1
                 continue
             platforms = _cg.parse_coin_platforms(payload)
@@ -697,6 +705,17 @@ class IdentityCatalog:
             "errors": errors,
             "known_at_ms": now,
         }
+        if budget_limited:
+            return ProviderResult(
+                status="PARTIAL" if fetched else "UNAVAILABLE",
+                source=DIRECTORY_SOURCE,
+                fetched_at_ms=now,
+                as_of_ms=now if fetched else None,
+                data=data,
+                stale=False,
+                reason_code=_cg.BUDGET_LIMITED,
+                error_message="CoinGecko monthly or request budget exhausted",
+            )
         if fetched == 0 and errors > 0:
             return ProviderResult(
                 status="UNAVAILABLE",

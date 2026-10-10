@@ -50,7 +50,7 @@ async def test_default_archive_fx_respects_currency_and_both_timestamps(tmp_path
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from diveintocrypto_desktop.shortlab.evidence.historical_market import RepositoryHistoricalMarketProvider
     repo=await ShortLabRepository.open(tmp_path/'archive-fx.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         async def save(id, at, known, currency, fx):
             await repo.save_spot_venue_snapshot(dict(snapshot_id=id,canonical_id='bitcoin',venue='BINANCE_SPOT',as_of_ms=at,fetched_at_ms=known,reference_notional_usd=1000,status='OK',quote_json=dict(quote_currency=currency,quote_to_usd=fx,fx_source_as_of_ms=at,fx_known_at_ms=known,source_timestamp_ms=at,fetched_at_ms=known)))
@@ -83,7 +83,7 @@ async def test_historical_lifecycle_reads_real_schema_at_cutoff(tmp_path):
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from diveintocrypto_desktop.shortlab.evidence.historical_market import RepositoryHistoricalMarketProvider
     repo=await ShortLabRepository.open(tmp_path/'life.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         for at,status in ((1000,'TRADING'),(2000,'DELISTED')):
             await repo.save_contract_lifecycle(dict(futures_symbol='XUSDT',observed_at_ms=at,
@@ -103,7 +103,7 @@ async def test_real_provider_completion_advances_grade_without_moving_due(tmp_pa
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from test_shortlab_hedge_evidence import _save_fcs, _save_venue, _complete_fake, NOW, DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'grade-clock.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         await _save_fcs(repo,'clock-fcs',NOW)
         await _save_venue(repo,'q-entry','bitcoin','BINANCE_SPOT',NOW,'100')
@@ -124,7 +124,7 @@ async def test_archive_fx_rejects_quote_time_without_actual_fx_source(tmp_path):
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from diveintocrypto_desktop.shortlab.evidence.historical_market import RepositoryHistoricalMarketProvider
     repo=await ShortLabRepository.open(tmp_path/'fx-provenance.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         await repo.save_spot_venue_snapshot(dict(snapshot_id='missing-fx-time',canonical_id='x',venue='BINANCE_SPOT',as_of_ms=9000,fetched_at_ms=9001,reference_notional_usd=10,status='OK',quote_json=dict(quote_currency='USDT',quote_to_usd='.99',source_timestamp_ms=9000,fetched_at_ms=9001)))
         assert await RepositoryHistoricalMarketProvider(repo)._fx('USDT',10000) is None
@@ -148,17 +148,37 @@ async def test_run_due_propagates_sender_budget_context(tmp_path, monkeypatch):
     from diveintocrypto_desktop.shortlab.request_budget import get_current_request_context
     from test_shortlab_hedge_evidence import _save_fcs, NOW, DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'context.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     seen=[]
     budget=object()
-    async def fake_grade(*args):
+    async def fake_grade(*args, **kwargs):
         seen.append(get_current_request_context())
         return SimpleNamespace(outcome_status='COMPLETE')
     monkeypatch.setattr(grader,'grade_hedge',fake_grade)
+    assert grader.grade_hedge is fake_grade
+    assert grader.run_due.__globals__["grade_hedge"] is fake_grade
     try:
         await _save_fcs(repo,'context-fcs',NOW)
-        await grader.run_due(SimpleNamespace(repository=repo,config=None,clock_ms=lambda:NOW+8*DAY_MS,request_budget=budget,trace_id='budget-test',market_provider=object()))
-        assert seen and all(c is not None and c.budget is budget for c in seen)
+        entry_id = "RESEARCH_CANDIDATE:context-fcs:ABSOLUTE_100"
+        await repo.save_strategy_entry({
+            "entry_id": entry_id, "cohort": "RESEARCH_CANDIDATE",
+            "symbol": "BTCUSDT", "source_snapshot_id": "context-fcs",
+            "strategy": "ABSOLUTE_100", "decision_as_of_ms": NOW,
+            "executed_as_of_ms": NOW,
+            "entry_json": {"status": "ENTRY_COMPLETE", "futures_qty": "1", "spot_qty": "1"},
+        }, references=())
+        await repo.save_strategy_quote_task({
+            "task_id": "context-exit-7", "entry_id": entry_id,
+            "horizon_days": 7, "purpose": "EXIT", "due_ms": NOW + 7 * DAY_MS,
+            "status": "COMPLETE",
+            "task_json": {"entry_id": entry_id, "purpose": "EXIT", "due_ms": NOW + 7 * DAY_MS,
+                           "deadline_ms": NOW + 7 * DAY_MS + 300_000,
+                           "requested_futures_qty": "1", "requested_spot_qty": "1",
+                           "quote_refs": {"futures": "f-exit", "spot": "s-exit"}},
+            "updated_at_ms": NOW + 7 * DAY_MS,
+        })
+        due_result = await grader.run_due(SimpleNamespace(repository=repo,config=None,clock_ms=lambda:NOW+8*DAY_MS,request_budget=budget,trace_id='budget-test',market_provider=object()))
+        assert seen and all(c is not None and c.budget is budget for c in seen), due_result.stats
         assert get_current_request_context() is None
     finally:
         await repo.close()
@@ -168,7 +188,7 @@ async def test_hedge_evidence_requires_frozen_multiplier_provenance(tmp_path):
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from test_shortlab_hedge_evidence import _fcs_row, NOW, DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'legacy-identity.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         row=_fcs_row('legacy-identity');row['risk_json']={}
         await repo.save_funding_capture_snapshot(row)
@@ -183,11 +203,18 @@ async def test_1000_contract_evidence_uses_canonical_spot_and_native_futures_qty
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from test_shortlab_hedge_evidence import _fcs_row, _complete_fake, NOW, DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'1000-evidence.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         row=_fcs_row('scaled',symbol='1000PEPEUSDT',canonical='pepe')
         row['risk_json']={'identity':{'contract_multiplier':'1000','multiplier_source':'MANUAL'}}
         await repo.save_funding_capture_snapshot(row)
+        await repo.save_funding_schedule({
+            "schedule_id": "pepe-1000-8h", "symbol": "1000PEPEUSDT",
+            "effective_from_ms": 0, "effective_to_ms": None, "known_at_ms": 0,
+            "schedule_json": {"interval_hours": 8, "anchor_ms": NOW % (8 * 3_600_000),
+                              "verification": "CONFIRMED", "source": "test fixture",
+                              "evidence_ref": "test receipt"},
+        })
         for id,at,px in [('entry',NOW,'.1'),('exit',NOW+7*DAY_MS,'.11')]:
             await repo.save_spot_venue_snapshot(dict(snapshot_id=id,canonical_id='pepe',venue='BINANCE_SPOT',as_of_ms=at,fetched_at_ms=at,reference_notional_usd=10000,status='OK',quote_json={'requested_canonical_qty':'100000','buy_vwap':px,'sell_vwap':px,'mid_price':px,'quote_to_usd':'1'}))
         provider=_complete_fake(NOW,NOW+7*DAY_MS)
@@ -210,7 +237,7 @@ async def test_due_exit_bar_is_pending_until_first_full_hour_closes(tmp_path):
     from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
     from test_shortlab_hedge_evidence import _save_fcs,NOW,DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'pending-exit.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     try:
         await _save_fcs(repo,'pending-exit',NOW)
         result=await grader.grade_hedge('pending-exit','ABSOLUTE_100',7,NOW+7*DAY_MS,repo,None,None)
@@ -227,7 +254,7 @@ async def test_real_history_transport_failure_remains_retryable_pending(tmp_path
     from diveintocrypto_desktop.shortlab.evidence.historical_market import RepositoryHistoricalMarketProvider
     from test_shortlab_hedge_evidence import _save_fcs,NOW,DAY_MS
     repo=await ShortLabRepository.open(tmp_path/'retry-history.duckdb')
-    await repo.migrate(target_version=5)
+    await repo.migrate(target_version=6)
     async def failed(*args):
         raise RuntimeError('HTTP 404')
     try:

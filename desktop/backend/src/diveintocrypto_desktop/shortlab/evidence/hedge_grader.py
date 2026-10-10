@@ -323,7 +323,9 @@ def _parse_json_dict(value: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_fcs(repository: Any, snapshot_id: str) -> dict[str, Any] | None:
+async def _fetch_fcs(
+    repository: Any, snapshot_id: str, entry: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Fetch one FCS snapshot row by id (supports real + fake repos).
 
     CR15: when no FCS row matches, fall back to a USER_DECISION Entry group
@@ -373,7 +375,7 @@ async def _fetch_fcs(repository: Any, snapshot_id: str) -> dict[str, Any] | None
             offset += 200
     # CR15 fallback: USER_DECISION Entry group (real Entry, not FCS).
     try:
-        _entry_view = await _fetch_entry_fcs_view(repository, snapshot_id)
+        _entry_view = await _fetch_entry_fcs_view(repository, snapshot_id, entry)
         if _entry_view is not None:
             return _entry_view
     except Exception:
@@ -381,64 +383,73 @@ async def _fetch_fcs(repository: Any, snapshot_id: str) -> dict[str, Any] | None
     return None
 
 
-async def _fetch_entry_fcs_view(repository: Any, snapshot_id: str) -> dict[str, Any] | None:
-    """Build an FCS-like view from a USER_DECISION Entry group (CR15).
+async def _fetch_entry_fcs_view(
+    repository: Any, snapshot_id: str, entry: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build an FCS-like view from one exact Entry or a unique old group.
 
     Looks for strategy entries with ``source_snapshot_id == snapshot_id``
     across the four cohorts. Uses the first entry's symbol/as_of and the
     Decision's reference notional when available (honest, never invented).
     Returns ``None`` when no Entry group matches.
     """
-    _list_fn = getattr(repository, "list_strategy_entries", None)
-    if not callable(_list_fn):
-        return None
     _found: dict[str, Any] | None = None
-    for _cohort in ("USER_DECISION", "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY"):
-        try:
-            # Wide window: entries are point-in-time, filter by source id.
-            rows = await _list_fn(_cohort, 0, 2**62)
-        except TypeError:
+    _rows: list[Any] = [entry] if entry is not None else []
+    if entry is None:
+        _list_fn = getattr(repository, "list_strategy_entries", None)
+        if not callable(_list_fn):
+            return None
+        _matches: list[Any] = []
+        for _cohort in ("USER_DECISION", "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY"):
             try:
-                rows = await _list_fn(cohort=_cohort, start_ms=0, end_ms=2**62)  # type: ignore[call-arg]
+                _cohort_rows = await _list_fn(_cohort, 0, 2**62)
+            except TypeError:
+                try:
+                    _cohort_rows = await _list_fn(cohort=_cohort, start_ms=0, end_ms=2**62)  # type: ignore[call-arg]
+                except Exception:
+                    continue
             except Exception:
                 continue
+            _matches.extend(
+                row for row in (_cohort_rows or ())
+                if str(_field(row, "source_snapshot_id", "sourceSnapshotId") or "") == str(snapshot_id)
+            )
+        if len(_matches) != 1:
+            return None
+        _rows = _matches
+    for _row in _rows:
+        try:
+            _src = _field(_row, "source_snapshot_id", "sourceSnapshotId")
+            if entry is None and str(_src or "") != str(snapshot_id):
+                continue
+            _sym = str(_field(_row, "symbol") or "")
+            _asof = _field(_row, "decision_as_of_ms", "decisionAsOfMs", "as_of_ms")
+            try:
+                _asof_i = int(_asof)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if not _sym or _asof_i <= 0:
+                continue
+            _entry_json = _field(_row, "entry_json", "entryJson")
+            if isinstance(_entry_json, str):
+                try:
+                    import json as _js
+
+                    _entry_json = _js.loads(_entry_json)
+                except Exception:
+                    _entry_json = {}
+            if not isinstance(_entry_json, Mapping):
+                _entry_json = {}
+            _found = {
+                "symbol": _sym,
+                "canonical_id": str(_field(_row, "canonical_id", "canonicalId") or _sym.lower()),
+                "as_of_ms": _asof_i,
+                "_entry_row": _row,
+                "_entry_json": dict(_entry_json),
+            }
+            break
         except Exception:
             continue
-        for _row in (rows or ()):
-            try:
-                _src = _field(_row, "source_snapshot_id", "sourceSnapshotId")
-                if str(_src or "") != str(snapshot_id):
-                    continue
-                _sym = str(_field(_row, "symbol") or "")
-                _asof = _field(_row, "decision_as_of_ms", "decisionAsOfMs", "as_of_ms")
-                try:
-                    _asof_i = int(_asof)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    continue
-                if not _sym or _asof_i <= 0:
-                    continue
-                _entry_json = _field(_row, "entry_json", "entryJson")
-                if isinstance(_entry_json, str):
-                    try:
-                        import json as _js
-
-                        _entry_json = _js.loads(_entry_json)
-                    except Exception:
-                        _entry_json = {}
-                if not isinstance(_entry_json, Mapping):
-                    _entry_json = {}
-                _found = {
-                    "symbol": _sym,
-                    "canonical_id": str(_field(_row, "canonical_id", "canonicalId") or _sym.lower()),
-                    "as_of_ms": _asof_i,
-                    "_entry_row": _row,
-                    "_entry_json": dict(_entry_json),
-                }
-                break
-            except Exception:
-                continue
-        if _found is not None:
-            break
     if _found is None:
         return None
     # Reference notional: Decision request when available (same USER_DECISION),
@@ -498,6 +509,108 @@ async def _fetch_entry_fcs_view(repository: Any, snapshot_id: str) -> dict[str, 
         "_raw": _found.get("_entry_row"),
         "_from_entry": True,
     }
+
+
+async def _find_strategy_entry(
+    repository: Any, source_or_entry_id: str, strategy: str,
+    cohort: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve an exact Entry id or an unambiguous legacy source key."""
+    by_id = getattr(repository, "get_strategy_entry_by_id", None)
+    if callable(by_id):
+        try:
+            exact = await by_id(source_or_entry_id)
+        except Exception:
+            exact = None
+        if exact is not None and str(_field(exact, "strategy") or "").upper() == str(strategy).upper():
+            data = dict(exact) if isinstance(exact, Mapping) else {
+                key: _field(exact, key) for key in (
+                    "entry_id", "cohort", "symbol", "source_snapshot_id",
+                    "strategy", "decision_as_of_ms", "executed_as_of_ms", "entry_json",
+                )
+            }
+            data["entry_json"] = _parse_json_dict(data.get("entry_json"))
+            return data
+    get_fn = getattr(repository, "get_strategy_entry", None)
+    if callable(get_fn):
+        try:
+            row = await get_fn(source_or_entry_id, strategy, cohort)
+        except Exception:
+            row = None
+        if row is not None:
+            data = dict(row) if isinstance(row, Mapping) else {
+                key: _field(row, key) for key in (
+                    "entry_id", "cohort", "symbol", "source_snapshot_id",
+                    "strategy", "decision_as_of_ms", "executed_as_of_ms", "entry_json",
+                )
+            }
+            raw = data.get("entry_json")
+            if isinstance(raw, str):
+                try:
+                    import json as _json
+                    raw = _json.loads(raw)
+                except (TypeError, ValueError):
+                    raw = {}
+            data["entry_json"] = dict(raw) if isinstance(raw, Mapping) else {}
+            return data
+    list_fn = getattr(repository, "list_strategy_entries", None)
+    if not callable(list_fn):
+        return None
+    matches: list[dict[str, Any]] = []
+    for entry_cohort in ((cohort,) if cohort else ("USER_DECISION", "RESEARCH_CANDIDATE", "EXECUTABLE_DIRECTIONAL", "FUNDING_CARRY")):
+        try:
+            rows = await list_fn(entry_cohort, 0, 2**62)
+        except Exception:
+            continue
+        for row in rows or ():
+            if str(_field(row, "source_snapshot_id") or "") != str(source_or_entry_id) \
+                    and str(_field(row, "entry_id") or "") != str(source_or_entry_id):
+                continue
+            if str(_field(row, "strategy") or "").upper() != str(strategy).upper():
+                continue
+            data = dict(row) if isinstance(row, Mapping) else {
+                key: _field(row, key) for key in (
+                    "entry_id", "cohort", "symbol", "source_snapshot_id",
+                    "strategy", "decision_as_of_ms", "executed_as_of_ms", "entry_json",
+                )
+            }
+            raw = data.get("entry_json")
+            if isinstance(raw, str):
+                try:
+                    import json as _json
+                    raw = _json.loads(raw)
+                except (TypeError, ValueError):
+                    raw = {}
+            data["entry_json"] = dict(raw) if isinstance(raw, Mapping) else {}
+            matches.append(data)
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _entry_fx_rate(repository: Any, entry: Mapping[str, Any], currency: str) -> Decimal | None:
+    if currency.upper() == "USD":
+        return Decimal("1")
+    entry_json = entry.get("entry_json") if isinstance(entry.get("entry_json"), Mapping) else {}
+    fx_refs = entry_json.get("fx_refs", {}) if isinstance(entry_json, Mapping) else {}
+    fx_id = fx_refs.get(currency) if isinstance(fx_refs, Mapping) else None
+    get_fn = getattr(repository, "get_fx_observation", None)
+    if not isinstance(fx_id, str) or not callable(get_fn):
+        return None
+    try:
+        row = await get_fn(fx_id)
+    except Exception:
+        row = None
+    if not isinstance(row, Mapping):
+        return None
+    rate = _parse_dec("entry_fx", _field(row, "rate_str", "rateStr"))
+    known = _field(row, "known_at_ms", "knownAtMs")
+    try:
+        entry_known = int(entry_json.get("executed_as_of_ms") or entry.get("executed_as_of_ms") or 0)
+        fx_known = int(known)
+    except (TypeError, ValueError):
+        return None
+    if rate is None or rate <= 0 or fx_known > entry_known:
+        return None
+    return rate
 
 
 def _normalise_fcs(row: Any) -> dict[str, Any]:
@@ -875,8 +988,10 @@ async def grade_hedge(
     repository: Any,
     market_provider: Any,
     policy: Any = None,
+    *,
+    cohort: str | None = None,
 ) -> Any:
-    """Grade one FCS snapshot for one fixed strategy and horizon.
+    """Grade one legacy FCS id or exact cohort-qualified Entry id.
 
     Reads only the archived FCS snapshot plus frozen market history via
     ``market_provider`` -- never a live provider and never a current price
@@ -901,15 +1016,34 @@ async def grade_hedge(
         HEDGE_FORMULA_VERSION_CURRENT as HEDGE_FORMULA_VERSION,
     )
 
-    fcs = await _fetch_fcs(repository, snapshot_id)
+    entry = await _find_strategy_entry(repository, snapshot_id, strategy, cohort)
+    source_id = str(entry.get("source_snapshot_id") or snapshot_id) if entry else snapshot_id
+    outcome_key = str(entry.get("entry_id") or snapshot_id) if entry else snapshot_id
+    fcs = await _fetch_fcs(repository, source_id, entry)
     if fcs is None or not fcs.get("snapshot_id"):
         raise LookupError(f"FCS snapshot {snapshot_id!r} not found")
+    entry_json = entry.get("entry_json", {}) if isinstance(entry, Mapping) else {}
+    quote_task_json: Mapping[str, Any] | None = None
+    if not isinstance(entry_json, Mapping):
+        entry_json = {}
+    snapshot_id = outcome_key
+    if entry is not None:
+        executed_as_of = entry.get("executed_as_of_ms")
+        try:
+            fcs["as_of_ms"] = int(executed_as_of or entry.get("decision_as_of_ms") or fcs["as_of_ms"])
+        except (TypeError, ValueError):
+            pass
     snapshot_as_of = int(fcs["as_of_ms"])
     due_ms = snapshot_as_of + horizon_days * DAY_MS
+    outcome_id = outcome_id_for(
+        snapshot_id, strategy, horizon_days, evidence_version, cost_hash
+    )
     # CR15: SYSTEM_POLICY copies the frozen selected proposal of the same
     # USER_DECISION (never re-selected). Resolve its actual ratio from the
     # Entry; missing Entry stays UNAVAILABLE (never fabricated).
-    if strategy == _SYSTEM_POLICY:
+    if strategy == _SYSTEM_POLICY and entry_json.get("actual_ratio") is not None:
+        ratio = _parse_dec("entry_actual_ratio", entry_json.get("actual_ratio"))
+    elif strategy == _SYSTEM_POLICY:
         ratio: Decimal | None = None
         try:
             _list_fn = getattr(repository, "list_strategy_entries", None)
@@ -921,7 +1055,7 @@ async def grade_hedge(
                         continue
                     for _r in (_rows or ()):
                         try:
-                            if str(_field(_r, "source_snapshot_id") or "") != str(snapshot_id):
+                            if str(_field(_r, "source_snapshot_id") or "") != str(source_id):
                                 continue
                             if str(_field(_r, "strategy") or "").upper() != _SYSTEM_POLICY:
                                 continue
@@ -956,9 +1090,23 @@ async def grade_hedge(
             )
     else:
         ratio = STRATEGY_RATIOS[strategy]
-    outcome_id = outcome_id_for(
-        snapshot_id, strategy, horizon_days, evidence_version, cost_hash
-    )
+        if entry is not None:
+            captured_ratio = _parse_dec("entry_actual_ratio", entry_json.get("actual_ratio"))
+            if captured_ratio is None:
+                return await _persist_unavailable(
+                    repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                    evidence_version, cost_hash, outcome_id, as_of_ms,
+                    snapshot_as_of, due_ms, fcs, "ENTRY_RATIO_UNKNOWN",
+                    funding_event_count=None, funding_coverage=None,
+                )
+            ratio = captured_ratio
+    if ratio is None or ratio < 0:
+        return await _persist_unavailable(
+            repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+            evidence_version, cost_hash, outcome_id, as_of_ms,
+            snapshot_as_of, due_ms, fcs, "SYSTEM_NO_SELECTION",
+            funding_event_count=None, funding_coverage=None,
+        )
 
     def _pending(reason: str = PENDING_NOT_DUE) -> Any:
         return HedgeOutcome(
@@ -998,6 +1146,69 @@ async def grade_hedge(
     if as_of_ms < exit_close_ms:
         return _pending('PENDING_EXIT_BAR')
 
+    if entry is not None:
+        entry_status = str(entry_json.get("status") or "")
+        if entry_status != "ENTRY_COMPLETE":
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs,
+                str((entry_json.get("reasons") or ["ENTRY_NOT_EXECUTABLE"])[0]),
+                funding_event_count=None, funding_coverage=None,
+            )
+        tasks_fn = getattr(repository, "list_strategy_quote_tasks", None)
+        tasks: list[Any] = []
+        if callable(tasks_fn):
+            try:
+                tasks = list(await tasks_fn(
+                    str(entry.get("entry_id")), 0, 2**62, limit=10, offset=0,
+                ) or ())
+            except Exception:
+                tasks = []
+        quote_task = next((task for task in tasks
+                           if str(_field(task, "purpose") or "").upper() == "EXIT"
+                           and int(_field(task, "horizon_days") or 0) == horizon_days), None)
+        if quote_task is None or str(_field(quote_task, "status") or "").upper() != "COMPLETE":
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "EXIT_TASK_NOT_COMPLETE",
+                funding_event_count=None, funding_coverage=None,
+            )
+        quote_task_json = _field(quote_task, "task_json")
+        if isinstance(quote_task_json, str):
+            try:
+                import json as _task_json
+                quote_task_json = _task_json.loads(quote_task_json)
+            except (TypeError, ValueError):
+                quote_task_json = {}
+        if not isinstance(quote_task_json, Mapping):
+            quote_task_json = {}
+        if quote_task_json.get("finish_status") != "COMPLETE":
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "EXIT_TASK_RESULT_UNKNOWN",
+                funding_event_count=None, funding_coverage=None,
+            )
+        expected_native_qty = _parse_dec(
+            "entry_native_futures_qty", entry_json.get("native_futures_qty"),
+        )
+        expected_spot_qty = _parse_dec("entry_spot_net_qty", entry_json.get("spot_net_qty"))
+        task_native_qty = _parse_dec("task_requested_futures_qty", quote_task_json.get("requested_futures_qty"))
+        task_spot_qty = _parse_dec("task_requested_spot_qty", quote_task_json.get("requested_spot_qty"))
+        actual_native_qty = _parse_dec("task_quoted_futures_qty", quote_task_json.get("quoted_futures_qty"))
+        actual_spot_qty = _parse_dec("task_quoted_spot_qty", quote_task_json.get("quoted_spot_qty"))
+        if (expected_native_qty is None or expected_spot_qty is None
+                or task_native_qty != expected_native_qty or task_spot_qty != expected_spot_qty
+                or actual_native_qty != expected_native_qty or actual_spot_qty != expected_spot_qty):
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "EXIT_TASK_QUANTITY_MISMATCH",
+                funding_event_count=None, funding_coverage=None,
+            )
+
     # -- due path needs frozen market history ---------------------------
     symbol = str(fcs.get("symbol") or "")
     canonical_id = str(fcs.get("canonical_id") or fcs.get("symbol") or "")
@@ -1015,6 +1226,20 @@ async def grade_hedge(
         )
 
     identity = fcs.get('risk', {}).get('identity', {})
+    if entry is not None and not isinstance(identity, Mapping):
+        identity = {}
+    if entry is not None and not identity.get("contract_multiplier"):
+        identity_id = entry_json.get("identity_snapshot_id")
+        get_identity = getattr(repository, "get_identity_snapshot", None)
+        if isinstance(identity_id, str) and callable(get_identity):
+            try:
+                identity_row = await get_identity(identity_id)
+            except Exception:
+                identity_row = None
+            identity_payload = _field(identity_row, "identity_json", "identityJson")
+            if isinstance(identity_payload, Mapping):
+                identity = dict(identity_payload)
+                fcs.setdefault("risk", {})["identity"] = dict(identity)
     multiplier = _parse_dec('contract_multiplier', identity.get('contract_multiplier'))
     if (multiplier is None or multiplier <= 0 or
             identity.get('multiplier_source') not in ('MANUAL', 'EXCHANGE')):
@@ -1024,6 +1249,17 @@ async def grade_hedge(
             snapshot_as_of, due_ms, fcs, 'LEGACY_IDENTITY_UNVERIFIED',
             funding_event_count=None, funding_coverage=None,
         )
+    if entry is not None:
+        native_qty_check = _parse_dec("entry_native_futures_qty", entry_json.get("native_futures_qty"))
+        canonical_qty_check = _parse_dec("entry_canonical_futures_qty", entry_json.get("canonical_futures_qty"))
+        if native_qty_check is None or canonical_qty_check is None \
+                or native_qty_check * multiplier != canonical_qty_check:
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "ENTRY_CONTRACT_QUANTITY_MISMATCH",
+                funding_event_count=None, funding_coverage=None,
+            )
     fcs['_contract_multiplier'] = multiplier
 
     # Lifecycle (explicit evidence only; unknown degrades to tradable).
@@ -1079,7 +1315,7 @@ async def grade_hedge(
             snapshot_as_of, due_ms, fcs, NO_ENTRY_BAR,
             funding_event_count=None, funding_coverage=None,
         )
-    if entry_bar["fx_to_usd"] is None:
+    if entry_bar["fx_to_usd"] is None and entry is None:
         if delisted:
             return await _persist_censored_no_bars(
                 repository, HedgeOutcome, snapshot_id, strategy,
@@ -1092,9 +1328,33 @@ async def grade_hedge(
             snapshot_as_of, due_ms, fcs, BAR_FX_MISSING,
             funding_event_count=None, funding_coverage=None,
         )
+    futures_entry_native_quote: Decimal | None
+    futures_exit_fx_to_usd: Decimal | None
+    futures_entry_native_quote = None
+    futures_exit_fx_to_usd = None
     with localcontext() as ctx:
         ctx.prec = 80
         futures_entry_usd = entry_bar["native_close"] * entry_bar["fx_to_usd"] / multiplier  # type: ignore[operator]
+        futures_entry_native_quote = entry_bar["native_close"] / multiplier  # type: ignore[operator]
+    if entry is not None:
+        entry_native = _parse_dec("entry_futures_vwap", entry_json.get("futures_entry_vwap_native"))
+        futures_ccy = str(entry_json.get("futures_quote_currency") or "USDT")
+        entry_fx = await _entry_fx_rate(repository, entry, futures_ccy)
+        canonical_qty = _parse_dec("entry_canonical_futures_qty", entry_json.get("canonical_futures_qty"))
+        spot_qty_entry = _parse_dec("entry_spot_net_qty", entry_json.get("spot_net_qty"))
+        if entry_native is None or entry_native <= 0 or entry_fx is None \
+                or canonical_qty is None or canonical_qty <= 0 or spot_qty_entry is None:
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "ENTRY_PRICE_OR_FX_UNKNOWN",
+                funding_event_count=None, funding_coverage=None,
+            )
+        with localcontext() as ctx:
+            ctx.prec = 80
+            futures_entry_usd = entry_native * entry_fx / multiplier
+            futures_entry_native_quote = entry_native / multiplier
+            futures_notional = futures_entry_usd * canonical_qty
     if futures_entry_usd is None or futures_entry_usd <= 0:
         return await _persist_unavailable(
             repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
@@ -1105,21 +1365,85 @@ async def grade_hedge(
 
     # Frozen quantities: futures from the frozen notional/entry, spot from
     # the fixed strategy ratio (both frozen; never re-derived from live).
-    with localcontext() as ctx:
-        ctx.prec = 80
-        futures_qty = futures_notional / futures_entry_usd
-        spot_qty = futures_qty * ratio
+    if entry is not None:
+        futures_qty = canonical_qty
+        spot_qty = spot_qty_entry
+        futures_notional = futures_qty * futures_entry_usd
+    else:
+        with localcontext() as ctx:
+            ctx.prec = 80
+            futures_qty = futures_notional / futures_entry_usd
+            spot_qty = futures_qty * ratio
     futures_qty_s = _dec_str(futures_qty)
     spot_qty_s = _dec_str(spot_qty)
 
     # Frozen spot quotes (entry at snapshot, exit at due; future forbidden).
-    entry_quote = await _find_quote(
-        market_provider, canonical_id, venue, spot_qty_s, snapshot_as_of,
-        as_of_ms,
-    )
-    exit_quote = await _find_quote(
-        market_provider, canonical_id, venue, spot_qty_s, due_ms, as_of_ms,
-    )
+    if entry is not None and spot_qty == 0:
+        entry_quote = {
+            "snapshot_id": None, "canonical_id": canonical_id,
+            "venue": entry_json.get("spot_venue") or venue,
+            "as_of_ms": int(entry.get("executed_as_of_ms") or snapshot_as_of),
+            "fetched_at_ms": int(entry.get("executed_as_of_ms") or snapshot_as_of),
+            "requested_canonical_qty": "0", "buy_vwap": "0", "sell_vwap": "0",
+            "mid_price": "0", "quote_to_usd": "1", "quote_currency": "USD", "status": "OK",
+        }
+        exit_quote = dict(entry_quote)
+    elif entry is not None:
+        spot_ccy = str(entry_json.get("spot_quote_currency") or "USDT")
+        spot_entry_fx = await _entry_fx_rate(repository, entry, spot_ccy) if spot_qty != 0 else Decimal("1")
+        entry_spot_native = _parse_dec("entry_spot_vwap", entry_json.get("spot_entry_vwap_native"))
+        if spot_qty != 0 and (spot_entry_fx is None or entry_spot_native is None or entry_spot_native <= 0):
+            return await _persist_unavailable(
+                repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
+                evidence_version, cost_hash, outcome_id, as_of_ms,
+                snapshot_as_of, due_ms, fcs, "ENTRY_SPOT_PRICE_OR_FX_UNKNOWN",
+                funding_event_count=None, funding_coverage=None,
+            )
+        entry_quote = {
+            "snapshot_id": (entry_json.get("quote_refs") or {}).get("spot") if isinstance(entry_json.get("quote_refs"), Mapping) else None,
+            "canonical_id": canonical_id, "venue": entry_json.get("spot_venue") or venue,
+            "as_of_ms": int(entry.get("executed_as_of_ms") or snapshot_as_of),
+            "fetched_at_ms": int(entry.get("executed_as_of_ms") or snapshot_as_of),
+            "requested_canonical_qty": spot_qty_s,
+            "buy_vwap": _dec_str(entry_spot_native) if entry_spot_native is not None else "0",
+            "sell_vwap": _dec_str(entry_spot_native) if entry_spot_native is not None else "0",
+            "mid_price": _dec_str(entry_spot_native) if entry_spot_native is not None else "0",
+            "quote_to_usd": _dec_str(spot_entry_fx) if spot_entry_fx is not None else None,
+            "quote_currency": spot_ccy,
+            "status": "OK",
+        }
+        if quote_task_json is not None:
+            exit_spot_native = _parse_dec("task_spot_exit_vwap", quote_task_json.get("spot_exit_vwap_native"))
+            task_fx = _parse_dec("task_spot_exit_fx", quote_task_json.get("spot_exit_fx_to_usd"))
+            task_time = quote_task_json.get("exit_as_of_ms")
+            try:
+                task_time_i = int(task_time)
+            except (TypeError, ValueError):
+                task_time_i = 0
+            exit_quote = {
+                "snapshot_id": (quote_task_json.get("quote_refs") or {}).get("spot") if isinstance(quote_task_json.get("quote_refs"), Mapping) else None,
+                "canonical_id": canonical_id, "venue": entry_json.get("spot_venue") or venue,
+                "as_of_ms": task_time_i, "fetched_at_ms": int(_field(quote_task, "updated_at_ms") or task_time_i),
+                "requested_canonical_qty": spot_qty_s,
+                "buy_vwap": _dec_str(exit_spot_native) if exit_spot_native is not None else None,
+                "sell_vwap": _dec_str(exit_spot_native) if exit_spot_native is not None else None,
+                "mid_price": _dec_str(exit_spot_native) if exit_spot_native is not None else None,
+                "quote_to_usd": _dec_str(task_fx) if task_fx is not None else None,
+                "quote_currency": str(quote_task_json.get("spot_exit_quote_currency") or spot_ccy),
+                "status": "OK" if exit_spot_native is not None and task_fx is not None else "UNAVAILABLE",
+            }
+        else:
+            exit_quote = await _find_quote(
+                market_provider, canonical_id, venue, spot_qty_s, due_ms, as_of_ms,
+            )
+    else:
+        entry_quote = await _find_quote(
+            market_provider, canonical_id, venue, spot_qty_s, snapshot_as_of,
+            as_of_ms,
+        )
+        exit_quote = await _find_quote(
+            market_provider, canonical_id, venue, spot_qty_s, due_ms, as_of_ms,
+        )
     if entry_quote is None:
         if delisted:
             return await _persist_censored_no_bars(
@@ -1153,8 +1477,8 @@ async def grade_hedge(
             snapshot_as_of, due_ms, fcs, QUOTE_FX_MISSING,
             funding_event_count=None, funding_coverage=None,
         )
-    entry_spot_usd = _quote_entry_price(entry_quote)
-    if entry_spot_usd is None or entry_spot_usd <= 0:
+    entry_spot_usd = Decimal("0") if spot_qty == 0 else _quote_entry_price(entry_quote)
+    if entry_spot_usd is None or (spot_qty != 0 and entry_spot_usd <= 0):
         if delisted:
             return await _persist_censored_no_bars(
                 repository, HedgeOutcome, snapshot_id, strategy,
@@ -1170,8 +1494,13 @@ async def grade_hedge(
 
     # Exit leg: delisted contracts keep a CENSORED row even when the exit
     # quote/bar is gone; tradable contracts need both.
+    task_has_futures_exit = bool(
+        entry is not None and quote_task_json is not None
+        and quote_task_json.get("futures_exit_vwap_native") is not None
+        and quote_task_json.get("futures_exit_fx_to_usd") is not None
+    )
     if exit_bar is None or exit_bar["native_close"] is None \
-            or exit_bar["native_close"] <= 0 or exit_bar["fx_to_usd"] is None:
+            or exit_bar["native_close"] <= 0 or (exit_bar["fx_to_usd"] is None and not task_has_futures_exit):
         if delisted:
             return await _settle_censored_early_exit(
                 repository, HedgeOutcome, snapshot_id, strategy,
@@ -1230,11 +1559,23 @@ async def grade_hedge(
             snapshot_as_of, due_ms, fcs, QUOTE_FX_MISSING,
             funding_event_count=None, funding_coverage=None,
         )
-    exit_spot_usd = _quote_exit_price(exit_quote)
-    with localcontext() as ctx:
-        ctx.prec = 80
-        exit_fut_usd = exit_bar["native_close"] * exit_bar["fx_to_usd"] / multiplier  # type: ignore[operator]
-    if exit_spot_usd is None or exit_spot_usd <= 0 \
+    exit_spot_usd = Decimal("0") if spot_qty == 0 else _quote_exit_price(exit_quote)
+    if task_has_futures_exit and quote_task_json is not None:
+        task_fut = _parse_dec("task_futures_exit_vwap", quote_task_json.get("futures_exit_vwap_native"))
+        task_fut_fx = _parse_dec("task_futures_exit_fx", quote_task_json.get("futures_exit_fx_to_usd"))
+        if task_fut is None or task_fut_fx is None or task_fut <= 0 or task_fut_fx <= 0:
+            exit_fut_usd = None
+        else:
+            with localcontext() as ctx:
+                ctx.prec = 80
+                exit_fut_usd = task_fut * task_fut_fx / multiplier
+                futures_exit_fx_to_usd = task_fut_fx
+    else:
+        with localcontext() as ctx:
+            ctx.prec = 80
+            exit_fut_usd = exit_bar["native_close"] * exit_bar["fx_to_usd"] / multiplier  # type: ignore[operator]
+            futures_exit_fx_to_usd = exit_bar["fx_to_usd"]
+    if exit_spot_usd is None or (spot_qty != 0 and exit_spot_usd <= 0) \
             or exit_fut_usd is None or exit_fut_usd <= 0:
         if delisted:
             return await _settle_censored_early_exit(
@@ -1279,10 +1620,13 @@ async def grade_hedge(
                  if e["mark_price"] is None or e["mark_price"] <= 0]
     bad_fx = [e for e in fundings
               if e["fx_to_usd"] is None] if not bad_marks else []
-    expected_n = max(1, horizon_days * 3)  # 8h cadence baseline
-    coverage = min(1.0, len(fundings) / expected_n) if expected_n else 1.0
-    gaps_ok = _funding_gaps_ok(fundings, snapshot_as_of, due_ms)
-    if bad_marks or bad_fx or not gaps_ok:
+    schedule_coverage = await _schedule_funding_coverage(
+        repository, symbol, fundings, snapshot_as_of, due_ms, as_of_ms,
+    )
+    coverage = schedule_coverage.coverage_fraction
+    schedule_unknown = coverage is None
+    schedule_incomplete = not schedule_unknown and coverage != "1"
+    if bad_marks or bad_fx or schedule_unknown or schedule_incomplete:
         if delisted:
             return await _settle_censored_early_exit(
                 repository, HedgeOutcome, snapshot_id, strategy,
@@ -1295,17 +1639,20 @@ async def grade_hedge(
                 funding_reason=(
                     FUNDING_MARK_MISSING if bad_marks
                     else FUNDING_FX_MISSING if bad_fx
+                    else "FUNDING_SCHEDULE_UNKNOWN" if schedule_unknown
                     else FUNDING_HISTORY_INCOMPLETE
                 ),
             )
         reason = (FUNDING_MARK_MISSING if bad_marks
                   else FUNDING_FX_MISSING if bad_fx
+                  else "FUNDING_SCHEDULE_UNKNOWN" if schedule_unknown
                   else FUNDING_HISTORY_INCOMPLETE)
         return await _persist_unavailable(
             repository, HedgeOutcome, snapshot_id, strategy, horizon_days,
             evidence_version, cost_hash, outcome_id, as_of_ms,
             snapshot_as_of, due_ms, fcs, reason,
             funding_event_count=len(fundings), funding_coverage=coverage,
+            schedule_coverage=schedule_coverage,
         )
 
     # Full PnL settlement (complete legs only).
@@ -1316,7 +1663,10 @@ async def grade_hedge(
         spot_qty, futures_entry_usd, entry_spot_usd, exit_fut_usd,
         exit_spot_usd, entry_bar, exit_bar, entry_quote, exit_quote,
         bars, fundings, coverage, market_provider, policy, venue,
-        canonical_id, symbol, HEDGE_FORMULA_VERSION, censored=delisted,
+        canonical_id, symbol, HEDGE_FORMULA_VERSION,
+        futures_entry_native_quote=futures_entry_native_quote,
+        futures_exit_fx_to_usd=futures_exit_fx_to_usd,
+        censored=delisted,
     )
 
 
@@ -1396,9 +1746,9 @@ async def _future_quote_exists(
 
 
 def _quote_entry_price(quote: Mapping[str, Any]) -> Decimal | None:
-    buy = quote.get("buy_vwap")
-    mid = quote.get("mid_price")
-    fx = quote.get("quote_to_usd")
+    buy = _parse_dec("buy_vwap", quote.get("buy_vwap"))
+    mid = _parse_dec("mid_price", quote.get("mid_price"))
+    fx = _parse_dec("quote_to_usd", quote.get("quote_to_usd"))
     if fx is None:
         return None
     raw = buy if buy is not None else mid
@@ -1410,9 +1760,9 @@ def _quote_entry_price(quote: Mapping[str, Any]) -> Decimal | None:
 
 
 def _quote_exit_price(quote: Mapping[str, Any]) -> Decimal | None:
-    sell = quote.get("sell_vwap")
-    mid = quote.get("mid_price")
-    fx = quote.get("quote_to_usd")
+    sell = _parse_dec("sell_vwap", quote.get("sell_vwap"))
+    mid = _parse_dec("mid_price", quote.get("mid_price"))
+    fx = _parse_dec("quote_to_usd", quote.get("quote_to_usd"))
     if fx is None:
         return None
     raw = sell if sell is not None else mid
@@ -1434,6 +1784,47 @@ def _funding_gaps_ok(
     if times[0] - start_ms > gap or end_ms - times[-1] > gap:
         return False
     return not any(b - a > gap for a, b in zip(times, times[1:]))
+
+
+async def _schedule_funding_coverage(
+    repository: Any, symbol: str, events: list[dict[str, Any]],
+    start_ms: int, end_ms: int, known_by_ms: int,
+) -> Any:
+    """Return schedule-derived settlement coverage for a frozen interval.
+
+    An absent/unverified schedule remains UNKNOWN. Observed event spacing
+    never redefines the expected schedule, so a missing scheduled payment
+    reduces coverage rather than being mistaken for a cadence change.
+    """
+    from diveintocrypto_desktop.shortlab.funding_schedule import compute_schedule_coverage
+
+    list_fn = getattr(repository, "list_funding_schedules", None)
+    schedules: list[Any] = []
+    if callable(list_fn):
+        try:
+            raw_schedules = list(await list_fn(symbol, int(known_by_ms)) or ())
+            for row in raw_schedules:
+                if not isinstance(row, Mapping):
+                    continue
+                segment = row.get("schedule_json")
+                if isinstance(segment, str):
+                    try:
+                        import json as _json
+                        segment = _json.loads(segment)
+                    except (TypeError, ValueError):
+                        segment = None
+                if isinstance(segment, Mapping):
+                    merged = dict(segment)
+                    for key in ("schedule_id", "symbol", "effective_from_ms",
+                                "effective_to_ms", "known_at_ms"):
+                        if row.get(key) is not None:
+                            merged[key] = row[key]
+                    schedules.append(merged)
+        except Exception:
+            schedules = []
+    return compute_schedule_coverage(
+        events, schedules, int(start_ms), int(end_ms), int(known_by_ms),
+    )
 
 
 def _drawdown_if_complete(
@@ -1604,7 +1995,8 @@ async def _persist_unavailable(
     outcome_id: str, as_of_ms: int, snapshot_as_of: int, due_ms: int,
     fcs: Mapping[str, Any], reason: str,
     funding_event_count: int | None = None,
-    funding_coverage: float | None = None,
+    funding_coverage: str | None = None,
+    schedule_coverage: Any | None = None,
 ) -> Any:
     outcome_json = {
         "fcs_snapshot_id": snapshot_id,
@@ -1616,6 +2008,17 @@ async def _persist_unavailable(
         "reason": reason,
         "funding_event_count": funding_event_count,
         "funding_coverage": funding_coverage,
+        "funding_schedule_coverage": (
+            {
+                "expected_count": schedule_coverage.expected_count,
+                "received_count": schedule_coverage.received_count,
+                "coverage_fraction": schedule_coverage.coverage_fraction,
+                "schedule_coverage_fraction": schedule_coverage.schedule_coverage_fraction,
+                "missing_slots": list(schedule_coverage.missing_slots),
+                "reasons": list(schedule_coverage.reasons),
+            }
+            if schedule_coverage is not None else None
+        ),
         "fcs_version": fcs.get("fcs_version"),
         "fcs_config_hash": fcs.get("fcs_config_hash"),
     }
@@ -1773,6 +2176,8 @@ async def _settle_complete(
     bars: list[dict[str, Any]], fundings: list[dict[str, Any]],
     coverage: float, provider: Any, policy: Any, venue: str,
     canonical_id: str, symbol: str, formula_version: str,
+    futures_entry_native_quote: Decimal | None = None,
+    futures_exit_fx_to_usd: Decimal | None = None,
     censored: bool = False,
 ) -> Any:
     rates = _policy_cost_rates(policy)
@@ -1808,16 +2213,26 @@ async def _settle_complete(
                 carry += event["rate"] * mark_usd * futures_qty
             if event["rate"] < 0:
                 negatives += 1
-        futures_pnl = (futures_entry - exit_fut) * futures_qty
+        # Futures settle their native quote-currency price difference at the
+        # exit FX. Entry FX prices entry notional/fees, but does not reprice
+        # the already-open futures leg's PnL principal.
+        if futures_entry_native_quote is None or futures_exit_fx_to_usd is None:
+            futures_pnl = None
+        else:
+            exit_futures_native_quote = exit_fut / futures_exit_fx_to_usd
+            futures_pnl = (
+                (futures_entry_native_quote - exit_futures_native_quote)
+                * futures_qty * futures_exit_fx_to_usd
+            )
         spot_pnl = (exit_spot - spot_entry) * spot_qty
-        basis_pnl = futures_pnl + spot_pnl
+        basis_pnl = futures_pnl + spot_pnl if futures_pnl is not None else None
         # CR18: net consumes true per-leg entry/exit-amount fees
         # (fees_exit_based); capital denominator stays frozen
         # (spot cash + futures margin + cost reserve), never one margin leg.
-        net = basis_pnl + carry - fees_exit_based - slip - gas
+        net = basis_pnl + carry - fees_exit_based - slip - gas if basis_pnl is not None else None
         capital = spot_notional + margin + fees_exit_based + gas
-        net_return = (net / capital) if capital != 0 else None
-        fut_return = (net / futures_notional) if futures_notional != 0 else None
+        net_return = (net / capital) if net is not None and capital != 0 else None
+        fut_return = (net / futures_notional) if net is not None and futures_notional != 0 else None
     # CR16: MARK liquidation-path coverage from a real MARK read (async).
     path_coverage = await _mark_path_coverage(
         provider, symbol, int(entry_bar["open_ms"]),
@@ -1874,8 +2289,8 @@ async def _settle_complete(
         },
         "pnl": {
             "spot_pnl_usd": _dec_str(spot_pnl),
-            "futures_pnl_usd": _dec_str(futures_pnl),
-            "basis_pnl_usd": _dec_str(basis_pnl),
+            "futures_pnl_usd": _dec_str(futures_pnl) if futures_pnl is not None else None,
+            "basis_pnl_usd": _dec_str(basis_pnl) if basis_pnl is not None else None,
             "funding_carry_usd": _dec_str(carry),
             # CR18: fees_usd is the true exit-based total (exit follows
             # exit notional); detailed legs below sum to it.
@@ -1892,7 +2307,7 @@ async def _settle_complete(
             "spot_exit_notional_usd": _dec_str(spot_exit_notional),
             "slippage_usd": _dec_str(slip),
             "gas_usd": _dec_str(gas),
-            "net_pnl_usd": _dec_str(net),
+            "net_pnl_usd": _dec_str(net) if net is not None else None,
             "net_return": _dec_str(net_return) if net_return is not None else None,
             "futures_notional_return": _dec_str(fut_return) if fut_return is not None else None,
         },
@@ -2034,7 +2449,7 @@ async def run_due(context: Any, **overrides: Any) -> Any:
     unavailable = 0
     skipped_have_row = 0
     errors = 0
-    candidates: list[tuple[int, str, str, str, int]] = []
+    candidates: list[tuple[int, str, str, str, int, str | None]] = []
 
     # Discovery: FCS snapshots in the default 180d window lacking a stored
     # outcome for a now-due (strategy, horizon). Oldest-due first.
@@ -2075,6 +2490,8 @@ async def run_due(context: Any, **overrides: Any) -> Any:
 
     evidence_version = _resolve_evidence_version(config)
 
+    fcs_snapshot_ids = {str(row.get("snapshot_id") or "") for row in fcs_rows}
+    entry_source_keys: set[tuple[str, str]] = set()
     for fcs in fcs_rows:
         try:
             as_of = int(fcs["as_of_ms"])
@@ -2091,7 +2508,7 @@ async def run_due(context: Any, **overrides: Any) -> Any:
                 due_ms = as_of + horizon_days * DAY_MS
                 if now_ms < due_ms:
                     continue
-                candidates.append((due_ms, symbol, snapshot_id, strategy, horizon_days))
+                candidates.append((due_ms, symbol, snapshot_id, strategy, horizon_days, None))
     # CR15: real Entry + completed-Task consumption. Discover strategy
     # entries (all four cohorts, same 180d window) and grade their due
     # (source, strategy, horizon) triples -- including UNHEDGED_0 and the
@@ -2114,33 +2531,43 @@ async def run_due(context: Any, **overrides: Any) -> Any:
                 for _r in (_rows or ()):
                     try:
                         _src = str(_field(_r, "source_snapshot_id") or "")
+                        _entry_id = str(_field(_r, "entry_id") or "")
+                        _entry_cohort = str(_field(_r, "cohort") or _cohort)
                         _sym = str(_field(_r, "symbol") or "")
                         _strat = str(_field(_r, "strategy") or "").upper()
-                        _asof = _field(_r, "decision_as_of_ms", "as_of_ms")
+                        _asof = _field(_r, "executed_as_of_ms") or _field(_r, "decision_as_of_ms", "as_of_ms")
                         try:
                             _asof_i = int(_asof)  # type: ignore[arg-type]
                         except (TypeError, ValueError):
                             continue
-                        if not _src or not _sym or not _strat:
+                        if not _src or not _entry_id or not _sym or not _strat:
                             continue
                         try:
                             _strat_n = normalize_strategy(_strat)
                         except ValueError:
                             continue
+                        entry_source_keys.add((_src, _strat_n))
                         if _asof_i < window_from or _asof_i > now_ms:
                             continue
                         for _hz in HORIZON_DAYS:
                             _due = _asof_i + _hz * DAY_MS
                             if now_ms < _due:
                                 continue
-                            candidates.append((_due, _sym, _src, _strat_n, _hz))
+                            candidates.append((_due, _sym, _entry_id, _strat_n, _hz, _entry_cohort))
                     except Exception:
                         continue
     except Exception:
         pass
+    # If a legacy FCS source is represented by a new frozen Entry for the
+    # same strategy, grade through that exact Entry only. This prevents the
+    # source-level legacy row from stealing the cohort's Entry/Task outcome.
+    candidates = [
+        row for row in candidates
+        if not (row[5] is None and row[2] in fcs_snapshot_ids and (row[2], row[3]) in entry_source_keys)
+    ]
     candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
 
-    for _due_ms, _symbol, snapshot_id, strategy, horizon_days in candidates:
+    for _due_ms, _symbol, snapshot_id, strategy, horizon_days, cohort in candidates:
         if graded >= limit_n:
             break
         try:
@@ -2162,7 +2589,7 @@ async def run_due(context: Any, **overrides: Any) -> Any:
             with scoped_request_context(request_context):
                 outcome = await grade_hedge(
                     snapshot_id, strategy, horizon_days, now_ms,
-                    repository, provider, config,
+                    repository, provider, config, cohort=cohort,
                 )
         except Exception:
             errors += 1

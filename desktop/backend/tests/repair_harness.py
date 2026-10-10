@@ -41,7 +41,7 @@ from __future__ import annotations
 import functools
 import inspect
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 # ---------------------------------------------------------------------------
 # Harness origin (frozen: 127.0.0.1:46409, harness-only, never production).
@@ -50,6 +50,116 @@ from typing import Any, Callable
 HARNESS_HOST = "127.0.0.1"
 HARNESS_PORT = 46409
 HARNESS_ORIGIN = f"http://{HARNESS_HOST}:{HARNESS_PORT}"
+
+
+def _install_public_network_guard(state: dict[str, Any]) -> Callable[[], None]:
+    """Deny public requests before DNS/socket send; keep loopback harness API.
+
+    The production providers still receive ordinary connection failures and
+    therefore report unavailable inputs. The harness substitutes no computed
+    data and records every blocked host so acceptance can assert isolation.
+    """
+    import ipaddress as _ipaddress
+    import socket as _socket
+    import errno as _errno
+    import aiohttp as _aiohttp
+    from yarl import URL as _URL
+
+    def _loopback_host(host: Any) -> bool:
+        if not isinstance(host, str) or not host:
+            return False
+        value = host.rstrip(".").lower()
+        if value == "localhost" or value.endswith(".localhost"):
+            return True
+        try:
+            return _ipaddress.ip_address(value).is_loopback
+        except ValueError:
+            return False
+
+    def _record(host: Any, method: str = "GET") -> None:
+        try:
+            attempts = state.setdefault("blocked_public_requests", [])
+            if isinstance(attempts, list):
+                attempts.append({"host": str(host or ""), "method": str(method).upper()})
+        except Exception:
+            pass
+
+    session_cls = _aiohttp.ClientSession
+    old_request = getattr(session_cls, "_repair_harness_original_request", None)
+    if old_request is None:
+        old_request = session_cls._request
+        session_cls._repair_harness_original_request = old_request
+    old_getaddrinfo = getattr(_socket, "_repair_harness_original_getaddrinfo", None)
+    if old_getaddrinfo is None:
+        old_getaddrinfo = _socket.getaddrinfo
+        _socket._repair_harness_original_getaddrinfo = old_getaddrinfo
+    old_connect = getattr(_socket.socket, "_repair_harness_original_connect", None)
+    if old_connect is None:
+        old_connect = _socket.socket.connect
+        _socket.socket._repair_harness_original_connect = old_connect
+    old_connect_ex = getattr(_socket.socket, "_repair_harness_original_connect_ex", None)
+    if old_connect_ex is None:
+        old_connect_ex = _socket.socket.connect_ex
+        _socket.socket._repair_harness_original_connect_ex = old_connect_ex
+
+    def _guard_socket_address(address: Any) -> bool:
+        # Unix-domain sockets and loopback are local harness traffic. Blocking
+        # connect itself also covers clients using literal public IPs, which
+        # do not pass through getaddrinfo.
+        if not isinstance(address, tuple) or not address:
+            return False
+        host = address[0]
+        if _loopback_host(host):
+            return False
+        _record(host, "SOCKET")
+        return True
+
+    async def _guard_request(self: Any, method: str, str_or_url: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            url = str_or_url if isinstance(str_or_url, _URL) else _URL(str(str_or_url))
+            if not url.scheme and getattr(self, "_base_url", None) is not None:
+                url = self._base_url.join(url)
+            host = url.host
+        except Exception:
+            host = None
+        if _loopback_host(host):
+            return await old_request(self, method, str_or_url, *args, **kwargs)
+        _record(host, method)
+        raise _aiohttp.ClientConnectionError("HARNESS_PUBLIC_NETWORK_DISABLED")
+
+    def _guard_getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if _loopback_host(host):
+            return old_getaddrinfo(host, *args, **kwargs)
+        _record(host, "SOCKET")
+        raise _socket.gaierror("HARNESS_PUBLIC_NETWORK_DISABLED")
+
+    def _guard_connect(sock: Any, address: Any) -> Any:
+        if _guard_socket_address(address):
+            raise OSError("HARNESS_PUBLIC_NETWORK_DISABLED")
+        return old_connect(sock, address)
+
+    def _guard_connect_ex(sock: Any, address: Any) -> int:
+        if _guard_socket_address(address):
+            return int(_errno.EACCES)
+        return int(old_connect_ex(sock, address))
+
+    session_cls._request = _guard_request  # type: ignore[method-assign]
+    _socket.getaddrinfo = _guard_getaddrinfo  # type: ignore[assignment]
+    _socket.socket.connect = _guard_connect  # type: ignore[method-assign]
+    _socket.socket.connect_ex = _guard_connect_ex  # type: ignore[method-assign]
+
+    def _restore() -> None:
+        if getattr(session_cls, "_request", None) is _guard_request:
+            session_cls._request = old_request  # type: ignore[method-assign]
+        if getattr(_socket, "getaddrinfo", None) is _guard_getaddrinfo:
+            _socket.getaddrinfo = old_getaddrinfo  # type: ignore[assignment]
+        if getattr(_socket.socket, "connect", None) is _guard_connect:
+            _socket.socket.connect = old_connect  # type: ignore[method-assign]
+        if getattr(_socket.socket, "connect_ex", None) is _guard_connect_ex:
+            _socket.socket.connect_ex = old_connect_ex  # type: ignore[method-assign]
+
+    return _restore
+
 
 # Canonical five scenarios + task-literal alias.
 HARNESS_SCENARIOS: tuple[str, ...] = (
@@ -982,7 +1092,8 @@ def create_repair_acceptance_app(
     universe listing + 1.5s real slow-provider sleep). Computed legs
     (mark/quote/funding/rules via ProductionHedgeMarket + nine real
     RepairPorts) are never overwritten. Identity overrides are static verified
-    mappings (raw config, not scores); FX cache is a raw HTTP cache entry.
+    mappings (raw config, not scores); stablecoin FX is fetched by the real
+    CoinGecko provider through the raw-response transport below.
     The nine RepairPorts stay real (bindings=None => REAL_PRODUCERS/False);
     explicit non-None bindings must still be D19.6 TEST_FAKE or this helper
     raises TEST_BINDINGS_REQUIRED. No computed Score/PnL/Outcome is injected.
@@ -1024,6 +1135,7 @@ def create_repair_acceptance_app(
         "bindings_mode": "TEST_FAKE" if bindings is not None else "REAL_PRODUCERS",
         "origin": HARNESS_ORIGIN,
         "acceptance": ACCEPTANCE_MODE,
+        "blocked_public_requests": [],
     }
 
     # -- CR20 raw-HTTP-only stubs (test process only) ---------------------
@@ -1073,79 +1185,14 @@ def create_repair_acceptance_app(
             e["onboardDate"] = int(onboard)
         return e
 
-    # Install raw patches (CR20: last harness_state wins for the single
-    # isolated server on 46409; reinstall per app so scenario-aware closures
-    # stay fresh for sequential TestClient apps).
+    # Define an app-scoped fixture transport. It is installed only when this
+    # app's lifespan starts and restored at shutdown; constructing an app has
+    # no effect on shared HTTP globals.
     try:
-        import asyncio as _raw_aio  # noqa: F401
-        from diveintocrypto_desktop.data import funding as _raw_fund_mod
+        import asyncio as _raw_aio
         from diveintocrypto_desktop.data import http as _raw_http_mod
-        from diveintocrypto_desktop.data import universe as _raw_uni_mod
-
-        # Save true originals once (first install) so reinstalls wrap originals,
-        # not already-wrapped stubs.
-        if getattr(_raw_fund_mod, "_cr20_orig_saved", None) is not True:
-            try:
-                _raw_fund_mod._cr20_orig_premium = _raw_fund_mod.premium_index  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                _raw_fund_mod._cr20_orig_hist = getattr(_raw_fund_mod, "funding_history_range", None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                _raw_fund_mod._cr20_orig_get_json_fund = getattr(_raw_fund_mod, "get_json", None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                _raw_http_mod._cr20_orig_get_json = _raw_http_mod.get_json  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                _raw_uni_mod._cr20_orig_meta = _raw_uni_mod.contract_metadata_all  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                from diveintocrypto_desktop.data import orderbook as _raw_ob_mod0
-                _raw_ob_mod0._cr20_orig_get_json = getattr(_raw_ob_mod0, "get_json", None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                from diveintocrypto_desktop.data import spot as _raw_spot_mod0
-                _raw_spot_mod0._cr20_orig_get_json = getattr(_raw_spot_mod0, "get_json", None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                from diveintocrypto_desktop.shortlab.hedge import market as _raw_mkt_mod0
-                _raw_mkt_mod0._cr20_orig_fx = getattr(_raw_mkt_mod0.ProductionHedgeMarket, "_fx", None)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            _raw_fund_mod._cr20_orig_saved = True  # type: ignore[attr-defined]
-        _raw_orig_get_json = getattr(_raw_http_mod, "_cr20_orig_get_json", _raw_http_mod.get_json)
-        # Reinstall per app (fresh closure over current harness_state/clock).
         if True:
-            async def _cr20_raw_premium_index(symbol: str, *, request_context: Any | None = None) -> dict[str, Any]:
-                scen = _raw_scenario()
-                if scen == "slow-provider":
-                    await _raw_aio.sleep(SLOW_PROVIDER_REAL_DELAY_S)
-                s = str(symbol).upper()
-                now = _raw_now()
-                px = _raw_price_for(s)
-                rate = -0.0005 if scen == "negative-funding" else 0.0005
-                return {
-                    "mark_price": float(px),
-                    "index_price": float(px),
-                    "last_funding_rate": float(rate),
-                    "next_funding_time": int(now + 8 * 3600 * 1000),
-                    "time_ms": int(now),
-                    "time": int(now),
-                }
-
-            async def _cr20_raw_hist(symbol: str, start_ms: int, end_ms: int, limit: int = 1000, *, request_context: Any | None = None) -> list[Any]:
-                # Fresh DB stays honestly empty offline (no network backfill).
-                return []
-
-            async def _cr20_raw_get_json(url: str, params: Any | None = None, **kw: Any) -> Any:
+            def _cr20_raw_get_json(url: str, params: Any | None = None) -> Any:
                 ustr = str(url)
                 now = _raw_now()
                 scen = _raw_scenario()
@@ -1169,6 +1216,11 @@ def create_repair_acceptance_app(
                     syms = [_raw_entry("1000PEPEUSDT", onboard), _raw_entry("BTCUSDT", onboard), _raw_entry("PEPEUSDT", onboard)]
                     # Verified REQUEST_WEIGHT contract required by budget.configure_host_limits.
                     return {"symbols": syms, "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 6000}]}
+                if "/ticker/24hr" in ustr:
+                    return [
+                        {"symbol": "1000PEPEUSDT", "lastPrice": "0.012", "priceChangePercent": "1.5", "quoteVolume": "100000000", "closeTime": now},
+                        {"symbol": "BTCUSDT", "lastPrice": "67000", "priceChangePercent": "0.26", "quoteVolume": "1000000000", "closeTime": now},
+                    ]
                 if "bookTicker" in ustr:
                     sym = str((params or {}).get("symbol") or "").upper() if isinstance(params, dict) else ""
                     px = _raw_price_for(sym)
@@ -1185,89 +1237,78 @@ def create_repair_acceptance_app(
                         return {"lastUpdateId": 1, "bids": [["66990", "10"], ["66980", "10"]], "asks": [["67010", "10"], ["67020", "10"]], "E": now, "T": now}
                     px = _raw_price_for(sym or "BTCUSDT")
                     return {"lastUpdateId": 1, "bids": [[str(px * 0.999), "1000"]], "asks": [[str(px * 1.001), "1000"]], "E": now, "T": now}
-                return await _raw_orig_get_json(url, params, **kw)
+                if "/api/v3/coins/" in ustr:
+                    coin = ustr.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+                    coin_symbols = {"tether": "usdt", "usd-coin": "usdc", "first-digital-usd": "fdusd"}
+                    if coin in coin_symbols:
+                        import datetime as _dt
+                        as_of = _dt.datetime.fromtimestamp(now / 1000, tz=_dt.timezone.utc).isoformat()
+                        return {
+                            "id": coin, "symbol": coin_symbols[coin], "name": coin,
+                            "market_data": {
+                                "current_price": {"usd": "1"},
+                                "market_cap": {"usd": "1"},
+                                "fully_diluted_valuation": {"usd": "1"},
+                                "circulating_supply": 1, "total_supply": 1,
+                                "max_supply": None, "ath": {"usd": "1"},
+                                "ath_change_percentage": {"usd": 0},
+                                "ath_date": {"usd": as_of},
+                                "last_updated": as_of,
+                            },
+                            "categories": [],
+                        }
+                # Acceptance stays raw-fixture-only. Unknown endpoints retain
+                # the provider's honest unavailable path instead of falling
+                # through to a public service.
+                raise RuntimeError(f"HARNESS_RAW_HTTP_FIXTURE_UNAVAILABLE:{ustr[:160]}")
 
-            def _cr20_raw_meta_all() -> dict[str, Any]:
-                try:
-                    from diveintocrypto_desktop.data.universe import ContractMetadata as _CM
-                except Exception:
-                    return {}
-                scen_raw = str(harness_state.get("scenario") or "normal")
-                now2 = _raw_now()
-                if scen_raw == "unknown-schedule":
-                    return {
-                        "1000PEPEUSDT": _CM(symbol="1000PEPEUSDT", onboard_at_ms=None, first_seen_ms=now2, delivery_at_ms=None, status="TRADING", contract_type="PERPETUAL", observed_at_ms=now2, contract_multiplier=None, multiplier_source=None),
-                        "BTCUSDT": _CM(symbol="BTCUSDT", onboard_at_ms=None, first_seen_ms=now2, delivery_at_ms=None, status="TRADING", contract_type="PERPETUAL", observed_at_ms=now2, contract_multiplier=None, multiplier_source=None),
-                    }
-                ob = now2 - 200 * 86_400_000
-                return {
-                    "1000PEPEUSDT": _CM(symbol="1000PEPEUSDT", onboard_at_ms=ob, first_seen_ms=ob, delivery_at_ms=None, status="TRADING", contract_type="PERPETUAL", observed_at_ms=now2, contract_multiplier=1000.0, multiplier_source="EXCHANGE"),
-                    "BTCUSDT": _CM(symbol="BTCUSDT", onboard_at_ms=ob, first_seen_ms=ob, delivery_at_ms=None, status="TRADING", contract_type="PERPETUAL", observed_at_ms=now2, contract_multiplier=1.0, multiplier_source="EXCHANGE"),
-                }
+            class _FixtureResponse:
+                status = 200
+                headers: dict[str, str] = {}
 
-            _raw_fund_mod.premium_index = _cr20_raw_premium_index  # type: ignore[attr-defined]
-            try:
-                _raw_hist_orig = getattr(_raw_fund_mod, "_cr20_orig_hist", None)
-                if _raw_hist_orig is not None:
-                    _raw_fund_mod.funding_history_range = _cr20_raw_hist  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            _raw_http_mod.get_json = _cr20_raw_get_json  # type: ignore[attr-defined]
-            _raw_uni_mod.contract_metadata_all = _cr20_raw_meta_all  # type: ignore[attr-defined]
-            # CR20: stablecoin FX is always 1 (raw CoinGecko response stub).
-            # Pre-populating once is not enough: FakeClock advances 10s per
-            # scenario (60s+ across the matrix) expire the 60s FX cache, so
-            # patch the market FX fetch to stay fresh on current clock.
-            try:
-                from diveintocrypto_desktop.shortlab.hedge import market as _raw_mkt_mod
+                def __init__(self, payload: Any, url: str) -> None:
+                    self._payload = payload
+                    self._url = str(url)
 
-                _orig_fx = getattr(_raw_mkt_mod.ProductionHedgeMarket, "_fx", None)
-                if getattr(_raw_mkt_mod.ProductionHedgeMarket, "_cr20_fx_patched", None) is not True:
+                async def __aenter__(self) -> Any:
+                    harness_state["raw_http_sends"] = int(harness_state.get("raw_http_sends", 0)) + 1
+                    if _raw_scenario() == "slow-provider" and "premiumIndex" in self._url:
+                        await _raw_aio.sleep(SLOW_PROVIDER_REAL_DELAY_S)
+                    return self
+
+                async def __aexit__(self, *exc: Any) -> bool:
+                    return False
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                async def json(self) -> Any:
+                    return self._payload
+
+            class _FixtureSession:
+                closed = False
+
+                def get(self, url: Any, params: Any = None, **_kwargs: Any) -> Any:
                     try:
-                        _raw_mkt_mod.ProductionHedgeMarket._cr20_orig_fx = _orig_fx  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                    _raw_mkt_mod.ProductionHedgeMarket._cr20_fx_patched = True  # type: ignore[attr-defined]
-
-                async def _cr20_raw_fx(self: Any, currency: str, request_context: Any = None) -> str:
-                    cur = str(currency).upper()
-                    if cur in ("USD", "USDT", "USDC", "FDUSD"):
-                        now = _raw_now()
+                        payload = _cr20_raw_get_json(str(url), params)
+                    except RuntimeError:
                         try:
-                            self._fx_cache[cur] = (now, "1")  # type: ignore[attr-defined]
-                            self._fx_provenance[cur] = {"source_as_of_ms": now - 1_000, "known_at_ms": now, "currency": cur}  # type: ignore[attr-defined]
+                            from urllib.parse import urlsplit as _urlsplit
+                            host = _urlsplit(str(url)).hostname or ""
+                            attempts = harness_state.setdefault("blocked_public_requests", [])
+                            if isinstance(attempts, list):
+                                attempts.append({"host": host, "method": "GET"})
                         except Exception:
                             pass
-                        return "1"
-                    orig = getattr(_raw_mkt_mod.ProductionHedgeMarket, "_cr20_orig_fx", None)
-                    if callable(orig):
-                        return await orig(self, currency)
-                    raise RuntimeError("QUOTE_FX_UNAVAILABLE")
+                        raise
+                    return _FixtureResponse(payload, str(url))
 
-                _raw_mkt_mod.ProductionHedgeMarket._fx = _cr20_raw_fx  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            # CR20: direct `from http import get_json` bindings bypass
-            # http.get_json patch; patch each consumer module as well so raw
-            # stubs win offline (budget-family UNBUDGETED would otherwise fire
-            # for spot bookTicker/depth via stale direct references).
-            try:
-                from diveintocrypto_desktop.data import orderbook as _raw_ob_mod
-                from diveintocrypto_desktop.data import spot as _raw_spot_mod
-                try:
-                    _raw_ob_mod.get_json = _cr20_raw_get_json  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                try:
-                    _raw_spot_mod.get_json = _cr20_raw_get_json  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                try:
-                    _raw_fund_mod.get_json = _cr20_raw_get_json  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                async def close(self) -> None:
+                    self.closed = True
+
+            async def _cr20_fixture_get_session() -> Any:
+                return _FixtureSession()
+
     except Exception:
         pass
 
@@ -1281,9 +1322,31 @@ def create_repair_acceptance_app(
             config=enabled_cfg,
         )
         _orig_start = rt.start
+        _orig_stop = rt.stop
+        _network_restore: Callable[[], None] | None = None
+        _raw_restore: Callable[[], None] | None = None
 
         async def _acceptance_start() -> Any:
-            out = await _orig_start()
+            nonlocal _network_restore, _raw_restore
+            _network_restore = _install_public_network_guard(harness_state)
+            _prior_get_session = _raw_http_mod.get_session
+            _raw_http_mod.get_session = _cr20_fixture_get_session  # type: ignore[attr-defined]
+
+            def _restore_transport() -> None:
+                if _raw_http_mod.get_session is _cr20_fixture_get_session:
+                    _raw_http_mod.get_session = _prior_get_session  # type: ignore[attr-defined]
+
+            _raw_restore = _restore_transport
+            try:
+                out = await _orig_start()
+            except Exception:
+                if _network_restore is not None:
+                    _network_restore()
+                    _network_restore = None
+                if _raw_restore is not None:
+                    _raw_restore()
+                    _raw_restore = None
+                raise
             try:
                 svc = rt.service
             except Exception:
@@ -1309,38 +1372,25 @@ def create_repair_acceptance_app(
                 except Exception:
                     return 1791417600000
 
-            # CR20: computed fakes removed. Raw HTTP stubs above (+FakeClock)
-            # are the only replacements; ProductionHedgeMarket computes
-            # mark/quote/funding/rules honestly from those raw responses.
+            # Raw HTTP response fixtures run below data.http.get_json, so its
+            # endpoint budget, retry and accounting logic remains production.
 
-            # CR20: never overwrite computed legs (mark/quote/funding/rules).
-            # ProductionHedgeMarket stays wired (svc._hedge_*_fn remain the
-            # real market.mark/quote/funding bound by ShortLabRuntime); only
-            # the original HTTP responses + FakeClock are stubbed (see raw
-            # patches installed before runtime creation below). Identity
-            # overrides below are static verified mappings (raw config, not
-            # computed scores) and FX cache is a raw HTTP cache entry.
-            try:
-                mkt = getattr(svc, "_hedge_market", None)
-                if mkt is not None:
-                    try:
-                        _now_ms = _now()
-                        try:
-                            mkt._fx_cache["USDT"] = (_now_ms, "1")  # type: ignore[attr-defined]
-                            mkt._fx_provenance["USDT"] = {  # type: ignore[attr-defined]
-                                "source_as_of_ms": _now_ms - 1_000,
-                                "known_at_ms": _now_ms,
-                                "currency": "USDT",
-                            }
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
             return out
 
+        async def _acceptance_stop() -> Any:
+            nonlocal _network_restore, _raw_restore
+            try:
+                return await _orig_stop()
+            finally:
+                if _network_restore is not None:
+                    _network_restore()
+                    _network_restore = None
+                if _raw_restore is not None:
+                    _raw_restore()
+                    _raw_restore = None
+
         rt.start = _acceptance_start  # type: ignore[method-assign]
+        rt.stop = _acceptance_stop  # type: ignore[method-assign]
         return rt
 
     sig = inspect.signature(shortlab_runtime_factory)
@@ -1360,6 +1410,8 @@ def create_repair_acceptance_app(
         except Exception:
             now_ms = -1
         provider = FakeHarnessRawProvider(harness_state["scenario"])
+        runtime = getattr(app.state, "shortlab_runtime", None)
+        budget = getattr(runtime, "_request_budget", None)
         return {
             "scenario": harness_state["scenario"],
             "canonicalScenario": harness_state["canonical_scenario"],
@@ -1370,6 +1422,14 @@ def create_repair_acceptance_app(
             "slowProviderDelayMs": provider.slow_provider_delay_ms(),
             "planSequence": list(provider.plan_sequence()),
             "acceptance": ACCEPTANCE_MODE,
+            "blockedPublicRequestCount": len(harness_state.get("blocked_public_requests", ())),
+            "blockedPublicHosts": sorted({
+                str(item.get("host") or "")
+                for item in harness_state.get("blocked_public_requests", ())
+                if isinstance(item, Mapping)
+            }),
+            "rawHttpSendCount": int(harness_state.get("raw_http_sends", 0)),
+            "actualBudgetSendCount": int(getattr(budget, "sent_attempts", 0) or 0),
         }
 
     @control.post("/advance")

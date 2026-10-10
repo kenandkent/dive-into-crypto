@@ -33,6 +33,7 @@ Design A7.1/A7.2; plan F03 (AC03/AC04/AC07).
 
 from __future__ import annotations
 
+import json
 import time
 import urllib.parse
 from collections import deque
@@ -77,7 +78,7 @@ __all__ = [
 ]
 
 #: Versioned endpoint-weight fixture. Bump when any weight changes.
-ENDPOINT_WEIGHTS_VERSION = "endpoint-weights-v2"
+ENDPOINT_WEIGHTS_VERSION = "endpoint-weights-v3"
 
 UNBUDGETED_ENDPOINT = "UNBUDGETED_ENDPOINT"
 BUDGET_EXHAUSTED = "REQUEST_BUDGET_EXHAUSTED"
@@ -199,7 +200,7 @@ def _default_clock_ms() -> int:
 #: Static fixture: family -> weight or limit-bucket table. Weights are
 #: illustrative-but-fixed Binance public weights; the point is they are
 #: versioned and limit-aware, not guessed from rateLimits at runtime.
-#: R11a (endpoint-weights-v2): existing families/buckets retained, plus
+#: R11a (endpoint-weights-v3): existing families/buckets retained, plus
 #: markKlines/fundingInfo/Spot/Alpha/CoinGecko/0x per D19.3. FAPI/Spot final
 #: weight is max(local token, Fixture frozen official IP weight) elsewhere;
 #: Alpha/CoinGecko/0x use independent host-local RPS/token limits.
@@ -219,7 +220,8 @@ ENDPOINT_WEIGHTS: dict[str, Any] = {
     "spot": {"default": 10},
     "spotKlines": {"default": 10, "buckets": [(100, 10), (500, 20), (1000, 30)], "min": 1, "max": 1000},
     "spotDepth": {"default": 20, "buckets": [(100, 20), (500, 30), (1000, 50)], "min": 1, "max": 1000, "require_limit": True},
-    "spotTicker": {"default": 40},
+    "spotTicker": {"default": 80},
+    "spotBookTicker": {"default": 4},
     "alphaTokenList": {"default": 10},
     "alphaExchangeInfo": {"default": 10},
     "alphaTicker": {"default": 10},
@@ -329,6 +331,8 @@ def endpoint_family_for_url(url: str) -> str | None:
             return "spotDepth"
         if path == "/api/v3/ticker/24hr":
             return "spotTicker"
+        if path == "/api/v3/ticker/bookTicker":
+            return "spotBookTicker"
         if path == "/api/v3/exchangeInfo":
             return "exchangeInfo"
         # Legacy generic spot family for other /api/v3/* market paths is NOT
@@ -380,19 +384,43 @@ def endpoint_weight(
 
     Unknown families are ``UNBUDGETED_ENDPOINT`` and must not be sent under a
     budget. Limit-bucketed families reject out-of-range/missing limits
-    (unknown limit => ``None``); spotTicker distinguishes single (2) vs full
-    list (40) by ``symbol`` presence.
+    (unknown limit => ``None``); spotTicker distinguishes single symbols and
+    batch sizes using the frozen local floor plus official IP weight.
     """
     if family is None:
         return None
     # premiumIndex single vs all share the same fixture weight.
     if family == "premiumIndex" and isinstance(params, dict) and params.get("symbol") is None:
         family = "premiumIndexAll"
-    # spotTicker: single symbol 2, full list 40 (D19.3).
+    # Spot ticker 24hr: single symbol 2. Batch calls use max(local 40,
+    # official tier 2/40/80); omitted symbols use the official 80 weight.
     if family == "spotTicker":
+        if not isinstance(params, dict):
+            return 80
+        symbol = params.get("symbol")
+        symbols = params.get("symbols")
+        has_symbol = symbol is not None
+        has_symbols = symbols is not None
+        if has_symbol and has_symbols:
+            return None
+        if has_symbol:
+            return 2 if isinstance(symbol, str) and symbol.strip() else None
+        if has_symbols:
+            try:
+                parsed = json.loads(symbols) if isinstance(symbols, str) else symbols
+            except (TypeError, ValueError):
+                return None
+            if (not isinstance(parsed, (list, tuple)) or not parsed
+                    or any(not isinstance(item, str) or not item.strip() for item in parsed)):
+                return None
+            return 40 if len(parsed) <= 100 else 80
+        return 80
+    if family == "spotBookTicker":
+        if isinstance(params, dict) and params.get("symbol") and params.get("symbols"):
+            return None
         if isinstance(params, dict) and params.get("symbol"):
             return 2
-        return 40
+        return 4
     spec = ENDPOINT_WEIGHTS.get(family)
     if spec is None:
         return None
