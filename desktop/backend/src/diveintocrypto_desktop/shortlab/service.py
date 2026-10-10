@@ -1703,6 +1703,45 @@ class ShortLabService:
         next_allowed: int | None = None
         processed: list[str] = []
         cutoff_ms = int(context.clock_ms())
+        # CR03: archive funding schedules once per run (single fundingInfo
+        # charge inside the shared 80/300s window) so CONFIRMED coverage can
+        # form on fresh installs. Denied/failed collection keeps history
+        # UNKNOWN and is recorded, never fabricated.
+        schedules_saved: int = 0
+        try:
+            from diveintocrypto_desktop.data.funding import (
+                collect_and_archive_funding_schedules as _collect_sched,
+            )
+            from diveintocrypto_desktop.shortlab.request_budget import (
+                make_request_context as _mk_sched_ctx,
+            )
+
+            if budget is not None:
+                _sched_ctx = _mk_sched_ctx(
+                    budget, job_type="funding_backfill",
+                    host="fapi", endpoint_family="fundingInfo",
+                    trace_id=f"{context.trace_id}:schedules",
+                )
+            else:
+                _sched_ctx = None
+            _sched_res = await _collect_sched(
+                repository=repo,
+                symbols=list(tracked) if tracked else None,
+                observed_at_ms=cutoff_ms,
+                now_ms=cutoff_ms,
+                request_context=_sched_ctx,
+            )
+            if isinstance(_sched_res, Mapping):
+                schedules_saved = len(_sched_res.get("saved_ids") or ())
+                requested += 1
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.request_budget import BudgetExhausted as _BE
+
+                if isinstance(exc, _BE):
+                    deferred += 1
+            except Exception:
+                pass
         for symbol in rotated[:batch]:
             # Cache-first: TTL hit reuses the identical Observed, no send.
             cache_key = (symbol, "funding", "90d")
@@ -1806,6 +1845,7 @@ class ShortLabService:
             "requested": requested,
             "persisted_events": persisted_events,
             "deferred": deferred,
+            "schedules_saved": int(schedules_saved),
             "cursor": int(self._funding_cursor),
             "next_allowed_at_ms": self._funding_next_allowed_at_ms,
         }

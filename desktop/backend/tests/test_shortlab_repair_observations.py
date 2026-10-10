@@ -1000,3 +1000,73 @@ async def test_cr03_restart_preserves_receipt_and_coverage():
         await repo2.close()
 
 
+
+
+class _TFakeClock:
+    def __init__(self, start_ms: int) -> None:
+        self.ms = int(start_ms)
+
+    def __call__(self) -> int:
+        return int(self.ms)
+
+
+@pytest.mark.asyncio
+async def test_backfill_run_archives_funding_schedules(tmp_path) -> None:
+    """CR03 wiring: run_funding_backfill archives CONFIRMED schedules (D05.1)."""
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from diveintocrypto_desktop.shortlab import observations as _obs
+    from diveintocrypto_desktop.shortlab.config import load_shortlab_config
+    from diveintocrypto_desktop.data import funding as fm
+    from diveintocrypto_desktop.shortlab.providers.base import ProviderRegistry
+    from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
+    from diveintocrypto_desktop.shortlab.request_budget import ObservedCache, RequestBudget
+    from diveintocrypto_desktop.shortlab.service import (
+        JOB_TYPE_FUNDING_BACKFILL,
+        ShortLabService,
+    )
+
+    db = Path(tempfile.mkdtemp()) / "cr03w.duckdb"
+    repo = await ShortLabRepository.open(db)
+    try:
+        await repo.migrate(6)
+        assert await repo.list_funding_schedules("BTCUSDT", T0) == ()
+
+        async def _universe_fn(limit: int | None = None):
+            return [{"s": "BTCUSDT"}]
+
+        async def _funding_fn(symbol: str, a: int, b: int):
+            return []
+
+        async def _fake_info_observed(*, request_context=None, **kwargs):
+            return _obs.make_observation(
+                [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}],
+                source="binance:fapi/fundingInfo",
+                source_as_of_ms=None,
+                fetched_at_ms=T0,
+                known_at_ms=T0,
+            )
+
+        clock = _TFakeClock(T0)
+        service = ShortLabService(
+            config=load_shortlab_config(), repository=repo,
+            registry=ProviderRegistry(), clock=clock,
+            universe_fn=_universe_fn, funding_history_fn=_funding_fn,
+            request_budget=RequestBudget(max_sends=240, window_ms=60_000),
+            observed_cache=ObservedCache(),
+        )
+        with patch.object(fm, "fetch_funding_info_observed", _fake_info_observed):
+            ctx = service.make_job_context(JOB_TYPE_FUNDING_BACKFILL, trace_id="cr03w-1")
+            status = await service.run_funding_backfill(ctx, job_id="cr03w-1")
+        assert status.status == "SUCCEEDED"
+        assert int(status.stats.get("schedules_saved", 0)) >= 1
+        rows = await repo.list_funding_schedules("BTCUSDT", T0)
+        assert len(rows) == 1
+        sched = rows[0]["schedule_json"]
+        assert sched["verification"] == "CONFIRMED"
+        assert int(sched["interval_hours"]) == 8
+        assert int(rows[0]["effective_from_ms"]) == T0
+    finally:
+        await repo.close()
