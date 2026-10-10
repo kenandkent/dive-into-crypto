@@ -136,7 +136,7 @@ async def test_failed_mirror_rehydrate_exposes_degraded_memory_not_old_safe_snap
     from diveintocrypto_desktop.shortlab.hedge.models import HedgeMonitor
     repo = SimpleNamespace(list_hedge_plans=AsyncMock(side_effect=TimeoutError('queue unavailable')))
     svc = SimpleNamespace(_repository=repo, _config=None, _ensure_hedge_available=AsyncMock())
-    jobs = HedgeJobs(svc)
+    jobs=HedgeJobs(svc)
     jobs.mirror['p'] = {'plan': {'plan_id':'p','status':'ACTIVE'}, 'positions': [],
                        'previous': HedgeMonitor('old','p',100000,mark_price='100',status='OK')}
     jobs.invalidate('p')
@@ -145,3 +145,84 @@ async def test_failed_mirror_rehydrate_exposes_degraded_memory_not_old_safe_snap
     assert jobs.mirror['p']['previous'].status == 'MONITOR_DEGRADED'
     assert jobs.mirror['p']['previous'].mark_price is None
     assert jobs.mirror['p']['plan']['status'] == 'ACTIVE'
+
+
+@pytest.mark.asyncio
+async def test_opportunity_writes_projection_v2_queryable_without_manual_seed(tmp_path):
+    """CR11 (D08/R09): real opportunity job persists frozen projection_v2.
+
+    No manual FCS/projection seed: the job calls the single frozen
+    projection implementation and the new row is queryable via the current
+    API with Gate/hash/term/expiry (never LEGACY/stale by omission).
+    """
+    import json
+    from diveintocrypto_desktop.shortlab.config import fcs_config_hash, load_shortlab_config
+    from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics
+    from diveintocrypto_desktop.shortlab.repair_contracts import OpportunityQuery
+    from diveintocrypto_desktop.shortlab.repository import ShortLabRepository
+
+    NOW = 1791417600000
+    repo = await ShortLabRepository.open(tmp_path / "cr11.duckdb")
+    await repo.migrate(target_version=6)
+    try:
+        cfg = load_shortlab_config()
+        expected_hash = fcs_config_hash(cfg)
+        identity = {'canonical_id': 'bitcoin', 'contract_multiplier': '1',
+                    'identity_confidence': 'VERIFIED',
+                    'onboard_at_ms': NOW - 400 * 86400000, 'reliable': True}
+        mark = {'price': '100', 'canonical_price_usd': '100',
+                'next_funding_time_ms': NOW + 1000, 'expires_at_ms': NOW + 30000}
+        quote = {'venue': 'BINANCE_SPOT', 'status': 'OK', 'mid_price': '100',
+                 'buy_vwap': '100.01', 'sell_vwap': '99.99',
+                 'buy_executable_qty': '1000', 'sell_executable_qty': '1000',
+                 'exit_feasibility': 'CONFIRMED',
+                 'as_of_ms': NOW, 'fetched_at_ms': NOW, 'expires_at_ms': NOW + 60000}
+        funding = FundingMetrics(symbol='BTCUSDT', funding_7d='0.01', funding_30d='0.05',
+                                 funding_90d='0.10', positive_ratio_30d='0.9',
+                                 positive_ratio_90d='0.9', coverage_30d='1.0',
+                                 coverage_90d='1.0', conservative_apr='0.5',
+                                 history_coverage='1.0')
+        svc = SimpleNamespace(_repository=repo, _config=cfg,
+                              _ensure_hedge_available=AsyncMock(),
+                              _universe_fn=lambda n: [{'symbol': 'BTCUSDT', 'quote_volume': 1}],
+                              _hedge_identity_for=AsyncMock(return_value=dict(identity)),
+                              _hedge_mark_for=AsyncMock(return_value=dict(mark)),
+                              _hedge_funding_for=AsyncMock(return_value=funding),
+                              _hedge_quote_for=AsyncMock(return_value=dict(quote)))
+        jobs = HedgeJobs(svc)
+        result = await jobs.opportunity(SimpleNamespace(trace_id='t', clock_ms=lambda: NOW))
+        assert result.stats == {'computed': 1, 'failed': 0}
+        # Raw row carries the frozen envelope (identity + projection_v2).
+        rows = await repo.list_fcs('BTCUSDT')
+        assert len(rows) == 1
+        risk = json.loads(rows[0]['risk_json']) if isinstance(rows[0]['risk_json'], str) else dict(rows[0]['risk_json'])
+        assert set(risk) == {'identity', 'projection_v2'}
+        assert risk['identity']['canonical_id'] == 'bitcoin'
+        proj = dict(risk['projection_v2'])
+        for key in ('snapshot_id', 'symbol', 'canonical_id', 'as_of_ms', 'expires_at_ms',
+                    'stale', 'fcs', 'fcs_config_hash', 'funding_7d', 'funding_30d',
+                    'positive_ratio_30d', 'history_class', 'best_venue', 'break_even_days',
+                    'conservative_apr', 'readiness_breakdown', 'readiness', 'reasons'):
+            assert key in proj, key
+        # Gate/hash/term/expiry are real frozen values (never invented).
+        assert proj['fcs_config_hash'] == expected_hash
+        assert rows[0]['fcs_config_hash'] == expected_hash
+        assert proj['history_class'] == 'FULL_90D'
+        assert proj['funding_7d'] == '0.01' and proj['funding_30d'] == '0.05'
+        assert proj['best_venue'] == 'BINANCE_SPOT'
+        assert proj['expires_at_ms'] == NOW + 30000
+        bd = proj['readiness_breakdown']
+        assert set(bd) >= {'funding_gate', 'execution_gate', 'economic_gate', 'readiness'}
+        # Current API without manual seed: new row is visible and legal.
+        page = await repo.list_current_funding_opportunities(
+            OpportunityQuery(symbol='BTCUSDT'), as_of_ms=NOW + 1000)
+        assert page.total == 1 and len(page.items) == 1
+        item = dict(page.items[0])
+        assert item['snapshot_id'] == 'BTCUSDT:fcs:%d' % NOW
+        assert item['stale'] is False
+        assert 'LEGACY' not in list(item.get('reasons') or [])
+        assert item['fcs_config_hash'] == expected_hash
+        assert item['best_venue'] == 'BINANCE_SPOT'
+        assert item['expires_at_ms'] == NOW + 30000
+    finally:
+        await repo.close()

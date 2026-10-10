@@ -493,11 +493,107 @@ class HedgeJobs:
                 identity['multiplier_verified']=identity.get('contract_multiplier') is not None and identity.get('identity_confidence') in ('HIGH','VERIFIED')
                 identity['spot_quote_fresh']=quote.get('status')=='OK' and quote.get('expires_at_ms') is not None and int(quote['expires_at_ms'])>=now
                 identity['next_funding_time_known']=mark.get('next_funding_time') is not None or mark.get('next_funding_time_ms') is not None
-                result=score_fcs(funding,venue_summary,basis,identity,self.service._config,funding_stats=stats,reference_notional_usd=reference,symbol=symbol,canonical_id=identity['canonical_id'],as_of_ms=now,snapshot_id=f'{symbol}:fcs:{now}',created_at_ms=now)
+                # CR11 (D08/R09): real FCS hash for the frozen projection (never "").
+                try:
+                    from ..config import fcs_config_hash as _fcs_hash_fn
+                    _fcs_hash = _fcs_hash_fn(self.service._config)
+                    if not isinstance(_fcs_hash, str) or not _fcs_hash.strip():
+                        _fcs_hash = ""
+                except Exception:
+                    _fcs_hash = ""
+                result=score_fcs(funding,venue_summary,basis,identity,self.service._config,funding_stats=stats,reference_notional_usd=reference,symbol=symbol,canonical_id=identity['canonical_id'],as_of_ms=now,snapshot_id=f'{symbol}:fcs:{now}',fcs_config_hash=_fcs_hash,created_at_ms=now)
                 data=dataclasses.asdict(result)
                 for key in ('module_scores','funding_metrics','venue_summary','basis','risk','reasons'):
                     data[key+'_json']=data.pop(key)
-                data['risk_json']={**mapping(data.get('risk_json')),'identity':dict(identity)}
+                # CR11 (D08/R09): opportunity refresh calls the single frozen
+                # projection implementation and persists the complete frozen
+                # projection + Gate/hash/term/expiry (never LEGACY/stale by
+                # omission). No GET-time fabrication of historic projections.
+                from .opportunity import build_projection_v2 as _build_proj
+                from .opportunity import build_risk_json as _build_risk
+                _fm = mapping(data.get('funding_metrics_json'))
+                # Listing age (term) from identity onboard when available.
+                _age_days = None
+                try:
+                    for _k in ('listing_age_days', 'listingAgeDays', 'age_days', 'ageDays'):
+                        _v = identity.get(_k)
+                        if _v is not None and not isinstance(_v, bool):
+                            try:
+                                _iv = int(float(str(_v).strip())) if isinstance(_v, str) else int(float(_v))
+                            except (TypeError, ValueError):
+                                continue
+                            if _iv >= 0:
+                                _age_days = _iv
+                                break
+                    if _age_days is None:
+                        for _k in ('onboard_at_ms', 'onboardMs', 'onboard_ms'):
+                            _v = identity.get(_k)
+                            if isinstance(_v, bool):
+                                continue
+                            try:
+                                _ob = int(_v)
+                            except (TypeError, ValueError):
+                                continue
+                            if _ob > 0 and _ob <= now:
+                                _age_days = max(0, (int(now) - _ob) // 86400000)
+                                break
+                except Exception:
+                    _age_days = None
+                def _int_or_none(_v):
+                    try:
+                        if _v is None or isinstance(_v, bool):
+                            return None
+                        _iv = int(_v)
+                    except (TypeError, ValueError):
+                        return None
+                    return _iv if _iv >= 0 else None
+                _quote_exp = _int_or_none(quote.get('expires_at_ms'))
+                _mark_exp = _int_or_none(mark.get('expires_at_ms', mark.get('mark_expires_at_ms')))
+                _fund_exp = None
+                try:
+                    if isinstance(funding, Mapping):
+                        _fund_exp = _int_or_none(funding.get('expires_at_ms', funding.get('funding_expires_at_ms')))
+                    else:
+                        _fund_exp = _int_or_none(getattr(funding, 'expires_at_ms', None))
+                except Exception:
+                    _fund_exp = None
+                _venue_quote = dict(quote)
+                _venue_quote.setdefault('venue', 'BINANCE_SPOT')
+                _venue_quote['requested_canonical_qty'] = str(qty)
+                if 'reference_notional_usd' not in _venue_quote and 'referenceNotionalUsd' not in _venue_quote:
+                    _venue_quote['reference_notional_usd'] = reference
+                if venue_summary.get('roundtrip_cost_pct') is not None:
+                    _venue_quote.setdefault('roundtrip_cost_pct', venue_summary.get('roundtrip_cost_pct'))
+                _expiries = [_v for _v in (_quote_exp, _mark_exp, _fund_exp) if _v is not None]
+                _snapshot = {
+                    'snapshot_id': str(result.snapshot_id),
+                    'symbol': str(symbol),
+                    'canonical_id': str(identity.get('canonical_id') or symbol.lower()),
+                    'as_of_ms': int(now),
+                    'fcs': result.fcs,
+                    'fcs_config_hash': _fcs_hash,
+                    'funding_metrics': dict(_fm),
+                    'funding_7d': _fm.get('funding_7d'),
+                    'funding_30d': _fm.get('funding_30d'),
+                    'positive_ratio_30d': _fm.get('positive_ratio_30d'),
+                    'conservative_apr': _fm.get('conservative_apr'),
+                    'history_class': history_class,
+                    'listing_age_days': _age_days,
+                    'venue_quotes': [_venue_quote],
+                    'venue_summary': dict(venue_summary),
+                    'reference_notional_usd': reference,
+                    'quote_expires_at_ms': _quote_exp,
+                    'mark_expires_at_ms': _mark_exp,
+                    'funding_expires_at_ms': _fund_exp,
+                    'expires_at_candidates': list(_expiries),
+                }
+                _proj = _build_proj(_snapshot, int(now))
+                _risk = _build_risk(_snapshot, int(now), extra={'identity': dict(identity)})
+                data['fcs'] = _proj.get('fcs')
+                data['readiness'] = str(_proj.get('readiness', 'NOT_READY'))
+                data['reasons_json'] = list(_proj.get('reasons', []))
+                data['fcs_config_hash'] = str(_proj.get('fcs_config_hash') or _fcs_hash or "")
+                data['risk_json'] = _risk
                 await self._db(self.service._repository.save_funding_capture_snapshot(data))
                 await self._save_quote({'symbol':symbol,'canonical_id':identity['canonical_id']},quote,now)
                 computed+=1
