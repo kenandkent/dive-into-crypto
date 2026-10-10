@@ -790,6 +790,10 @@ async def test_r10b_activate_persists_activation_check(tmp_path) -> None:
         for _k in ("identity", "mark_vs_liquidation", "depth", "funding_gate", "economics", "protection"):
             assert _checks[_k]["status"] == "PASS", (_k, _checks[_k])
         assert isinstance(_checks.get("protected_position_hash"), str) and _checks["protected_position_hash"]
+        # CR20: pid-as-symbol is a query mismatch so it must yield 0 rows.
+        rows_pid = await repo.list_market_observations(pid, "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert isinstance(rows_pid, tuple)
+        assert len(rows_pid) == 0, f"pid-as-symbol query must be empty (symbol mismatch), got {len(rows_pid)}"
     finally:
         await repo.close()
 

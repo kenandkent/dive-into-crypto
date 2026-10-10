@@ -379,16 +379,11 @@ def _full_chain_once(tag: str, scenario: str):
     altered = {**altered, "futures": {**altered["futures"], "nativeQty": "0.001"}}
     st, _bad = _post(f"/api/short/hedge/plans/{pid}/protection", altered)
     assert st == 409, f"protection mismatch must be 409, got {st} {_bad}"
-    # Stale version activate -> 409.
+    # Stale version activate -> strict 409 (CR20: stale-200 no longer accepted).
     st, _stale = _post(f"/api/short/hedge/plans/{pid}/activate", {"expected_version": 999999})
-    # activate without version is allowed; with wrong version must be 409.
-    # (Some builds accept {} — only assert the stale-version case when provided.)
-    if st not in (200,):
-        assert st == 409, f"stale activate {st} {_stale}"
-        st, act = _post(f"/api/short/hedge/plans/{pid}/activate", {})
-        assert st == 200, act
-    else:
-        act = _stale
+    assert st == 409, f"stale activate must be 409, got {st} {_stale}"
+    st, act = _post(f"/api/short/hedge/plans/{pid}/activate", {})
+    assert st == 200, act
     assert act.get("status") == "ACTIVE"
     # Partial close (40% each leg) -> remaining verified.
     fut_d = Decimal(str(fut_qty))
@@ -509,13 +504,23 @@ def test_r15b_slow_provider_bounded(isolated_server):
     assert st == 200
     st, state = _get("/test/harness/state")
     assert state["slowProviderDelayMs"] == 8000
+    # Expire the 5s ProductionHedgeMarket mark cache so the raw premiumIndex
+    # fetch really runs (otherwise a prior slow/normal mark hit would hide the
+    # real 1.5s sleep and falsely look like marker-only).
+    st, _adv = _post("/test/harness/advance", {"ms": 10000})
+    assert st == 200
+    st, state = _get("/test/harness/state")
     now_ms = int(state["nowMs"])
     t0 = time.monotonic()
-    st, dec = _post("/api/short/hedge/decisions", _decision_body(now_ms))
+    # Generous timeout: slow decision does real 1.5s sleep(s) plus honest
+    # computation; must stay bounded <8s deadline, not hit the 15s default.
+    st, dec = _post("/api/short/hedge/decisions", _decision_body(now_ms), timeout=30.0)
     dt = time.monotonic() - t0
     assert st == 201, dec
-    # Skeleton records 8s marker but never sleeps 8s; E2E must stay bounded.
-    assert dt < 8.0, f"slow-provider must not sleep 8s (took {dt:.2f}s)"
+    # CR20: real transport delay required (marker-only rejected) but bounded
+    # by the 8s deadline. Harness sleeps SLOW_PROVIDER_REAL_DELAY_S (1.5s).
+    assert dt >= 1.0, f"slow-provider must really sleep (>=1s), took {dt:.2f}s"
+    assert dt < 8.0, f"slow-provider must stay bounded <8s (took {dt:.2f}s)"
 
 
 # ---------------------------------------------------------------------------

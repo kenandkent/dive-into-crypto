@@ -144,25 +144,8 @@ test.describe('R15b repair browser (real React)', () => {
     const bad = await request.post(`${ORIGIN}/api/short/hedge/plans/${savedPlanId}/activate`, {
       data: { expected_version: 999999 },
     });
-    // Frozen plan lifecycle returns 409 on stale version (or 200 when no
-    // version gate is supplied; the explicit stale gate must be 409).
-    expect([200, 409].includes(bad.status())).toBeTruthy();
-    if (bad.status() === 200) {
-      const stale2 = await request.patch(`${ORIGIN}/api/short/hedge/plans/${savedPlanId}/legs`, {
-        data: {
-          event: {
-            schema_version: 'hedge-event-v1', leg_type: 'FUTURES_SHORT', event_type: 'OPEN_FUTURES_SHORT',
-            native_qty: '0.05', canonical_qty: '0.05', native_price: '67000', price_currency: 'USDT',
-            fee_currency: null, fee_amount: null, fee_usd: null, gas_usd: null,
-            source: 'USER_ENTERED', executed_at_ms: Date.now(), gross_qty: '0.05', net_qty: '0.05',
-          },
-          client_event_id: `e-409-${Date.now()}`, expected_version: 999999,
-        },
-      });
-      expect(stale2.status()).toBe(409);
-    } else {
-      expect(bad.status()).toBe(409);
-    }
+    // CR20: explicit stale version must be strict 409 (stale-200 rejected).
+    expect(bad.status()).toBe(409);
   });
 
   test('coins: capabilities are real producers (no TEST_FAKE)', async ({ request }) => {
