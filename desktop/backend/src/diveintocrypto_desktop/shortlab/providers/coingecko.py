@@ -53,10 +53,22 @@ from aiolimiter import AsyncLimiter
 
 from diveintocrypto_desktop.data.http import (
     TransientUpstreamError,
+    check_deadline_or_raise,
     get_session,
+    handle_month_rollover,
+    resolve_family_or_raise,
     run_with_retries,
 )
 from diveintocrypto_desktop.shortlab.models import ProviderResult
+from diveintocrypto_desktop.shortlab.request_budget import (
+    JOB_TYPE_UNKNOWN,
+    BudgetExhausted,
+    Denied,
+    UnbudgetedEndpointError,
+    budget_class,
+    get_current_request_context,
+    host_from_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -776,6 +788,225 @@ class CoinGeckoProvider:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # CR13 unified pre-send (D11/D19.4): every real transport reserves
+    # monthly + host budget per attempt, checks deadline, handles midnight
+    # rollover, bills per send; cache never reserves.
+    # ------------------------------------------------------------------
+
+    def _effective_ctx(self, request_context: Any | None) -> Any | None:
+        """Explicit ``request_context`` wins, else the ambient scheduler ctx."""
+        if request_context is not None:
+            return request_context
+        try:
+            return get_current_request_context()
+        except Exception:
+            return None
+
+    def _budget_and_job(self, ctx: Any | None) -> tuple[Any | None, str]:
+        budget = getattr(ctx, "budget", None) if ctx is not None else None
+        try:
+            jt = str(getattr(ctx, "job_type", "entry") or "entry")
+        except Exception:
+            jt = "entry"
+        return budget, jt
+
+    async def _transport_with_budget(
+        self, url: str, params: Mapping[str, Any], ctx: Any | None
+    ) -> Any:
+        """One budgeted transport with retries (per-send reserve/billing).
+
+        Unified pre-send per attempt (D19.3/D19.4): family/weight from URL
+        only, unknown job refuses, deadline checked before reserve and again
+        before transport, monthly reserve with fresh UUID per attempt, host
+        permit per attempt, UTC month re-read before transport entry with
+        old-ID cancel + new-UUID reserve on rollover. Billing point is first
+        transport entry: ``finish(sent=True)`` + ``permit.mark_sent()`` for
+        every entered transport (success or fetcher exception); pre-transport
+        denials cancel (``finish(False)`` + ``release_unsent``) and never
+        send. Cache callers never reach here. Retries use new IDs via
+        ``run_with_retries`` (only ``TransientUpstreamError`` retried).
+        """
+        # Strict family/weight from URL only (no ambient fallback).
+        family, weight = resolve_family_or_raise(url, dict(params) if isinstance(params, Mapping) else params)
+        host = host_from_url(url)
+        budget, job_type = self._budget_and_job(ctx)
+        # Unknown job_type refuses before any monthly reservation (D19.3).
+        if budget is not None and budget_class(job_type) == JOB_TYPE_UNKNOWN:
+            raise BudgetExhausted(
+                f"{JOB_TYPE_UNKNOWN}: job_type={job_type!r} is not a known tier; refusing to send",
+                reason_code=JOB_TYPE_UNKNOWN,
+                next_allowed_at_ms=None,
+                job_type=job_type,
+                endpoint_family=family,
+            )
+
+        async def _one_send() -> Any:
+            # Pre-attempt deadline (before any reservation).
+            check_deadline_or_raise(ctx, int(self._clock()))
+            now0 = int(self._clock())
+            monthly_hold: tuple[str, str] | None = None
+            try:
+                monthly_hold = await self._check_monthly(now0)
+            except _MonthlyExhausted:
+                raise
+            except Exception:
+                # Reserve validation errors (month mismatch etc.) never send.
+                raise
+            permit: Any | None = None
+            if budget is not None:
+                res = budget.try_acquire(host, weight, job_type, family)
+                if isinstance(res, Denied) or res is False:
+                    denied = res if isinstance(res, Denied) else Denied()
+                    if monthly_hold is not None:
+                        try:
+                            await self._finish_monthly(monthly_hold[0], False, int(self._clock()))
+                        except Exception:
+                            pass
+                    raise BudgetExhausted(
+                        getattr(denied, "message", "budget exhausted"),
+                        reason_code=getattr(denied, "reason_code", "REQUEST_BUDGET_EXHAUSTED"),
+                        next_allowed_at_ms=getattr(denied, "next_allowed_at_ms", None),
+                        job_type=getattr(denied, "job_type", None) or job_type,
+                        endpoint_family=getattr(denied, "endpoint_family", None) or family,
+                    )
+                permit = res
+            # Limiter wait ends here; re-read clock before transport entry.
+            async with self._active_limiter:
+                now_pre = int(self._clock())
+                try:
+                    check_deadline_or_raise(ctx, now_pre)
+                except BudgetExhausted:
+                    if monthly_hold is not None:
+                        try:
+                            await self._finish_monthly(monthly_hold[0], False, now_pre)
+                        except Exception:
+                            pass
+                    if permit is not None:
+                        try:
+                            permit.release_unsent()
+                        except Exception:
+                            pass
+                    raise
+                if monthly_hold is not None and self._repository is not None:
+                    fresh_month = coingecko_month_key(now_pre)
+                    if fresh_month != monthly_hold[1]:
+                        # Midnight: cancel un-sent old ID, reserve new month.
+                        try:
+                            new_id, new_res = await handle_month_rollover(
+                                self._repository,
+                                provider=PROVIDER_NAME,
+                                old_request_id=str(monthly_hold[0]),
+                                old_month_key=str(monthly_hold[1]),
+                                new_month_key=str(fresh_month),
+                                monthly_limit=int(self.effective_monthly_limit()),
+                                as_of_ms=int(now_pre),
+                                uuid_fn=self._uuid_fn,
+                            )
+                        except Exception as exc:
+                            if permit is not None:
+                                try:
+                                    permit.release_unsent()
+                                except Exception:
+                                    pass
+                            raise exc
+                        if not bool(new_res.get("admitted")):
+                            if permit is not None:
+                                try:
+                                    permit.release_unsent()
+                                except Exception:
+                                    pass
+                            raise _MonthlyExhausted(
+                                str(new_res.get("reason_code") or "BUDGET_MONTHLY_EXHAUSTED")
+                            )
+                        monthly_hold = (str(new_id), str(fresh_month))
+                # Final deadline immediately before transport entry.
+                try:
+                    check_deadline_or_raise(ctx, int(self._clock()))
+                except BudgetExhausted:
+                    if monthly_hold is not None:
+                        try:
+                            await self._finish_monthly(monthly_hold[0], False, int(self._clock()))
+                        except Exception:
+                            pass
+                    if permit is not None:
+                        try:
+                            permit.release_unsent()
+                        except Exception:
+                            pass
+                    raise
+                # Transport entry (billing point): mark + finish(true) for
+                # every entered send, success or fetcher exception.
+                try:
+                    payload = await self._fetcher(url, params)
+                except TransientUpstreamError:
+                    if permit is not None:
+                        try:
+                            permit.mark_sent()
+                        except Exception:
+                            pass
+                    if monthly_hold is not None:
+                        await self._finish_monthly(monthly_hold[0], True, int(self._clock()))
+                    raise
+                except asyncio.CancelledError:
+                    # Cancelled before entry completed: release, never bill.
+                    # If already marked (not possible here), mark path above
+                    # would have billed; this is pre-entry cancellation.
+                    if permit is not None:
+                        try:
+                            permit.release_unsent()
+                        except Exception:
+                            pass
+                    if monthly_hold is not None:
+                        try:
+                            await self._finish_monthly(monthly_hold[0], False, int(self._clock()))
+                        except Exception:
+                            pass
+                    raise
+                except Exception:
+                    if permit is not None:
+                        try:
+                            permit.mark_sent()
+                        except Exception:
+                            pass
+                    if monthly_hold is not None:
+                        await self._finish_monthly(monthly_hold[0], True, int(self._clock()))
+                    raise
+                # Success: bill then return.
+                if permit is not None:
+                    try:
+                        permit.mark_sent()
+                    except Exception:
+                        pass
+                if monthly_hold is not None:
+                    await self._finish_monthly(monthly_hold[0], True, int(self._clock()))
+                return payload
+
+        return await run_with_retries(
+            _one_send,
+            sleep=self._sleep or asyncio.sleep,
+            max_retries=self._max_retries,
+        )
+
+    def _budget_limited(
+        self,
+        cached: _CacheEntry | None,
+        now_ms: int,
+        detail: str,
+    ) -> ProviderResult[Fundamentals]:
+        """UNAVAILABLE ``BUDGET_LIMITED`` (stale attached when cached)."""
+        log.info("coingecko budget-limited: %s", detail[:150])
+        return ProviderResult(
+            status="UNAVAILABLE",  # type: ignore[arg-type]
+            source=PROVIDER_NAME,
+            fetched_at_ms=int(now_ms),
+            as_of_ms=(cached.as_of_ms if cached is not None else None),
+            data=(cached.data if cached is not None else None),
+            stale=bool(cached is not None),
+            reason_code=BUDGET_LIMITED,
+            error_message=str(detail)[:200],
+        )
+
     async def _default_fetcher(self, url: str, params: Mapping[str, Any]) -> Any:
         session = await get_session()
         timeout = aiohttp.ClientTimeout(total=self._timeout_sec)
@@ -825,16 +1056,17 @@ class CoinGeckoProvider:
     async def fetch(
         self, identity: Any, *, request_context: Any | None = None
     ) -> ProviderResult[Fundamentals]:
-        """Fetch one coin document (R11a: ``request_context`` forwarded).
+        """Fetch one coin document (CR13 unified budgeting, D11/D19.4).
 
-        ``request_context`` is accepted for R11a/R11b HTTP-layer uniformity
-        and never double-charges: cache hits never reserve, and this provider
-        performs a single budgeted send per call (RPM + optional monthly via
-        the repository). Production callers pass the shared context; tests
-        omit it (legacy unbounded path preserved).
+        Cache hits never reserve/bill; every real transport reserves monthly
+        + host budget per attempt (retry = new ID/permit), checks deadline
+        before reserve and before transport, rolls month on midnight, bills
+        per entered send. ``request_context`` (explicit else ambient) carries
+        the shared budget/job/deadline; legacy ``None`` stays unbounded
+        except for the wired monthly gate.
         """
-        _ = request_context  # single-charge: no duplicate budgeting here
-        now_ms = self._clock()
+        ctx = self._effective_ctx(request_context)
+        now_ms = int(self._clock())
         raw_id = getattr(identity, "coingecko_id", None)
         coingecko_id = str(raw_id).strip() if raw_id is not None else ""
         if not coingecko_id:
@@ -868,40 +1100,26 @@ class CoinGeckoProvider:
 
         url, params = build_coin_request(coingecko_id, self._base_url)
         request_url = _request_url_for_snapshot(url, params)
-        # R11a monthly gate (persistent BUDGET_COUNTER, restart-retained).
-        # Cache hits above never reserve; lowering the limit never resets
-        # history (R01 single-worker transaction decides admission).
-        monthly_hold: tuple[str, str] | None = None
+        # CR13: unified pre-send per attempt inside _transport_with_budget.
+        # Cache hits above never reserve; monthly/host billed per entered
+        # transport (retry = new ID), deadline + month rollover handled.
         try:
-            monthly_hold = await self._check_monthly(now_ms)
+            payload = await self._transport_with_budget(url, params, ctx)
         except _MonthlyExhausted as exc:
-            log.info("coingecko budget-limited id=%s reason=%s", coingecko_id, exc.reason_code)
-            return ProviderResult(
-                status="UNAVAILABLE",  # type: ignore[arg-type]
-                source=PROVIDER_NAME,
-                fetched_at_ms=now_ms,
-                as_of_ms=(cached.as_of_ms if cached is not None else None),
-                data=(cached.data if cached is not None else None),
-                stale=bool(cached is not None),
-                reason_code=BUDGET_LIMITED,
-                error_message=f"coingecko monthly quota exhausted ({exc.reason_code})",
+            return self._budget_limited(
+                cached, now_ms, f"coingecko monthly quota exhausted ({exc.reason_code})"
             )
-        try:
-            async with self._active_limiter:
-                payload = await run_with_retries(
-                    lambda: self._fetcher(url, params),
-                    sleep=self._sleep or asyncio.sleep,
-                    max_retries=self._max_retries,
-                )
+        except BudgetExhausted as exc:
+            return self._budget_limited(
+                cached, now_ms, f"coingecko send refused ({exc.reason_code})"
+            )
+        except UnbudgetedEndpointError as exc:
+            return self._failure(cached, COINGECKO_CLIENT_ERROR, "ERROR", str(exc), now_ms)
         except CoinGeckoNotFound as exc:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached, COINGECKO_UNKNOWN_ID, "ERROR", str(exc), now_ms
             )
         except TransientUpstreamError as exc:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
             if exc.status == 429:
                 return self._failure(
                     cached,
@@ -918,8 +1136,6 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except (asyncio.TimeoutError, TimeoutError):
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached,
                 COINGECKO_TIMEOUT,
@@ -928,8 +1144,6 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except aiohttp.ClientError as exc:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
             return self._failure(
                 cached,
                 COINGECKO_NETWORK_ERROR,
@@ -938,15 +1152,11 @@ class CoinGeckoProvider:
                 now_ms,
             )
         except CoinGeckoBadResponse as exc:
-            # Fetcher-level bad response still consumed transport (counts).
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            # Fetcher-level bad response already billed per send.
             return self._failure(cached, COINGECKO_CLIENT_ERROR, "ERROR", str(exc), now_ms)
         except Exception as exc:  # noqa: BLE001 - encapsulated, never raised
             # Raw text is truncated and redacted by ProviderResult's
             # sanitize_error_message; it never reaches the public API.
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
             detail = str(exc)[:200]
             suffix = f": {detail}" if detail else ""
             return self._failure(
@@ -965,8 +1175,7 @@ class CoinGeckoProvider:
                 fetched_at_ms=now_ms,
             )
         except CoinGeckoBadResponse as exc:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            # Transport already billed per send; parse failure bills nothing extra.
             return self._failure(
                 cached, COINGECKO_BAD_RESPONSE, "ERROR", str(exc), now_ms
             )
@@ -984,8 +1193,6 @@ class CoinGeckoProvider:
         self._supply_cache[coingecko_id] = _CacheEntry(
             data=fundamentals, fetched_at_ms=now_ms, as_of_ms=as_of_ms
         )
-        if monthly_hold is not None:
-            await self._finish_monthly(monthly_hold[0], True, self._clock())
         log.info("coingecko ok id=%s as_of_ms=%s", coingecko_id, as_of_ms)
         return ProviderResult(
             status="OK",
@@ -1004,13 +1211,14 @@ class CoinGeckoProvider:
         """Batch Fundamentals refresh preferring ``/coins/markets`` (D11).
 
         Cache hits (market TTL) never send; misses are fetched in one batch
-        markets call (single monthly + RPM charge for the batch) with per-coin
-        fallback to :meth:`fetch` on partial failure. Supply uses the
-        independent 6h TTL via ``_supply_cache``. ``request_context`` is
-        accepted for uniformity and never double-charges.
+        markets call (per-send monthly + RPM + host budget via the unified
+        pre-send check, retry = new ID) with per-coin fallback to :meth:`fetch`
+        on partial failure. Supply uses the independent 6h TTL via
+        ``_supply_cache``. ``request_context`` (explicit else ambient) is
+        honoured for budget/deadline; cache never double-charges.
         """
-        _ = request_context
-        now_ms = self._clock()
+        ctx = self._effective_ctx(request_context)
+        now_ms = int(self._clock())
         ids: list[str] = []
         by_id: dict[str, Any] = {}
         for ident in identities or []:
@@ -1038,13 +1246,12 @@ class CoinGeckoProvider:
                 misses.append(cid)
         if not misses:
             return out
-        # Single batch markets fetch for all misses (one transport).
+        # One batch markets transport (unified per-send budgeting inside).
         url, params = build_markets_request(misses, self._base_url)
         request_url = _request_url_for_snapshot(url, params)
-        monthly_hold: tuple[str, str] | None = None
         try:
-            monthly_hold = await self._check_monthly(now_ms)
-        except _MonthlyExhausted as exc:
+            payload = await self._transport_with_budget(url, params, ctx)
+        except (_MonthlyExhausted, BudgetExhausted) as exc:
             for cid in misses:
                 cached = self._cache.get(cid)
                 out[cid] = ProviderResult(
@@ -1055,19 +1262,16 @@ class CoinGeckoProvider:
                     data=(cached.data if cached is not None else None),
                     stale=bool(cached is not None),
                     reason_code=BUDGET_LIMITED,
-                    error_message=f"coingecko monthly quota exhausted ({exc.reason_code})",
+                    error_message=f"coingecko monthly/budget exhausted ({getattr(exc, 'reason_code', exc)})",
                 )
             return out
-        try:
-            async with self._active_limiter:
-                payload = await run_with_retries(
-                    lambda: self._fetcher(url, params),
-                    sleep=self._sleep or asyncio.sleep,
-                    max_retries=self._max_retries,
-                )
-        except Exception as exc:  # noqa: BLE001 - per-coin fallback below
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
+        except UnbudgetedEndpointError as exc:
+            for cid in misses:
+                # Batch family unknown: per-coin fallback keeps honest mapping.
+                out[cid] = await self.fetch(by_id[cid], request_context=request_context)
+            _ = exc
+            return out
+        except Exception:  # noqa: BLE001 - per-coin fallback below (already billed per send)
             for cid in misses:
                 # Fall back to single fetch (preserves per-coin error mapping).
                 out[cid] = await self.fetch(by_id[cid], request_context=request_context)
@@ -1075,15 +1279,12 @@ class CoinGeckoProvider:
         try:
             parsed = parse_markets_payload(payload, request_url=request_url, fetched_at_ms=now_ms)
         except CoinGeckoBadResponse as exc:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
+            # Batch transport already billed per send; fallback bills per coin.
             for cid in misses:
                 out[cid] = await self.fetch(by_id[cid], request_context=request_context)
             _ = exc
             return out
         by_parsed: dict[str, Fundamentals] = {f.coingecko_id: f for f in parsed}
-        if monthly_hold is not None:
-            await self._finish_monthly(monthly_hold[0], True, self._clock())
         for cid in misses:
             fund = by_parsed.get(cid)
             if fund is None:
@@ -1112,11 +1313,12 @@ class CoinGeckoProvider:
 
         Fresh (<=60s) cached FX for the same currency is reused without a new
         CoinGecko send; missing/stale FX returns ``None`` (caller keeps
-        ``UNKNOWN``, never guesses ``USDT=1``). ``request_context`` is
-        accepted for uniformity.
+        ``UNKNOWN``, never guesses ``USDT=1``). Unified pre-send per attempt
+        (monthly + host + deadline + midnight) applies to the single batch
+        transport; cache reuse never reserves.
         """
-        _ = request_context
-        now_ms = self._clock()
+        ctx = self._effective_ctx(request_context)
+        now_ms = int(self._clock())
         if isinstance(coin_ids, str):
             wanted = [coin_ids.strip()] if coin_ids.strip() else []
         else:
@@ -1134,24 +1336,13 @@ class CoinGeckoProvider:
         if not need:
             return out
         url, params = build_fx_request(need, self._base_url)
-        monthly_hold: tuple[str, str] | None = None
         try:
-            monthly_hold = await self._check_monthly(now_ms)
-        except _MonthlyExhausted:
+            payload = await self._transport_with_budget(url, params, ctx)
+        except (_MonthlyExhausted, BudgetExhausted, UnbudgetedEndpointError, Exception):
+            # Monthly/host/deadline exhausted or transport failed: no FX,
+            # caller keeps UNKNOWN (never USDT=1). Already billed/cancelled
+            # per send inside the helper; cache reuse above never reserved.
             return out
-        try:
-            async with self._active_limiter:
-                payload = await run_with_retries(
-                    lambda: self._fetcher(url, params),
-                    sleep=self._sleep or asyncio.sleep,
-                    max_retries=self._max_retries,
-                )
-        except Exception:
-            if monthly_hold is not None:
-                await self._finish_monthly(monthly_hold[0], True, self._clock())
-            return out
-        if monthly_hold is not None:
-            await self._finish_monthly(monthly_hold[0], True, self._clock())
         if isinstance(payload, Mapping):
             for cid in need:
                 row = payload.get(cid) or payload.get(cid.lower()) or payload.get(cid.upper())

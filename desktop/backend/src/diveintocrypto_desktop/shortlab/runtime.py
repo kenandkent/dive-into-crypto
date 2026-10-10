@@ -74,6 +74,7 @@ def build_default_registry(
     *,
     clock: Callable[[], int] | None = None,
     env: Mapping[str, str] | None = None,
+    repository: Any | None = None,
 ) -> Any:
     """Default provider registry: CoinGecko when enabled, plus the Task 17
     Phase 5/6 providers (``unlock`` / ``social`` / ``catalyst``) when each
@@ -84,6 +85,11 @@ def build_default_registry(
     unregistered resolves to the shared ``NullProvider`` (explicit
     ``UNAVAILABLE``), which keeps the effective tier at ``LITE`` with
     ``FULL_PREREQUISITE_MISSING``.
+
+    CR13 (D11/D19.4): the default CoinGecko wiring carries the real
+    ``Repository`` so monthly sends reserve/persist via BUDGET_COUNTER
+    (restart-retained, UTC month). ``None`` preserves the legacy
+    in-memory-only path (tests without a DB).
     """
     from diveintocrypto_desktop.shortlab.providers.base import ProviderRegistry
 
@@ -97,9 +103,38 @@ def build_default_registry(
     if _enabled("coingecko"):
         from diveintocrypto_desktop.shortlab.providers.coingecko import CoinGeckoProvider
 
+        # CR13: forward the real Repository + configured monthly limits so the
+        # default provider reserves every real send (D11/D19.4). Missing
+        # optimization keys fall back to provider defaults.
+        _cg_kwargs: dict[str, Any] = {
+            "market_ttl_sec": config.refresh.fundamental_sec,
+            "clock": clock,
+        }
+        if repository is not None:
+            _cg_kwargs["repository"] = repository
+        try:
+            _opt = getattr(config, "optimization", None)
+            _prov = getattr(_opt, "providers", None) if _opt is not None else None
+            _cg_cfg: Any = None
+            if isinstance(_prov, Mapping):
+                _cg_cfg = _prov.get("coingecko")
+            elif _prov is not None:
+                try:
+                    _cg_cfg = _prov.get("coingecko")  # type: ignore[union-attr]
+                except Exception:
+                    _cg_cfg = None
+            if _cg_cfg is not None:
+                _lim = _cg_cfg.get("account_monthly_limit") if isinstance(_cg_cfg, Mapping) else getattr(_cg_cfg, "account_monthly_limit", None)
+                _res = _cg_cfg.get("reserve_fraction") if isinstance(_cg_cfg, Mapping) else getattr(_cg_cfg, "reserve_fraction", None)
+                if _lim is not None:
+                    _cg_kwargs["account_monthly_limit"] = int(_lim)
+                if _res is not None:
+                    _cg_kwargs["reserve_fraction"] = float(_res)  # type: ignore[arg-type]
+        except Exception:
+            pass
         registry.register(
             "coingecko",
-            CoinGeckoProvider(market_ttl_sec=config.refresh.fundamental_sec, clock=clock),
+            CoinGeckoProvider(**_cg_kwargs),
         )
     if _enabled("unlock"):
         from diveintocrypto_desktop.shortlab.providers.unlock import UnlockProvider
@@ -444,7 +479,24 @@ class ShortLabRuntime:
             return self._mark_unavailable(f"migration: {type(exc).__name__}: {str(exc)[:160]}")
 
         if self._registry is None:
-            self._registry = build_default_registry(config, clock=self._clock, env=self._env)
+            self._registry = build_default_registry(
+                config, clock=self._clock, env=self._env, repository=self._repository
+            )
+        else:
+            # CR13: an explicitly injected registry keeps its instance, but a
+            # CoinGecko provider without a Repository is retro-bound to the
+            # real one so default + injected paths both reserve (D19.4).
+            try:
+                _cg = self._registry.get("coingecko")
+                if (
+                    _cg is not None
+                    and getattr(_cg, "_repository", None) is None
+                    and self._repository is not None
+                    and type(_cg).__name__ == "CoinGeckoProvider"
+                ):
+                    _cg._repository = self._repository
+            except Exception:
+                pass
         # F06a default wiring: shared budget / cache / catalog / policy.
         if self._request_budget is None:
             try:
