@@ -401,7 +401,8 @@ async def test_funding_backfill_incremental_gap_no_90d_refetch(tmp_path) -> None
     ctx = service.make_job_context(JOB_TYPE_FUNDING_BACKFILL, trace_id="funding_backfill-1")
     first = await service.run_funding_backfill(ctx, job_id="funding_backfill-1")
     assert first.status == "SUCCEEDED"
-    assert first.stats["requested"] == 3
+    # CR03: 3 symbol fetches + 1 fundingInfo schedule archive share the window.
+    assert first.stats["requested"] == 4
     n_calls = len(calls)
     # Second backfill at the same cutoff: gap already filled -> no resend.
     ctx2 = service.make_job_context(JOB_TYPE_FUNDING_BACKFILL, trace_id="funding_backfill-2")
