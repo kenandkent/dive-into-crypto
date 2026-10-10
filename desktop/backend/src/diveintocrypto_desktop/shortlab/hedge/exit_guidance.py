@@ -140,19 +140,25 @@ def _floor_to_step(qty: Decimal, step: Decimal | None) -> Decimal:
         return units * step
 
 
-def _rules_for_leg(rules: Any, leg_type: str) -> Mapping[str, Any] | None:
+def _rules_for_leg(rules: Any, leg_type: str) -> Any | None:
     if rules is None:
         return None
     if isinstance(rules, Mapping):
-        if leg_type in rules and isinstance(rules[leg_type], Mapping):
-            return rules[leg_type]  # type: ignore[return-value]
-        if any(k in rules for k in ("lot_rules", "step_size", "min_qty", "venue")):
-            return rules  # type: ignore[return-value]
+        if leg_type in rules:
+            v = rules[leg_type]
+            if v is None:
+                return None
+            # CR06: per-leg value may be a real TradingRulesSnapshot dataclass
+            # (not a Mapping). Return it verbatim; step/venue readers below
+            # handle both Mapping and dataclass via _field/getattr.
+            return v
+        if any(k in rules for k in ("lot_rules", "step_size", "stepSize", "min_qty", "venue", "market")):
+            return rules
         return None
     leg = getattr(rules, "leg_type", None)
     if leg is not None and leg != leg_type:
         return None
-    return rules  # type: ignore[return-value]
+    return rules
 
 
 def _step_for_leg(leg_rules: Any) -> Decimal | None:
@@ -162,15 +168,22 @@ def _step_for_leg(leg_rules: Any) -> Decimal | None:
     if isinstance(leg_rules, Mapping):
         lot = leg_rules.get("lot_rules")
         if lot is None:
-            # Flat form: step_size at top level.
+            # Flat form: step_size at top level (Mapping or dataclass lot).
             for key in ("step_size", "stepSize"):
                 if leg_rules.get(key) is not None:
                     lot = leg_rules
                     break
     else:
+        # CR06: real TradingRulesSnapshot dataclass carries lot_rules dict.
         lot = getattr(leg_rules, "lot_rules", None)
         if lot is None:
-            return None
+            # Flat dataclass with step_size at top level.
+            for key in ("step_size", "stepSize"):
+                if getattr(leg_rules, key, None) is not None:
+                    lot = leg_rules
+                    break
+            if lot is None:
+                return None
     raw: Any = None
     if isinstance(lot, Mapping):
         raw = lot.get("step_size", lot.get("stepSize"))
@@ -305,13 +318,46 @@ def build_pair_exit_guidance(
     exit_refs = mctx.get("exit_quote_refs", mctx.get("exitQuoteRefs", {}))
     if not isinstance(exit_refs, Mapping):
         exit_refs = {}
-    raw_expires = mctx.get("expires_at_ms", mctx.get("expiresAtMs"))
-    try:
-        expires_at = int(raw_expires) if raw_expires is not None else int(now_ms) + 20000
-    except (TypeError, ValueError):
-        expires_at = int(now_ms) + 20000
-    if expires_at <= int(now_ms):
-        expires_at = int(now_ms) + 20000
+    # CR06: earliest expiry wins (never extend a 1s quote to 20s).
+    # Collect every expiry candidate from the context + nested quote DTOs
+    # (Mapping or dataclass via _field) and keep the minimum. Only when no
+    # candidate exists fall back to now+20s (quote TTL default).
+    def _as_int(v: Any) -> int | None:
+        try:
+            if isinstance(v, bool):
+                return None
+            return int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    _expiry_cands: list[int] = []
+    for _k in ("expires_at_ms", "expiresAtMs",
+               "futures_expires_at_ms", "futuresExpiresAtMs",
+               "spot_expires_at_ms", "spotExpiresAtMs",
+               "futures_quote_expires_at_ms", "spot_quote_expires_at_ms"):
+        _v = mctx.get(_k)
+        _i = _as_int(_v) if _v is not None else None
+        if _i is not None:
+            _expiry_cands.append(_i)
+    for _qk in ("futures_quote", "spot_quote", "futuresQuote", "spotQuote",
+                "futures_exit_quote", "spot_exit_quote"):
+        _q = mctx.get(_qk)
+        if _q is not None:
+            _qe = _field(_q, "expires_at_ms", None)
+            if _qe is None:
+                _qe = _field(_q, "expiresAtMs", None)
+            _qi = _as_int(_qe) if _qe is not None else None
+            if _qi is not None:
+                _expiry_cands.append(_qi)
+    if _expiry_cands:
+        expires_at = min(_expiry_cands)
+    else:
+        raw_expires = mctx.get("expires_at_ms", mctx.get("expiresAtMs"))
+        try:
+            expires_at = int(raw_expires) if raw_expires is not None else int(now_ms) + 20000
+        except (TypeError, ValueError):
+            expires_at = int(now_ms) + 20000
+        if expires_at <= int(now_ms):
+            expires_at = int(now_ms) + 20000
 
     price_currency = str(mctx.get("price_currency",
                                  mctx.get("priceCurrency", "USDT")))
@@ -382,15 +428,28 @@ def build_pair_exit_guidance(
         vwap = fut_vwap if is_fut else spot_vwap
         fx = fut_fx if is_fut else spot_fx
         cov = fut_cov if is_fut else spot_cov
-        # Venue: per-leg rules win, else plan, else BINANCE_SPOT.
+        # CR06 Venue: futures BUY uses futures venue (never spot default);
+        # spot SELL uses plan spot_venue first (ALPHA preserved), then
+        # per-leg rules venue (Mapping or TradingRulesSnapshot dataclass).
+        # Both legs defaulting to BINANCE_SPOT hides the real venue.
         venue: Any = None
-        if isinstance(leg_rules, Mapping):
-            venue = leg_rules.get("venue", leg_rules.get("market"))
-        if venue is None:
+        if is_fut:
+            # CR06: futures exit is BUY on the futures venue (planner uses
+            # BINANCE_FUTURES). Per-leg TradingRulesSnapshot venue is the spot
+            # instrument venue (BINANCE_SPOT) and must not mislabel the futures
+            # leg; only an explicit plan futures_venue overrides the default.
+            venue = _plan_field(plan, "futures_venue", "futuresVenue", default=None)
+            if not isinstance(venue, str) or not venue.strip():
+                venue = "BINANCE_FUTURES"
+        else:
             venue = _plan_field(plan, "spot_venue", "spotVenue",
                                 "venue", default=None)
-        if not isinstance(venue, str) or not venue.strip():
-            venue = "BINANCE_SPOT"
+            if venue is None:
+                venue = _field(leg_rules, "venue", None) if leg_rules is not None else None
+                if venue is None and isinstance(leg_rules, Mapping):
+                    venue = leg_rules.get("market")
+            if not isinstance(venue, str) or not venue.strip():
+                venue = "BINANCE_SPOT"
         # Capability: missing quote/coverage never claims executable.
         if vwap is None or cov is None:
             capability = "UNKNOWN"

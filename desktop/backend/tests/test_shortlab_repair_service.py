@@ -683,6 +683,10 @@ async def test_r10b_no_hedge_plan_422(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_r10b_activate_persists_activation_check(tmp_path) -> None:
+    # CR01 D12: six-item single-cutoff ACTIVATION_CHECK persists (kind by symbol).
+    # Full PASS needs liq + 90d CONFIRMED schedule + matching protection.
+    import json as _js
+
     clock = FakeClock()
     repo = await _open_repo(tmp_path)
     try:
@@ -692,9 +696,50 @@ async def test_r10b_activate_persists_activation_check(tmp_path) -> None:
             "mode": "ABSOLUTE",
             "futuresNotionalUsd": "10000",
             "preferredSpotVenue": "AUTO",
+            "liquidationPrice": "0.02",
+            "liquidationPriceUpdatedAtMs": NOW - 3_600_000,
         })
         plan = await svc.save_plan({"simulation_id": sim["simulationId"], "client_request_id": "r10b-act-check-1"})
         pid = plan["planId"]
+        # Plan liq for hash binding (save_plan ignores snake liq; store explicitly).
+        _row0 = await repo.get_hedge_plan(pid)
+        _cfg0 = _row0.get("plan_config_json") or {}
+        if isinstance(_cfg0, str):
+            try:
+                _cfg0 = _js.loads(_cfg0)
+            except Exception:
+                _cfg0 = {}
+        _cfg0 = dict(_cfg0) if isinstance(_cfg0, dict) else {}
+        _cfg0["liquidation_price"] = "0.02"
+        _cfg0["stop_trigger_basis"] = "MARK_PRICE"
+        repo._require_con().execute(
+            "UPDATE sl_hedge_plan SET plan_config_json = ? WHERE plan_id = ?",
+            [_js.dumps(_cfg0), pid],
+        )
+        # Seeded 90d CONFIRMED 8h schedule for an honest funding PASS.
+        _sym = "BTCUSDT"
+        _h8 = 8 * 3_600_000
+        _start = NOW - 90 * 86_400_000
+        _slots: list[int] = []
+        _cur = _start + _h8
+        while _cur <= NOW:
+            _slots.append(_cur)
+            _cur += _h8
+        await repo.upsert_funding_events([
+            {"symbol": _sym, "funding_time_ms": _s, "funding_rate": 0.0005}
+            for _s in _slots
+        ])
+        await repo.save_funding_schedule({
+            "schedule_id": "sched-act-pass", "symbol": _sym,
+            "effective_from_ms": _start, "effective_to_ms": None, "known_at_ms": _start,
+            "schedule_json": {
+                "schedule_id": "sched-act-pass", "symbol": _sym,
+                "effective_from_ms": _start, "effective_to_ms": None,
+                "interval_hours": 8, "anchor_ms": _slots[0], "known_at_ms": _start,
+                "source": "binance:fapi/fundingInfo", "evidence_ref": "ev-act",
+                "verification": "CONFIRMED",
+            },
+        })
 
         def _evt2(leg: str, typ: str, qty: str) -> dict[str, Any]:
             return {
@@ -725,19 +770,26 @@ async def test_r10b_activate_persists_activation_check(tmp_path) -> None:
             spot_qty = str(spot_qty)
         r1 = await svc.apply_leg_event(pid, {"event": _evt2("FUTURES_SHORT", "OPEN_FUTURES_SHORT", fut_qty), "client_event_id": "e-f-1", "expected_version": 1})
         r2 = await svc.apply_leg_event(pid, {"event": _evt2("SPOT_LONG", "OPEN_SPOT_LONG", spot_qty), "client_event_id": "e-s-1", "expected_version": r1["planVersion"]})
+        # Matching protection (MARK_PRICE basis so hashes agree).
+        _pos = await repo.aggregate_hedge_position(pid)
+        _fr = next(p for p in _pos if p.get("leg_type") == "FUTURES_SHORT").get("remaining_qty")
+        _sr = next(p for p in _pos if p.get("leg_type") == "SPOT_LONG").get("remaining_qty")
+        await svc.confirm_repair_protection(pid, {
+            "expected_version": r2["planVersion"],
+            "client_request_id": "r10b-act-check-1",
+            "confirmed_at_ms": NOW,
+            "futures": {"status": "CONFIRMED", "nativeQty": str(_fr), "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": str(_sr), "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+        })
         activated = await svc.activate(pid, {})
         assert activated["status"] == "ACTIVE"
-        # ACTIVATION_CHECK observation persisted (kind=ACTIVATION_CHECK).
-        try:
-            rows = await repo.list_market_observations(pid, "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
-            assert len(rows) >= 1
-        except Exception:
-            # Fallback: direct table check via list_market_observations symbol/kind.
-            try:
-                rows2 = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
-                assert isinstance(rows2, tuple)
-            except Exception:
-                pass
+        # CR01: strict symbol/kind query (no swallowed tuple fallback).
+        rows = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert len(rows) >= 1
+        _checks = rows[-1]["value_json"]["checks"]
+        for _k in ("identity", "mark_vs_liquidation", "depth", "funding_gate", "economics", "protection"):
+            assert _checks[_k]["status"] == "PASS", (_k, _checks[_k])
+        assert isinstance(_checks.get("protected_position_hash"), str) and _checks["protected_position_hash"]
     finally:
         await repo.close()
 
@@ -993,5 +1045,228 @@ async def test_cr07_deleted_slots_no_30d_credit_but_full_passes(tmp_path) -> Non
         })
         gap = await svc._fetch_funding(sym_gap, {}, NOW, NOW)
         assert gap["windows"][30]["complete"] is False
+    finally:
+        await repo.close()
+
+
+# ---------------------------------------------------------------------------
+# CR01 (D12): single-cutoff six-item activation; any FAIL/UNKNOWN/expired or
+# check/persist failure blocks ACTIVE; rejection still persists audit check.
+# ---------------------------------------------------------------------------
+
+
+async def _cr01_seed_funding_90d(repo: Any, sym: str) -> None:
+    _h8 = 8 * 3_600_000
+    _start = NOW - 90 * 86_400_000
+    _slots: list[int] = []
+    _cur = _start + _h8
+    while _cur <= NOW:
+        _slots.append(_cur)
+        _cur += _h8
+    await repo.upsert_funding_events([
+        {"symbol": sym, "funding_time_ms": _s, "funding_rate": 0.0005}
+        for _s in _slots
+    ])
+    await repo.save_funding_schedule({
+        "schedule_id": f"sched-cr01-{sym}", "symbol": sym,
+        "effective_from_ms": _start, "effective_to_ms": None, "known_at_ms": _start,
+        "schedule_json": {
+            "schedule_id": f"sched-cr01-{sym}", "symbol": sym,
+            "effective_from_ms": _start, "effective_to_ms": None,
+            "interval_hours": 8, "anchor_ms": _slots[0], "known_at_ms": _start,
+            "source": "binance:fapi/fundingInfo", "evidence_ref": "ev-cr01",
+            "verification": "CONFIRMED",
+        },
+    })
+
+
+async def _cr01_make_filled_plan(tmp_path, name: str, *, with_funding: bool = True):
+    """Save BTCUSDT plan, liq 0.02, fill both legs; return (svc, repo, clock, pid)."""
+    import json as _js
+
+    clock = FakeClock()
+    repo = await _open_repo(tmp_path, name)
+    svc = _make_service(repo, clock)
+    sim = await svc.simulate({
+        "symbol": "BTCUSDT", "mode": "ABSOLUTE",
+        "futuresNotionalUsd": "10000", "preferredSpotVenue": "AUTO",
+        "liquidationPrice": "0.02", "liquidationPriceUpdatedAtMs": NOW - 3_600_000,
+    })
+    plan = await svc.save_plan({"simulation_id": sim["simulationId"], "client_request_id": f"{name}-1"})
+    pid = plan["planId"]
+    _row = await repo.get_hedge_plan(pid)
+    _cfg = _row.get("plan_config_json") or {}
+    if isinstance(_cfg, str):
+        try:
+            _cfg = _js.loads(_cfg)
+        except Exception:
+            _cfg = {}
+    _cfg = dict(_cfg) if isinstance(_cfg, dict) else {}
+    _cfg["liquidation_price"] = "0.02"
+    _cfg["stop_trigger_basis"] = "MARK_PRICE"
+    repo._require_con().execute(
+        "UPDATE sl_hedge_plan SET plan_config_json = ? WHERE plan_id = ?",
+        [_js.dumps(_cfg), pid],
+    )
+    if with_funding:
+        await _cr01_seed_funding_90d(repo, "BTCUSDT")
+
+    def _evt(leg: str, typ: str, qty: str) -> dict[str, Any]:
+        return {
+            "schema_version": "hedge-event-v1", "leg_type": leg, "event_type": typ,
+            "native_qty": qty, "canonical_qty": qty, "native_price": "67000",
+            "price_currency": "USDT", "fee_currency": None, "fee_amount": None,
+            "fee_usd": None, "gas_usd": None, "source": "USER_ENTERED",
+            "executed_at_ms": NOW, "gross_qty": qty, "net_qty": qty,
+        }
+
+    got = await svc.get_simulation(sim["simulationId"])
+    fq = str(got["result"].get("futuresContractQty") or got["result"].get("futures_contract_qty") or "0.15")
+    sq = str(got["result"].get("targetSpotQty") or got["result"].get("target_spot_qty") or fq)
+    r1 = await svc.apply_leg_event(pid, {"event": _evt("FUTURES_SHORT", "OPEN_FUTURES_SHORT", fq), "client_event_id": "e-f-1", "expected_version": 1})
+    r2 = await svc.apply_leg_event(pid, {"event": _evt("SPOT_LONG", "OPEN_SPOT_LONG", sq), "client_event_id": "e-s-1", "expected_version": r1["planVersion"]})
+    return svc, repo, clock, pid, r2["planVersion"]
+
+
+@pytest.mark.asyncio
+async def test_cr01_no_protection_rejected_and_check_persisted(tmp_path) -> None:
+    from diveintocrypto_desktop.shortlab.service import HedgeValidationError
+
+    svc, repo, clock, pid, _ver = await _cr01_make_filled_plan(tmp_path, "cr01-no-prot.duckdb")
+    try:
+        with pytest.raises(HedgeValidationError, match="ACTIVATION_CHECK_FAILED"):
+            await svc.activate(pid, {})
+        # Rejection still persists the audit check (symbol/kind).
+        rows = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert len(rows) >= 1
+        _c = rows[-1]["value_json"]["checks"]
+        assert _c["protection"]["status"] in ("UNKNOWN", "FAIL")
+        assert _c["protection_status"] in ("UNKNOWN", "FAIL")
+        # Plan stays not ACTIVE (CAS never ran).
+        _row = await repo.get_hedge_plan(pid)
+        assert str(_row.get("status")) != "ACTIVE"
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr01_expired_protection_rejected(tmp_path) -> None:
+    from diveintocrypto_desktop.shortlab.service import HedgeValidationError
+
+    svc, repo, clock, pid, ver = await _cr01_make_filled_plan(tmp_path, "cr01-exp.duckdb")
+    try:
+        _pos = await repo.aggregate_hedge_position(pid)
+        _fr = next(p for p in _pos if p.get("leg_type") == "FUTURES_SHORT").get("remaining_qty")
+        _sr = next(p for p in _pos if p.get("leg_type") == "SPOT_LONG").get("remaining_qty")
+        # Expired: confirmed 25h ago (TTL 24h) -> FAIL PROTECTION_EXPIRED.
+        clock.ms = NOW
+        _old = NOW - 25 * 3_600_000
+        # Temporarily move clock back for confirmation, then forward for expiry.
+        clock.ms = _old
+        await svc.confirm_repair_protection(pid, {
+            "expected_version": ver, "client_request_id": "cr01-exp-1",
+            "confirmed_at_ms": _old,
+            "futures": {"status": "CONFIRMED", "nativeQty": str(_fr), "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": str(_sr), "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+        })
+        clock.ms = NOW
+        with pytest.raises(HedgeValidationError, match="ACTIVATION_CHECK_FAILED"):
+            await svc.activate(pid, {})
+        rows = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert len(rows) >= 1
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr01_remaining_change_rejected(tmp_path) -> None:
+    from diveintocrypto_desktop.shortlab.service import HedgeValidationError
+
+    svc, repo, clock, pid, ver = await _cr01_make_filled_plan(tmp_path, "cr01-rem.duckdb")
+    try:
+        _pos = await repo.aggregate_hedge_position(pid)
+        _fr = next(p for p in _pos if p.get("leg_type") == "FUTURES_SHORT").get("remaining_qty")
+        _sr = next(p for p in _pos if p.get("leg_type") == "SPOT_LONG").get("remaining_qty")
+        _conf = await svc.confirm_repair_protection(pid, {
+            "expected_version": ver, "client_request_id": "cr01-rem-1",
+            "confirmed_at_ms": NOW,
+            "futures": {"status": "CONFIRMED", "nativeQty": str(_fr), "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": str(_sr), "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+        })
+        _ver_after_conf = int(_conf["planVersion"])
+        # Additional OPEN changes remaining (no closes -> still activatable legs,
+        # but stored hash mismatches current) -> ACTIVATION_CHECK_FAILED.
+        await svc.apply_leg_event(pid, {
+            "event": {
+                "schema_version": "hedge-event-v1", "leg_type": "FUTURES_SHORT",
+                "event_type": "OPEN_FUTURES_SHORT", "native_qty": "1",
+                "canonical_qty": "1", "native_price": "67000",
+                "price_currency": "USDT", "fee_currency": None, "fee_amount": None,
+                "fee_usd": None, "gas_usd": None, "source": "USER_ENTERED",
+                "executed_at_ms": NOW, "gross_qty": "1", "net_qty": "1",
+            },
+            "client_event_id": "e-open-extra", "expected_version": _ver_after_conf,
+        })
+        with pytest.raises(HedgeValidationError, match="ACTIVATION_CHECK_FAILED"):
+            await svc.activate(pid, {})
+        rows = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert len(rows) >= 1
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr01_persist_failure_blocks(tmp_path) -> None:
+    from diveintocrypto_desktop.shortlab.service import HedgeValidationError
+
+    svc, repo, clock, pid, ver = await _cr01_make_filled_plan(tmp_path, "cr01-persist.duckdb")
+    try:
+        _pos = await repo.aggregate_hedge_position(pid)
+        _fr = next(p for p in _pos if p.get("leg_type") == "FUTURES_SHORT").get("remaining_qty")
+        _sr = next(p for p in _pos if p.get("leg_type") == "SPOT_LONG").get("remaining_qty")
+        await svc.confirm_repair_protection(pid, {
+            "expected_version": ver, "client_request_id": "cr01-persist-1",
+            "confirmed_at_ms": NOW,
+            "futures": {"status": "CONFIRMED", "nativeQty": str(_fr), "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": str(_sr), "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+        })
+
+        async def _boom(_rec: Any) -> str:
+            raise RuntimeError("disk-full")
+
+        _orig = repo.save_market_observation
+        repo.save_market_observation = _boom  # type: ignore[assignment]
+        try:
+            with pytest.raises(HedgeValidationError, match="ACTIVATION_CHECK_FAILED"):
+                await svc.activate(pid, {})
+        finally:
+            repo.save_market_observation = _orig  # type: ignore[assignment]
+        _row = await repo.get_hedge_plan(pid)
+        assert str(_row.get("status")) != "ACTIVE"
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_cr01_funding_unknown_rejected(tmp_path) -> None:
+    # No schedules (empty DB) -> funding UNKNOWN blocks even with valid protection.
+    from diveintocrypto_desktop.shortlab.service import HedgeValidationError
+
+    svc, repo, clock, pid, ver = await _cr01_make_filled_plan(tmp_path, "cr01-fund.duckdb", with_funding=False)
+    try:
+        _pos = await repo.aggregate_hedge_position(pid)
+        _fr = next(p for p in _pos if p.get("leg_type") == "FUTURES_SHORT").get("remaining_qty")
+        _sr = next(p for p in _pos if p.get("leg_type") == "SPOT_LONG").get("remaining_qty")
+        await svc.confirm_repair_protection(pid, {
+            "expected_version": ver, "client_request_id": "cr01-fund-1",
+            "confirmed_at_ms": NOW,
+            "futures": {"status": "CONFIRMED", "nativeQty": str(_fr), "triggerBasis": "MARK_PRICE", "orderReference": "f-1"},
+            "spot": {"status": "CONFIRMED", "nativeQty": str(_sr), "exitMode": "PLATFORM_ORDER", "orderReference": "s-1"},
+        })
+        with pytest.raises(HedgeValidationError, match="ACTIVATION_CHECK_FAILED"):
+            await svc.activate(pid, {})
+        rows = await repo.list_market_observations("BTCUSDT", "ACTIVATION_CHECK", 0, int(clock()) + 1_000, int(clock()) + 1_000)
+        assert len(rows) >= 1
+        assert rows[-1]["value_json"]["checks"]["funding_gate"]["status"] in ("UNKNOWN", "FAIL")
     finally:
         await repo.close()

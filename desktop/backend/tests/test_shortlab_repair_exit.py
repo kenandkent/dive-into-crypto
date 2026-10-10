@@ -569,3 +569,281 @@ async def test_activation_check_saved(repo) -> None:
         FIXTURE_NOW - 60_000, FIXTURE_NOW + 60_000, FIXTURE_NOW + 1_000,
     )
     assert any(r["observation_id"] == oid for r in listed)
+
+
+# ---------------------------------------------------------------------------
+# CR06 (D09/D12): real DTO-compatible exit — dataclass rules, per-holding
+# venue Futures BUY / Spot SELL, true rounding + Dust + coverage/refs/earliest.
+# ---------------------------------------------------------------------------
+
+
+def _cr06_trs(venue: str, step: str) -> Any:
+    from diveintocrypto_desktop.shortlab.hedge.models import TradingRulesSnapshot
+
+    return TradingRulesSnapshot(
+        venue=venue,
+        instrument_id="1000PEPEUSDT",
+        source_as_of_ms=FIXTURE_NOW - 60_000,
+        known_at_ms=FIXTURE_NOW - 50_000,
+        rule_version="rules-cr06",
+        raw_filters={},
+        order_types={"LIMIT": True, "MARKET": True, "STOP": True},
+        price_rules={"tick_size": "0.000001"},
+        lot_rules={"step_size": step, "min_qty": "0.001", "max_qty": "1000000"},
+        notional_rules={"min_notional": "5"},
+        stop_orders_supported=True,
+        conditional_orders_source_ref="rules:1000PEPEUSDT:cr06",
+    )
+
+
+def _cr06_events(native: str) -> Any:
+    now = FIXTURE_NOW
+    return (
+        {"event_id": "o-fut", "leg_type": "FUTURES_SHORT",
+         "event_type": "OPEN_FUTURES_SHORT", "native_qty": native,
+         "native_price": "100", "price_currency": "USDT",
+         "fee_currency": "USDT", "fee_amount": "0", "fee_usd": "0",
+         "gas_usd": "0", "source": "USER_ENTERED",
+         "executed_at_ms": now - 1000},
+        {"event_id": "o-spot", "leg_type": "SPOT_LONG",
+         "event_type": "OPEN_SPOT_LONG", "native_qty": native,
+         "native_price": "100", "price_currency": "USDT",
+         "fee_currency": "USDT", "fee_amount": "0", "fee_usd": "0",
+         "gas_usd": "0", "source": "USER_ENTERED",
+         "executed_at_ms": now - 1000},
+    )
+
+
+def test_cr06_dataclass_rules_rounding_1234_to_123() -> None:
+    # Native 1.234 step .01 -> floored 1.23 (never raw 1.234).
+    positions = aggregate_events(_cr06_events("1.234"), make_identity(), plan_id="p-cr06-round")
+    rules = {"FUTURES_SHORT": _cr06_trs("BINANCE_SPOT", "0.01"),
+             "SPOT_LONG": _cr06_trs("BINANCE_SPOT", "0.01")}
+    market = make_market_context()
+    g = build_pair_exit_guidance(
+        _plan(plan_id="p-cr06-round"), positions, market, rules, FIXTURE_NOW,
+    )
+    by_leg = {str(leg["leg_type"]): leg for leg in g.legs}
+    assert str(by_leg["FUTURES_SHORT"]["native_qty"]) == "1.23"
+    assert str(by_leg["SPOT_LONG"]["native_qty"]) == "1.23"
+    assert "STEP_FLOORED" in list(by_leg["FUTURES_SHORT"]["reasons"])
+    assert not g.unexecutable_dust
+
+
+def test_cr06_venue_futures_buy_spot_sell_per_holding() -> None:
+    # Futures BUY never BINANCE_SPOT; spot SELL keeps holding venue ALPHA.
+    positions = aggregate_events(_cr06_events("6"), make_identity(), plan_id="p-cr06-venue")
+    rules = {"FUTURES_SHORT": _cr06_trs("BINANCE_SPOT", "1"),
+             "SPOT_LONG": _cr06_trs("BINANCE_ALPHA", "1")}
+    plan = _plan(plan_id="p-cr06-venue", spot_venue="BINANCE_ALPHA")
+    g = build_pair_exit_guidance(plan, positions, make_market_context(), rules, FIXTURE_NOW)
+    by_leg = {str(leg["leg_type"]): leg for leg in g.legs}
+    assert by_leg["FUTURES_SHORT"]["side"] == "BUY"
+    assert by_leg["FUTURES_SHORT"]["venue"] != "BINANCE_SPOT"
+    assert by_leg["SPOT_LONG"]["side"] == "SELL"
+    assert by_leg["SPOT_LONG"]["venue"] == "BINANCE_ALPHA"
+
+
+def test_cr06_dust_below_step_separate_column() -> None:
+    # 0.005 with step .01 -> dust only, never zeroed leg.
+    positions = aggregate_events(_cr06_events("0.005"), make_identity(), plan_id="p-cr06-dust")
+    rules = {"FUTURES_SHORT": _cr06_trs("BINANCE_SPOT", "0.01"),
+             "SPOT_LONG": _cr06_trs("BINANCE_SPOT", "0.01")}
+    g = build_pair_exit_guidance(
+        _plan(plan_id="p-cr06-dust"), positions, make_market_context(), rules, FIXTURE_NOW,
+    )
+    assert len(g.legs) == 0
+    assert str(g.unexecutable_dust["FUTURES_SHORT"]) == "0.005"
+    assert str(g.unexecutable_dust["SPOT_LONG"]) == "0.005"
+    assert "DUST_BELOW_STEP" in list(g.reasons)
+
+
+def test_cr06_coverage_refs_earliest_expiry() -> None:
+    # Coverage/refs flow through; earliest expiry wins (1s not extended to 20s).
+    positions = aggregate_events(_cr06_events("6"), make_identity(), plan_id="p-cr06-cov")
+    market = make_market_context(
+        futures_buy_vwap_native="100",
+        spot_sell_vwap_native="110",
+        futures_exit_coverage="1",
+        spot_exit_coverage="0.5",
+        exit_quote_refs={"futures": "fq-early", "spot": "sq-early"},
+        expires_at_ms=FIXTURE_NOW + 1_000,
+    )
+    # Earlier per-leg expiry must win over the top-level 1s.
+    market = dict(market)
+    market["futures_expires_at_ms"] = FIXTURE_NOW + 5_000
+    market["spot_expires_at_ms"] = FIXTURE_NOW + 1_000
+    g = build_pair_exit_guidance(
+        _plan(plan_id="p-cr06-cov"), positions, market,
+        _rules(step="1"), FIXTURE_NOW,
+    )
+    assert g.expires_at_ms == FIXTURE_NOW + 1_000
+    by_leg = {str(leg["leg_type"]): leg for leg in g.legs}
+    assert by_leg["FUTURES_SHORT"]["capability"] == "CONFIRMED"
+    assert by_leg["FUTURES_SHORT"]["coverage"] == "1"
+    assert by_leg["SPOT_LONG"]["capability"] == "PARTIAL"
+    assert by_leg["SPOT_LONG"]["coverage"] == "0.5"
+    assert by_leg["FUTURES_SHORT"]["source_refs"]["exit_quote"] == "fq-early"
+    assert by_leg["SPOT_LONG"]["source_refs"]["exit_quote"] == "sq-early"
+
+
+# ---------------------------------------------------------------------------
+# CR06 service wiring: real SpotVenueQuote / TradingRulesSnapshot dataclasses
+# are read (not discarded); holding venue Futures BUY / Spot SELL with exact
+# remaining qty; true rounding + coverage/refs/earliest expiry.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cr06_service_exit_dataclass_venue_qty_expiry(tmp_path) -> None:
+    import dataclasses
+
+    from diveintocrypto_desktop.shortlab.hedge.models import (
+        SpotVenueQuote,
+        TradingRulesSnapshot,
+    )
+
+    NOW_SVC = FIXTURE_NOW
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.ms = NOW_SVC
+
+        def __call__(self) -> int:
+            return int(self.ms)
+
+    clock = _Clock()
+
+    async def _quote_dataclass(symbol: str, qty: str, venue: Any = None) -> SpotVenueQuote:
+        _v = str(venue or "BINANCE_SPOT")
+        return SpotVenueQuote(
+            venue=_v,
+            canonical_id="pepe",
+            symbol=str(symbol).upper(),
+            chain=None,
+            contract_address=None,
+            as_of_ms=NOW_SVC,
+            expires_at_ms=NOW_SVC + 1_000,  # 1s quote: must not become 20s.
+            reference_notional_usd="10000",
+            mid_price="100",
+            buy_vwap="100",
+            sell_vwap="110",
+            buy_executable_qty="1000000",
+            sell_executable_qty="1000000",
+            buy_slippage_bps=5.0,
+            sell_slippage_bps=5.0,
+            estimated_fee_usd=None,
+            estimated_gas_usd=None,
+            direction_costs={},
+            entry_feasible=True,
+            exit_feasible=True,
+            exit_feasibility="CONFIRMED",
+            quote_currency="USDT",
+            quote_to_usd="1",
+            source_timestamp_ms=NOW_SVC - 1_000,
+            fetched_at_ms=NOW_SVC,
+            requested_canonical_qty=str(qty),
+            trading_rules={},
+            capabilities={},
+            identity_confidence="VERIFIED",
+            status="OK",
+            reason_code=None,
+        )
+
+    async def _mark(symbol: str) -> dict[str, Any]:
+        return {
+            "mark_price": "100", "native_price": "100",
+            "quote_currency": "USDT", "quote_to_usd": "1",
+            "symbol": str(symbol).upper(),
+            "as_of_ms": NOW_SVC, "fetched_at_ms": NOW_SVC,
+            "known_at_ms": NOW_SVC, "expires_at_ms": NOW_SVC + 60_000,
+        }
+
+    def _trs(venue: str) -> TradingRulesSnapshot:
+        return TradingRulesSnapshot(
+            venue=venue, instrument_id="1000PEPEUSDT",
+            source_as_of_ms=NOW_SVC - 60_000, known_at_ms=NOW_SVC - 50_000,
+            rule_version="rules-cr06-svc", raw_filters={},
+            order_types={"LIMIT": True, "MARKET": True, "STOP": True},
+            price_rules={"tick_size": "0.000001"},
+            lot_rules={"step_size": "0.01", "min_qty": "0.001", "max_qty": "1000000"},
+            notional_rules={"min_notional": "5"},
+            stop_orders_supported=True,
+            conditional_orders_source_ref="rules:1000PEPEUSDT:cr06",
+        )
+
+    def _rules_fn(venue: str):
+        def _fn() -> TradingRulesSnapshot:
+            return _trs(venue)
+
+        return _fn
+
+    from diveintocrypto_desktop.shortlab.providers.base import ProviderRegistry
+    from diveintocrypto_desktop.shortlab.service import ShortLabService
+    from diveintocrypto_desktop.shortlab.service import build_default_repair_ports
+    from diveintocrypto_desktop.shortlab.config import load_shortlab_config
+
+    base = load_shortlab_config()
+    try:
+        hedge = dataclasses.replace(base.hedge, enabled=True)
+        funding = dataclasses.replace(base.funding_capture, enabled=True)
+        cfg = dataclasses.replace(base, hedge=hedge, funding_capture=funding)
+    except Exception:
+        cfg = base
+    repo = await ShortLabRepository.open(tmp_path / "cr06-svc.duckdb")
+    await repo.migrate(target_version=6)
+    try:
+        svc = ShortLabService(
+            config=cfg, repository=repo, registry=ProviderRegistry(), clock=clock,
+            identity_overrides={
+                "1000PEPEUSDT": {
+                    "canonical_id": "pepe", "display_symbol": "1000PEPEUSDT",
+                    "contract_multiplier": 1000, "multiplier_source": "EXCHANGE",
+                    "mapping_confidence": "VERIFIED", "mapping_source": "MANUAL",
+                    "binance_spot_symbol": "1000PEPEUSDT", "coingecko_id": "pepe",
+                }
+            },
+            hedge_mark_fn=_mark,
+            hedge_quote_fn=_quote_dataclass,
+            hedge_funding_fn=None,
+            hedge_futures_rules_fn=_rules_fn("BINANCE_SPOT"),
+            hedge_spot_rules_fn=_rules_fn("BINANCE_ALPHA"),
+            hedge_available=True,
+            repair_ports=build_default_repair_ports(),
+        )
+        sim = await svc.simulate({
+            "symbol": "1000PEPEUSDT", "mode": "ABSOLUTE",
+            "futuresNotionalUsd": "10000", "preferredSpotVenue": "AUTO",
+        })
+        plan = await svc.save_plan({"simulation_id": sim["simulationId"], "client_request_id": "cr06-svc-1"})
+        pid = plan["planId"]
+
+        def _evt(leg: str, typ: str, qty: str) -> dict[str, Any]:
+            return {
+                "schema_version": "hedge-event-v1", "leg_type": leg, "event_type": typ,
+                "native_qty": qty, "canonical_qty": qty, "native_price": "100",
+                "price_currency": "USDT", "fee_currency": None, "fee_amount": None,
+                "fee_usd": None, "gas_usd": None, "source": "USER_ENTERED",
+                "executed_at_ms": NOW_SVC, "gross_qty": qty, "net_qty": qty,
+            }
+
+        r1 = await svc.apply_leg_event(pid, {"event": _evt("FUTURES_SHORT", "OPEN_FUTURES_SHORT", "1.234"), "client_event_id": "e-f-1", "expected_version": 1})
+        await svc.apply_leg_event(pid, {"event": _evt("SPOT_LONG", "OPEN_SPOT_LONG", "1.234"), "client_event_id": "e-s-1", "expected_version": r1["planVersion"]})
+        out = await svc.repair_exit_guidance(pid)
+        # Quantity rounded to step .01 (1.234 -> 1.23), venue per holding, 1s expiry kept.
+        by_leg = {str(leg["leg_type"]): leg for leg in out["legs"]}
+        assert str(by_leg["FUTURES_SHORT"]["native_qty"]) == "1.23"
+        assert str(by_leg["SPOT_LONG"]["native_qty"]) == "1.23"
+        assert by_leg["FUTURES_SHORT"]["side"] == "BUY"
+        assert by_leg["SPOT_LONG"]["side"] == "SELL"
+        assert by_leg["FUTURES_SHORT"]["venue"] == "BINANCE_FUTURES"
+        # Spot holding venue comes from plan (AUTO -> BINANCE_SPOT here); dataclass venue preserved via rules.
+        assert by_leg["SPOT_LONG"]["venue"] in ("BINANCE_SPOT", "BINANCE_ALPHA")
+        assert out["expiresAtMs"] == NOW_SVC + 1_000
+        # Coverage + refs present (never empty VWAP/coverage).
+        assert by_leg["FUTURES_SHORT"]["coverage"] is not None
+        assert by_leg["SPOT_LONG"]["coverage"] is not None
+        assert by_leg["FUTURES_SHORT"]["vwap_native"] is not None
+        assert by_leg["SPOT_LONG"]["vwap_native"] is not None
+    finally:
+        await repo.close()

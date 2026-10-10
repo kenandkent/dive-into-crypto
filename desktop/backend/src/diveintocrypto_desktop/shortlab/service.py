@@ -5580,66 +5580,527 @@ class ShortLabService:
         except Exception:
             pass
         now_ms = self._now()
-        # R10b D12: current-check ACTIVATION_CHECK (six items, same cutoff).
-        # Original 20s simulation expiry never blocks already-filled plans:
-        # this check uses current Mark/depth/funding/economics/protection, and
-        # persists as an ACTIVATION_CHECK observation (kind=ACTIVATION_CHECK).
+        # CR01 D12 (R06b/R08b/R10b): single-cutoff six-item activation re-check.
+        # All six use one cutoff; any REQUIRED FAIL/UNKNOWN/expired blocks
+        # ACTIVE. Correct keyword-only build_activation_check_record call,
+        # full record persisted (even on rejection for audit) and CAS update
+        # associated. Check or persist failure never swallowed to ACTIVE.
+        from diveintocrypto_desktop.shortlab.hedge.monitor import build_activation_check_record as _bac
+        from diveintocrypto_desktop.shortlab.hedge.protection import validate_protection_confirmation as _vpc
+
+        _sym_act = str(row.get("symbol") or "").upper()
+        _cutoff = int(now_ms)
+        _known_at = int(now_ms)
+
+        def _dto_get(obj: Any, *names: str, default: Any = None) -> Any:
+            for _n in names:
+                if isinstance(obj, Mapping):
+                    if obj.get(_n) is not None:
+                        return obj.get(_n)
+                else:
+                    try:
+                        _v = getattr(obj, _n, None)
+                    except Exception:
+                        _v = None
+                    if _v is not None:
+                        return _v
+            return default
+
+        # Plan map for protection hash binding (current remaining + refs).
+        _plan_map_act: dict[str, Any] = {"plan_id": pid, "plan_version": int(current_version), "symbol": _sym_act}
         try:
-            from diveintocrypto_desktop.shortlab.hedge.monitor import build_activation_check_record as _bac
+            _cfgm = row.get("plan_config_json")
+            if isinstance(_cfgm, str):
+                import json as _jsm
 
-            _sym_act = str(row.get("symbol") or "").upper()
-            _cutoff = int(now_ms)
-            # Current inputs best-effort (UNKNOWN never fabricates PASS).
-            _mark_act: Any = None
-            try:
-                _mark_act = await self._hedge_mark_for(_sym_act)
-            except Exception:
-                _mark_act = None
-            _fund_ctx_act: Any = None
-            try:
-                _fund_ctx_act = await self._build_repair_funding_context(_sym_act, _cutoff)
-            except Exception:
-                _fund_ctx_act = None
-            _prot_act: Any = None
-            try:
-                _prot_act = await repo.get_protection_confirmation(pid)
-            except Exception:
-                _prot_act = None
-            try:
-                _plan_map_act = {"plan_id": pid, "plan_version": int(current_version), "symbol": _sym_act}
                 try:
-                    _cfgm = row.get("plan_config_json")
-                    if isinstance(_cfgm, str):
-                        import json as _jsm
-
-                        try:
-                            _cfgm = _jsm.loads(_cfgm)
-                        except Exception:
-                            _cfgm = {}
-                    if isinstance(_cfgm, Mapping):
-                        for _k in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "rule_ids"):
-                            if _cfgm.get(_k) is not None:
-                                _plan_map_act[_k] = _cfgm.get(_k)
+                    _cfgm = _jsm.loads(_cfgm)
                 except Exception:
-                    pass
-                _check_rec = _bac(_plan_map_act, list(positions or ()), {"futures_mark": _mark_act, "funding_context": _fund_ctx_act, "protection": _prot_act}, int(_cutoff))
-                # Persist the check (best-effort, never blocks activation on persist failure).
-                try:
-                    if isinstance(_check_rec, Mapping) and hasattr(repo, "save_market_observation"):
-                        await repo.save_market_observation(dict(_check_rec))
-                    elif hasattr(repo, "save_market_observation"):
-                        try:
-                            import dataclasses as _dcx
+                    _cfgm = {}
+            if isinstance(_cfgm, Mapping):
+                for _k in ("liquidation_price", "liquidationPrice", "stop_trigger_price", "stopTriggerPrice",
+                           "stop_trigger_basis", "stopTriggerBasis", "rule_ids", "ruleIds",
+                           "rule_version", "ruleVersion", "spot_venue", "spotVenue"):
+                    if _cfgm.get(_k) is not None and _plan_map_act.get(_k) is None:
+                        # Normalise camel to snake for the pure validator.
+                        _nk = {"liquidationPrice": "liquidation_price", "stopTriggerPrice": "stop_trigger_price",
+                               "stopTriggerBasis": "stop_trigger_basis", "ruleIds": "rule_ids",
+                               "ruleVersion": "rule_version", "spotVenue": "spot_venue"}.get(_k, _k)
+                        if _plan_map_act.get(_nk) is None:
+                            _plan_map_act[_nk] = _cfgm.get(_k)
+            for _rk in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "spot_venue"):
+                if row.get(_rk) is not None and _plan_map_act.get(_rk) is None:
+                    _plan_map_act[_rk] = row.get(_rk)
+        except Exception:
+            pass
+        # CR01: simulation fallback for liq/STOP when plan carries none
+        # (save_plan ignores snake liq; simulate request may hold it).
+        try:
+            if _plan_map_act.get("liquidation_price") is None:
+                _sim_id_x = str(row.get("simulation_id") or "")
+                if _sim_id_x:
+                    try:
+                        _sim_row_x = await repo.get_hedge_simulation(_sim_id_x)
+                    except Exception:
+                        _sim_row_x = None
+                    if isinstance(_sim_row_x, Mapping):
+                        import json as _jsx2
+                        _inp_x = _sim_row_x.get("input_json") or {}
+                        _res_x = _sim_row_x.get("result_json") or {}
+                        if isinstance(_inp_x, str):
+                            try:
+                                _inp_x = _jsx2.loads(_inp_x)
+                            except Exception:
+                                _inp_x = {}
+                        if isinstance(_res_x, str):
+                            try:
+                                _res_x = _jsx2.loads(_res_x)
+                            except Exception:
+                                _res_x = {}
+                        for _src in (_inp_x, _res_x):
+                            if isinstance(_src, Mapping):
+                                for _lk, _lk2 in (("liquidation_price", "liquidationPrice"),
+                                                 ("stop_trigger_price", "stopTriggerPrice"),
+                                                 ("stop_trigger_basis", "stopTriggerBasis")):
+                                    if _plan_map_act.get(_lk) is None and _src.get(_lk) is not None:
+                                        _plan_map_act[_lk] = _src.get(_lk)
+                                    if _plan_map_act.get(_lk) is None and _src.get(_lk2) is not None:
+                                        _plan_map_act[_lk] = _src.get(_lk2)
+        except Exception:
+            pass
+        # Remaining per leg (effective events, never UI reports).
+        try:
+            _by_leg: dict[str, Any] = {}
+            for _p in (positions or ()):
+                _leg = str(_dto_get(_p, "leg_type", "legType", default="") or "").upper()
+                _rem = _dto_get(_p, "remaining_qty", "remainingQty", "remaining", "open_qty", default="0")
+                if _leg:
+                    _by_leg[_leg] = str(_rem)
+            _fut_rem_s = str(_by_leg.get("FUTURES_SHORT", "0") or "0")
+            _spot_rem_s = str(_by_leg.get("SPOT_LONG", "0") or "0")
+        except Exception:
+            _fut_rem_s, _spot_rem_s = "0", "0"
 
-                            await repo.save_market_observation(_dcx.asdict(_check_rec) if _dcx.is_dataclass(_check_rec) else dict(_check_rec))
+        # 1) Identity / multiplier (D04.1 Catalog->Resolver, same as scoring).
+        try:
+            _ident = await self._hedge_identity_for(_sym_act)
+            _conf = str(_dto_get(_ident, "mapping_confidence", "identity_confidence", default="UNRESOLVED") or "UNRESOLVED").upper()
+            _mult = _dto_get(_ident, "contract_multiplier", "multiplier", default=None)
+            try:
+                _mult_ok = _mult is not None and float(str(_mult)) > 0
+            except Exception:
+                _mult_ok = False
+            if _conf in ("VERIFIED", "HIGH") and _mult_ok:
+                _id_status, _id_reasons = "PASS", []
+            else:
+                _id_status, _id_reasons = "UNKNOWN", ["IDENTITY_UNVERIFIED" if _conf in ("LOW", "UNRESOLVED") else "MULTIPLIER_UNVERIFIED"]
+            _id_detail: dict[str, Any] = {"confidence": _conf}
+        except Exception:
+            _id_status, _id_reasons, _id_detail = "UNKNOWN", ["IDENTITY_ERROR"], {}
+
+        # 2) Current Mark vs native liquidation price (fresh, not breached).
+        try:
+            _mark_act: Any = await self._hedge_mark_for(_sym_act)
+        except Exception:
+            _mark_act = None
+        try:
+            from decimal import Decimal as _DecM, InvalidOperation as _InvM
+
+            _mark_px_raw = _dto_get(_mark_act, "mark_price", "native_price", "price", "markPrice", default=None) if _mark_act is not None else None
+            _mark_exp_raw = _dto_get(_mark_act, "expires_at_ms", "expiresAtMs", default=None) if _mark_act is not None else None
+            _mark_asof_raw = _dto_get(_mark_act, "as_of_ms", "source_as_of_ms", "fetched_at_ms", default=None) if _mark_act is not None else None
+            _liq_raw = _plan_map_act.get("liquidation_price")
+            if _mark_px_raw is None or _liq_raw is None:
+                _mark_status, _mark_reasons = "UNKNOWN", ["MARK_OR_LIQ_UNKNOWN"]
+                _mark_detail = {}
+            else:
+                try:
+                    _mark_d = _DecM(str(_mark_px_raw))
+                    _liq_d = _DecM(str(_liq_raw))
+                    _mark_ok = _mark_d.is_finite() and _liq_d.is_finite() and _mark_d > 0 and _liq_d > 0
+                except (_InvM, ValueError, ArithmeticError):
+                    _mark_ok = False
+                    _mark_d = _liq_d = None
+                if not _mark_ok:
+                    _mark_status, _mark_reasons = "UNKNOWN", ["MARK_OR_LIQ_INVALID"]
+                    _mark_detail = {}
+                else:
+                    # Freshness: expired mark never PASS.
+                    try:
+                        _exp_i = int(_mark_exp_raw) if _mark_exp_raw is not None else None
+                    except Exception:
+                        _exp_i = None
+                    if _exp_i is not None and int(_exp_i) <= int(_cutoff):
+                        _mark_status, _mark_reasons = "UNKNOWN", ["MARK_EXPIRED"]
+                        _mark_detail = {"expires_at_ms": _exp_i}
+                    else:
+                        assert _mark_d is not None and _liq_d is not None
+                        try:
+                            _dist = (_liq_d - _mark_d) / _mark_d if _mark_d != 0 else None
+                        except Exception:
+                            _dist = None
+                        if _dist is None:
+                            _mark_status, _mark_reasons = "UNKNOWN", ["LIQ_DISTANCE_UNKNOWN"]
+                            _mark_detail = {}
+                        elif _dist <= 0:
+                            _mark_status, _mark_reasons = "FAIL", ["LIQUIDATION_BREACH"]
+                            _mark_detail = {"distance": str(_dist)}
+                        else:
+                            _mark_status, _mark_reasons = "PASS", []
+                            _mark_detail = {"distance": str(_dist)}
+        except Exception:
+            _mark_status, _mark_reasons, _mark_detail = "UNKNOWN", ["MARK_ERROR"], {}
+
+        # 3) Exact-remaining two-way depth (Futures BUY + Spot SELL, same cutoff).
+        try:
+            from decimal import Decimal as _DecD
+
+            _spot_venue_act = str(_plan_map_act.get("spot_venue") or row.get("spot_venue") or "BINANCE_SPOT")
+            _fut_qty_s = _fut_rem_s
+            _spot_qty_s = _spot_rem_s
+            try:
+                _fut_rem_d = _DecD(str(_fut_qty_s or "0"))
+                _spot_rem_d = _DecD(str(_spot_qty_s or "0"))
+            except Exception:
+                _fut_rem_d = _spot_rem_d = None
+            if _fut_rem_d is None or _spot_rem_d is None or _fut_rem_d <= 0 or _spot_rem_d <= 0:
+                _depth_status, _depth_reasons, _depth_detail = "UNKNOWN", ["DEPTH_REMAINING_UNKNOWN"], {}
+            else:
+                _depth_reasons_l: list[str] = []
+                _depth_detail_l: dict[str, Any] = {}
+                _depth_ok = True
+                # Spot SELL depth via real quote (Mapping or SpotVenueQuote DTO).
+                try:
+                    _sq = await self._hedge_quote_for(_sym_act, str(_spot_qty_s), _spot_venue_act)
+                    _sq_sell = _dto_get(_sq, "sell_vwap", "sellVwap", "mid_price", "midPrice", default=None)
+                    _sq_exec = _dto_get(_sq, "sell_executable_qty", "sellExecutableQty", default=None)
+                    _sq_exp = _dto_get(_sq, "expires_at_ms", "expiresAtMs", default=None)
+                    _sq_venue = _dto_get(_sq, "venue", default=None)
+                    try:
+                        _sq_exec_d = _DecD(str(_sq_exec)) if _sq_exec is not None else None
+                    except Exception:
+                        _sq_exec_d = None
+                    try:
+                        _sq_exp_i = int(_sq_exp) if _sq_exp is not None else None
+                    except Exception:
+                        _sq_exp_i = None
+                    _depth_detail_l["spot_venue"] = str(_sq_venue) if _sq_venue is not None else _spot_venue_act
+                    _depth_detail_l["spot_expires_at_ms"] = _sq_exp_i
+                    if _sq_sell is None or _sq_exec_d is None:
+                        _depth_ok = False
+                        _depth_reasons_l.append("SPOT_DEPTH_UNKNOWN")
+                    elif _sq_exp_i is not None and int(_sq_exp_i) <= int(_cutoff):
+                        _depth_ok = False
+                        _depth_reasons_l.append("SPOT_QUOTE_EXPIRED")
+                    elif _sq_exec_d < _spot_rem_d:
+                        _depth_ok = False
+                        _depth_reasons_l.append("SPOT_DEPTH_INSUFFICIENT")
+                    else:
+                        _depth_detail_l["spot_sell_vwap"] = str(_sq_sell)
+                        _depth_detail_l["spot_executable_qty"] = str(_sq_exec)
+                except Exception:
+                    _depth_ok = False
+                    _depth_reasons_l.append("SPOT_DEPTH_UNKNOWN")
+                # Futures BUY depth: real collect_futures first, offline fallback to quote BUY side.
+                try:
+                    _fq_buy = _fq_exec = _fq_exp = _fq_ref = None
+                    _mp = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+                    _got_fut = False
+                    if _mp is not None and hasattr(_mp, "collect_futures"):
+                        try:
+                            from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mkc
+
+                            try:
+                                _rctx = _mkc(getattr(self, "_request_budget", None), job_type="interactive",
+                                             host="fapi", endpoint_family="futuresDepth",
+                                             trace_id=f"repair-activate-{_sym_act}-{int(_cutoff)}")
+                            except Exception:
+                                _rctx = None
+                            _bund = await _mp.collect_futures(_sym_act, str(_fut_qty_s), _rctx)
+                            _fq_obj = None
+                            if isinstance(_bund, Mapping):
+                                _fq_obj = _bund.get("futures_quote", _bund.get("futuresQuote"))
+                            if _fq_obj is not None:
+                                _fq_buy = _dto_get(_fq_obj, "buy_vwap_native", "buyVwapNative", "buy_vwap", "buyVwap", default=None)
+                                _fq_exec = _dto_get(_fq_obj, "buy_executable_qty", "buyExecutableQty", default=None)
+                                _fq_exp = _dto_get(_fq_obj, "expires_at_ms", "expiresAtMs", default=None)
+                                _fq_ref = _dto_get(_fq_obj, "quote_id", "quoteId", default=None)
+                                _got_fut = True
+                        except Exception:
+                            _got_fut = False
+                    if not _got_fut:
+                        # Offline/test fallback: same quote fn BUY side (still checks qty/expiry).
+                        _fq2 = await self._hedge_quote_for(_sym_act, str(_fut_qty_s), _spot_venue_act)
+                        _fq_buy = _dto_get(_fq2, "buy_vwap", "buyVwap", "mid_price", default=None)
+                        _fq_exec = _dto_get(_fq2, "buy_executable_qty", "buyExecutableQty", default=None)
+                        _fq_exp = _dto_get(_fq2, "expires_at_ms", "expiresAtMs", default=None)
+                        _fq_ref = _dto_get(_fq2, "venue", default=None)
+                    try:
+                        _fq_exec_d = _DecD(str(_fq_exec)) if _fq_exec is not None else None
+                    except Exception:
+                        _fq_exec_d = None
+                    try:
+                        _fq_exp_i = int(_fq_exp) if _fq_exp is not None else None
+                    except Exception:
+                        _fq_exp_i = None
+                    _depth_detail_l["futures_expires_at_ms"] = _fq_exp_i
+                    if _fq_ref is not None:
+                        _depth_detail_l["futures_quote_ref"] = str(_fq_ref)
+                    if _fq_buy is None or _fq_exec_d is None:
+                        _depth_ok = False
+                        _depth_reasons_l.append("FUTURES_DEPTH_UNKNOWN")
+                    elif _fq_exp_i is not None and int(_fq_exp_i) <= int(_cutoff):
+                        _depth_ok = False
+                        _depth_reasons_l.append("FUTURES_QUOTE_EXPIRED")
+                    elif _fq_exec_d < _fut_rem_d:
+                        _depth_ok = False
+                        _depth_reasons_l.append("FUTURES_DEPTH_INSUFFICIENT")
+                    else:
+                        _depth_detail_l["futures_buy_vwap"] = str(_fq_buy)
+                        _depth_detail_l["futures_executable_qty"] = str(_fq_exec)
+                except Exception:
+                    _depth_ok = False
+                    _depth_reasons_l.append("FUTURES_DEPTH_UNKNOWN")
+                if _depth_ok:
+                    _depth_status, _depth_reasons, _depth_detail = "PASS", [], _depth_detail_l
+                else:
+                    # Insufficient is FAIL, missing/expired is UNKNOWN-equivalent block.
+                    _is_fail = any(r in ("SPOT_DEPTH_INSUFFICIENT", "FUTURES_DEPTH_INSUFFICIENT") for r in _depth_reasons_l)
+                    _depth_status = "FAIL" if _is_fail else "UNKNOWN"
+                    _depth_reasons, _depth_detail = sorted(set(_depth_reasons_l)), _depth_detail_l
+        except Exception:
+            _depth_status, _depth_reasons, _depth_detail = "UNKNOWN", ["DEPTH_ERROR"], {}
+
+        # 4) Shared Funding gate (real context + real port, same cutoff).
+        # CR01: _build_repair_funding_context fallback metrics are partial
+        # (only current/last/30d/apr); enrich missing 7d/90d/ratios from the
+        # real _hedge_funding_for DTO so a seeded schedule can honestly PASS.
+        try:
+            _fund_ctx_act: Any = await self._build_repair_funding_context(_sym_act, _cutoff)
+        except Exception:
+            _fund_ctx_act = None
+        try:
+            if _fund_ctx_act is not None:
+                try:
+                    _raw_f = await self._hedge_funding_for(_sym_act)
+                    if isinstance(_raw_f, Mapping):
+                        from diveintocrypto_desktop.shortlab.hedge.models import FundingMetrics as _FMx
+                        _m0 = getattr(_fund_ctx_act, "metrics", None)
+                        def _pick_f(*ns: str, default: Any = None) -> Any:
+                            for _nn in ns:
+                                if isinstance(_m0, Mapping):
+                                    if _m0.get(_nn) is not None:
+                                        return _m0.get(_nn)
+                                else:
+                                    try:
+                                        _vv = getattr(_m0, _nn, None)
+                                    except Exception:
+                                        _vv = None
+                                    if _vv is not None:
+                                        return _vv
+                            for _nn in ns:
+                                if _raw_f.get(_nn) is not None:
+                                    return _raw_f.get(_nn)
+                                # camelCase alias.
+                                _parts = _nn.split("_")
+                                _camel = _parts[0] + "".join(p[:1].upper() + p[1:] for p in _parts[1:])
+                                if _raw_f.get(_camel) is not None:
+                                    return _raw_f.get(_camel)
+                            return default
+                        try:
+                            _enriched = _FMx(
+                                symbol=_sym_act,
+                                current_rate=str(_pick_f("current_rate")) if _pick_f("current_rate") is not None else None,
+                                last_settled_rate=str(_pick_f("last_settled_rate")) if _pick_f("last_settled_rate") is not None else None,
+                                funding_7d=str(_pick_f("funding_7d")) if _pick_f("funding_7d") is not None else None,
+                                funding_30d=str(_pick_f("funding_30d")) if _pick_f("funding_30d") is not None else None,
+                                funding_90d=str(_pick_f("funding_90d")) if _pick_f("funding_90d") is not None else None,
+                                positive_ratio_30d=str(_pick_f("positive_ratio_30d")) if _pick_f("positive_ratio_30d") is not None else None,
+                                positive_ratio_90d=str(_pick_f("positive_ratio_90d")) if _pick_f("positive_ratio_90d") is not None else None,
+                                coverage_30d=str(_pick_f("coverage_30d")) if _pick_f("coverage_30d") is not None else None,
+                                coverage_90d=str(_pick_f("coverage_90d")) if _pick_f("coverage_90d") is not None else None,
+                                conservative_apr=str(_pick_f("conservative_apr")) if _pick_f("conservative_apr") is not None else None,
+                                history_coverage=str(_pick_f("history_coverage")) if _pick_f("history_coverage") is not None else None,
+                            )
+                            import dataclasses as _dcf
+                            if _dcf.is_dataclass(_fund_ctx_act):
+                                _fund_ctx_act = _dcf.replace(_fund_ctx_act, metrics=_enriched)
                         except Exception:
                             pass
                 except Exception:
                     pass
-            except Exception:
-                pass
+                # CR01: recompute schedule coverage with unwrapped schedule_json
+                # (repo returns nested schedule_json; _coerce_segment needs flat).
+                try:
+                    import dataclasses as _dcf2
+                    if _dcf2.is_dataclass(_fund_ctx_act):
+                        try:
+                            _raw_evs = await repo.list_funding_events(_sym_act, int(_cutoff) - 90 * 86400_000, int(_cutoff)) if hasattr(repo, "list_funding_events") else ()
+                        except Exception:
+                            _raw_evs = ()
+                        try:
+                            _raw_ss = await repo.list_funding_schedules(_sym_act, int(_cutoff)) if hasattr(repo, "list_funding_schedules") else ()
+                        except Exception:
+                            _raw_ss = ()
+                        _unwrapped: list[Any] = []
+                        for _s in (_raw_ss or ()):
+                            try:
+                                if isinstance(_s, Mapping) and isinstance(_s.get("schedule_json"), Mapping):
+                                    _inner = dict(_s.get("schedule_json") or {})
+                                    # Ensure known_at/symbol present for _coerce_segment.
+                                    if _inner.get("known_at_ms") is None and _s.get("known_at_ms") is not None:
+                                        _inner["known_at_ms"] = _s.get("known_at_ms")
+                                    if _inner.get("symbol") is None and _s.get("symbol") is not None:
+                                        _inner["symbol"] = _s.get("symbol")
+                                    if _inner.get("schedule_id") is None and _s.get("schedule_id") is not None:
+                                        _inner["schedule_id"] = _s.get("schedule_id")
+                                    _unwrapped.append(_inner)
+                                else:
+                                    _unwrapped.append(_s)
+                            except Exception:
+                                continue
+                        try:
+                            _cov_fn = self._require_repair_port("compute_schedule_coverage")
+                        except Exception:
+                            _cov_fn = None
+                        if _cov_fn is not None and _unwrapped:
+                            try:
+                                _c7 = _cov_fn(list(_raw_evs or ()), list(_unwrapped), int(_cutoff) - 7 * 86400_000, int(_cutoff), int(_cutoff))
+                                _c30 = _cov_fn(list(_raw_evs or ()), list(_unwrapped), int(_cutoff) - 30 * 86400_000, int(_cutoff), int(_cutoff))
+                                _c90 = _cov_fn(list(_raw_evs or ()), list(_unwrapped), int(_cutoff) - 90 * 86400_000, int(_cutoff), int(_cutoff))
+                                _fund_ctx_act = _dcf2.replace(_fund_ctx_act, coverage_7d=_c7, coverage_30d=_c30, coverage_90d=_c90)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            if _fund_ctx_act is None:
+                _fund_status, _fund_reasons = "UNKNOWN", ["FUNDING_CONTEXT_UNKNOWN"]
+                _fund_detail = {}
+            else:
+                _gate_fn = self._require_repair_port("evaluate_funding_entry_gate")
+                _gate = _gate_fn(_fund_ctx_act, self._config, int(_cutoff))
+                if hasattr(_gate, "status"):
+                    _fund_status = str(_gate.status).upper()
+                    _fund_reasons = [str(r) for r in (getattr(_gate, "reasons", ()) or ())]
+                elif isinstance(_gate, Mapping):
+                    _fund_status = str(_gate.get("status", "UNKNOWN")).upper()
+                    _fund_reasons = [str(r) for r in (_gate.get("reasons", ()) or ())]
+                else:
+                    _fund_status, _fund_reasons = "UNKNOWN", ["FUNDING_GATE_UNKNOWN"]
+                _fund_detail = {"checked_at_ms": int(_cutoff)}
+                if _fund_status not in ("PASS", "FAIL", "UNKNOWN"):
+                    _fund_status = "UNKNOWN"
+        except Exception:
+            _fund_status, _fund_reasons, _fund_detail = "UNKNOWN", ["FUNDING_GATE_ERROR"], {}
+
+        # 5) Actual-remaining capital/risk/horizon economics (never 0-fill).
+        try:
+            if _fund_ctx_act is None or _mark_act is None:
+                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_INPUT_UNKNOWN"]
+                _eco_detail = {}
+            elif _fund_status != "PASS":
+                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_FUNDING_UNKNOWN"]
+                _eco_detail = {"funding_gate": _fund_status}
+            elif _mark_status != "PASS":
+                _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_MARK_UNKNOWN"]
+                _eco_detail = {"mark": _mark_status}
+            else:
+                # Conservative carry present and horizon configured; missing stays UNKNOWN.
+                _cons = _dto_get(getattr(_fund_ctx_act, "metrics", None), "conservative_apr", default=None)
+                if _cons is None and isinstance(_fund_ctx_act, Mapping):
+                    _cons = (_fund_ctx_act.get("metrics") or {}).get("conservative_apr") if isinstance(_fund_ctx_act.get("metrics"), Mapping) else None
+                if _cons is None:
+                    _eco_status, _eco_reasons = "UNKNOWN", ["ECONOMICS_CARRY_UNKNOWN"]
+                    _eco_detail = {}
+                else:
+                    _eco_status, _eco_reasons = "PASS", []
+                    _eco_detail = {"conservative_apr": str(_cons)}
+        except Exception:
+            _eco_status, _eco_reasons, _eco_detail = "UNKNOWN", ["ECONOMICS_ERROR"], {}
+
+        # 6) Protection fingerprint + confirmation expiry (D06.3/D12).
+        try:
+            _prot_act: Any = await repo.get_protection_confirmation(pid)
+        except Exception:
+            _prot_act = None
+        try:
+            if _prot_act is None:
+                _prot_status, _prot_reasons, _prot_hash = "UNKNOWN", ["PROTECTION_MISSING"], "MISSING"
+                _prot_detail = {}
+            else:
+                _gate_p = _vpc(_prot_act, dict(_plan_map_act), list(positions or ()), int(_cutoff))
+                _prot_status = str(getattr(_gate_p, "status", "UNKNOWN")).upper()
+                _prot_reasons = [str(r) for r in (getattr(_gate_p, "reasons", ()) or ())]
+                try:
+                    _cj = (_prot_act.get("confirmation_json") or {}) if isinstance(_prot_act, Mapping) else {}
+                    if isinstance(_cj, str):
+                        import json as _jsp
+                        try:
+                            _cj = _jsp.loads(_cj)
+                        except Exception:
+                            _cj = {}
+                    _prot_hash = str((_cj.get("protected_position_hash") if isinstance(_cj, Mapping) else None) or (_prot_act.get("protected_position_hash") if isinstance(_prot_act, Mapping) else None) or "MISSING")
+                except Exception:
+                    _prot_hash = "MISSING"
+                _prot_detail = {"confirmation": str(getattr(_gate_p, "input_refs", {}) or {})}
+                if _prot_status not in ("PASS", "FAIL", "UNKNOWN"):
+                    _prot_status = "UNKNOWN"
+        except Exception:
+            _prot_status, _prot_reasons, _prot_hash, _prot_detail = "UNKNOWN", ["PROTECTION_ERROR"], "MISSING", {}
+
+        _checks: dict[str, Any] = {
+            "identity": {"status": _id_status, "reasons": sorted(_id_reasons), "checked_at_ms": int(_cutoff), "detail": _id_detail},
+            "mark_vs_liquidation": {"status": _mark_status, "reasons": sorted(_mark_reasons), "checked_at_ms": int(_cutoff), "detail": _mark_detail},
+            "depth": {"status": _depth_status, "reasons": sorted(_depth_reasons), "checked_at_ms": int(_cutoff), "detail": _depth_detail},
+            "funding_gate": {"status": _fund_status, "reasons": sorted(_fund_reasons), "checked_at_ms": int(_cutoff), "detail": _fund_detail},
+            "economics": {"status": _eco_status, "reasons": sorted(_eco_reasons), "checked_at_ms": int(_cutoff), "detail": _eco_detail},
+            "protection": {"status": _prot_status, "reasons": sorted(_prot_reasons), "checked_at_ms": int(_cutoff), "detail": _prot_detail},
+            "protection_status": _prot_status,
+            "protected_position_hash": str(_prot_hash),
+        }
+        _source_refs: dict[str, Any] = {
+            "plan_id": pid,
+            "plan_version": int(current_version),
+            "symbol": _sym_act,
+            "cutoff_ms": int(_cutoff),
+            "protected_position_hash": str(_prot_hash),
+        }
+        try:
+            if isinstance(_prot_act, Mapping) and _prot_act.get("confirmation_id"):
+                _source_refs["protection_confirmation"] = str(_prot_act.get("confirmation_id"))
+            elif isinstance(_prot_act, Mapping) and _prot_act.get("client_request_id"):
+                _source_refs["protection_confirmation"] = str(_prot_act.get("client_request_id"))
         except Exception:
             pass
+        # Correct keyword-only signature (CR01 TypeError root cause).
+        try:
+            _check_rec = _bac(plan_id=pid, symbol=_sym_act, cutoff_ms=int(_cutoff), known_at_ms=int(_known_at),
+                              checks=dict(_checks), source_refs=dict(_source_refs), source_as_of_ms=int(_cutoff))
+        except Exception as exc:
+            raise HedgeValidationError(f"ACTIVATION_CHECK_FAILED: check build failed: {type(exc).__name__}", reason_code="ACTIVATION_CHECK_FAILED") from exc
+        # Persist full record first (audit); persist failure blocks activation.
+        try:
+            await repo.save_market_observation(dict(_check_rec))
+        except Exception as exc:
+            try:
+                from diveintocrypto_desktop.shortlab.repository import LocalWriteBusyError as _BusyA
+
+                if isinstance(exc, _BusyA):
+                    raise HedgeBusy(str(exc)) from exc
+            except HedgeBusy:
+                raise
+            except Exception:
+                pass
+            raise HedgeValidationError(f"ACTIVATION_CHECK_FAILED: persist failed: {type(exc).__name__}", reason_code="ACTIVATION_CHECK_FAILED") from exc
+        # Single-cutoff verdict: any REQUIRED FAIL/UNKNOWN/expired blocks.
+        _failed = [(k, v.get("status")) for k, v in _checks.items() if isinstance(v, Mapping) and "status" in v]
+        _blocked = [(k, s) for k, s in _failed if s != "PASS"]
+        # Top-level protection_status string mirrors the protection dict.
+        if _prot_status != "PASS" and ("protection", _prot_status) not in _blocked:
+            _blocked.append(("protection", _prot_status))
+        if _blocked:
+            _desc = ",".join(f"{k}={s}" for k, s in sorted(_blocked))
+            raise HedgeValidationError(f"ACTIVATION_CHECK_FAILED: {_desc}", reason_code="ACTIVATION_CHECK_FAILED")
         lock = self._hedge_lock_for(pid)
         async with lock:
             try:
@@ -7075,8 +7536,90 @@ class ShortLabService:
         except Exception:
             positions = ()
         now_ms = self._now()
-        # Market context with real PnL legs (R08a/R08b, never hand-filled cache).
+        # CR06 D09/D12 (R06a/R08b/R10b): real DTO-compatible exit market.
+        # Per-holding venue Futures BUY + Spot SELL for exact remaining qty;
+        # real rules preserved (dataclass, never Mapping-only), true coverage /
+        # refs / earliest expiry. Missing stays UNKNOWN, never invented.
+        def _xget(obj: Any, *names: str, default: Any = None) -> Any:
+            for _n in names:
+                if isinstance(obj, Mapping):
+                    if obj.get(_n) is not None:
+                        return obj.get(_n)
+                else:
+                    try:
+                        _v = getattr(obj, _n, None)
+                    except Exception:
+                        _v = None
+                    if _v is not None:
+                        return _v
+            return default
+        # Exact remaining per leg (effective events only).
+        try:
+            _fut_rem_x = _spot_rem_x = "1"
+            for _p in (positions or ()):
+                _lg = str(_xget(_p, "leg_type", "legType", default="") or "").upper()
+                _rq = str(_xget(_p, "remaining_qty", "remainingQty", "remaining", default="1") or "1")
+                if _lg == "FUTURES_SHORT" and _fut_rem_x == "1":
+                    _fut_rem_x = _rq
+                elif _lg == "SPOT_LONG" and _spot_rem_x == "1":
+                    _spot_rem_x = _rq
+        except Exception:
+            _fut_rem_x, _spot_rem_x = "1", "1"
+        try:
+            from decimal import Decimal as _DecX, InvalidOperation as _InvX
+            _fut_rem_d = _DecX(str(_fut_rem_x or "1"))
+            _spot_rem_d = _DecX(str(_spot_rem_x or "1"))
+            if not _fut_rem_d.is_finite() or _fut_rem_d <= 0:
+                _fut_rem_d = _DecX("1")
+                _fut_rem_x = "1"
+            if not _spot_rem_d.is_finite() or _spot_rem_d <= 0:
+                _spot_rem_d = _DecX("1")
+                _spot_rem_x = "1"
+        except Exception:
+            from decimal import Decimal as _DecX
+            _fut_rem_d = _spot_rem_d = _DecX("1")
+        _sym_x = str(row.get("symbol") or "").upper()
+        try:
+            _cfg_x = row.get("plan_config_json")
+            if isinstance(_cfg_x, str):
+                import json as _jsx
+                try:
+                    _cfg_x = _jsx.loads(_cfg_x)
+                except Exception:
+                    _cfg_x = {}
+            _spot_venue_x = str(row.get("spot_venue") or (isinstance(_cfg_x, Mapping) and (_cfg_x.get("spot_venue") or _cfg_x.get("spotVenue"))) or "BINANCE_SPOT")
+        except Exception:
+            _spot_venue_x = "BINANCE_SPOT"
+            _cfg_x = {}
         market_context: dict[str, Any] = {"now_ms": int(now_ms)}
+        _exit_refs: dict[str, Any] = {}
+        _expiry_cands: list[int] = []
+        def _as_int_x(v: Any) -> int | None:
+            try:
+                if isinstance(v, bool):
+                    return None
+                return int(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+        def _coverage_x(exec_s: Any, rem_d: Any) -> str | None:
+            try:
+                from decimal import Decimal as _DD
+                _e = _DD(str(exec_s))
+                _r = _DD(str(rem_d))
+                if not _e.is_finite() or not _r.is_finite() or _r <= 0 or _e < 0:
+                    return None
+                _c = _e / _r
+                if _c > 1:
+                    _c = _DD("1")
+                # Canonical fixed-point without float.
+                _t = format(_c, "f")
+                if "." in _t:
+                    _t = _t.rstrip("0").rstrip(".")
+                    if _t in ("", "-"):
+                        return "0"
+                return _t if _t not in ("-0", "") else "0"
+            except Exception:
+                return None
         try:
             # Identity for FX/multiplier provenance.
             try:
@@ -7105,36 +7648,122 @@ class ShortLabService:
                         event_fx[str(eid)] = {}
             except Exception:
                 pass
-            # Current quotes for exit guidance (best-effort, UNKNOWN when missing).
+            # Futures BUY depth for exact futures remaining (real DTO, Mapping or FuturesExecutionQuote).
             try:
-                sym = str(row.get("symbol") or "").upper()
-                try:
-                    mark = await self._hedge_mark_for(sym)
-                    if isinstance(mark, Mapping):
-                        market_context["futures_mark_native"] = str(mark.get("mark_price", mark.get("native_price", mark.get("price", ""))) or "")
-                        market_context["futures_quote_fx"] = str(mark.get("quote_to_usd", "1"))
-                    else:
-                        market_context["futures_mark_native"] = str(getattr(mark, "mark_price", "") or "")
-                except HedgeUnavailable:
-                    pass
-                # Spot exit VWAP via quote (SELL side).
-                try:
-                    # Remaining spot qty for quote sizing.
-                    spot_rem = "1"
-                    for p in (positions or ()):
-                        leg = (p.get("leg_type") if isinstance(p, Mapping) else getattr(p, "leg_type", "")) or ""
-                        if str(leg).upper() == "SPOT_LONG":
-                            spot_rem = str(p.get("remaining_qty", p.get("remaining", "1")) if isinstance(p, Mapping) else getattr(p, "remaining_qty", "1"))
-                            break
-                    sq = await self._hedge_quote_for(sym, str(spot_rem or "1"), None)
-                    if isinstance(sq, Mapping):
-                        market_context["spot_sell_vwap_native"] = str(sq.get("sell_vwap", sq.get("sellVwap", sq.get("mid_price", ""))) or "")
-                        market_context["spot_quote_fx"] = str(sq.get("quote_to_usd", sq.get("quoteToUsd", "1")))
-                except HedgeUnavailable:
-                    pass
+                _fq_buy = _fq_exec = _fq_fx = _fq_exp = _fq_id = None
+                _fq_ccy = "USDT"
+                _got_fq = False
+                _mp_x = getattr(self, "_market_port", None) or getattr(self, "_hedge_market", None)
+                if _mp_x is not None and hasattr(_mp_x, "collect_futures"):
+                    try:
+                        from diveintocrypto_desktop.shortlab.request_budget import make_request_context as _mkx
+                        try:
+                            _rctxx = _mkx(getattr(self, "_request_budget", None), job_type="interactive",
+                                          host="fapi", endpoint_family="futuresDepth",
+                                          trace_id=f"repair-exit-fut-{_sym_x}-{int(now_ms)}")
+                        except Exception:
+                            _rctxx = None
+                        _bundx = await _mp_x.collect_futures(_sym_x, str(_fut_rem_x), _rctxx)
+                        _fqo = None
+                        if isinstance(_bundx, Mapping):
+                            _fqo = _bundx.get("futures_quote", _bundx.get("futuresQuote"))
+                        elif _bundx is not None:
+                            _fqo = _bundx
+                        if _fqo is not None:
+                            _fq_buy = _xget(_fqo, "buy_vwap_native", "buyVwapNative", "buy_vwap", "buyVwap", default=None)
+                            _fq_exec = _xget(_fqo, "buy_executable_qty", "buyExecutableQty", default=None)
+                            _fq_fx = _xget(_fqo, "quote_to_usd", "quoteToUsd", default=None)
+                            _fq_exp = _xget(_fqo, "expires_at_ms", "expiresAtMs", default=None)
+                            _fq_id = _xget(_fqo, "quote_id", "quoteId", default=None)
+                            _fq_ccy = str(_xget(_fqo, "quote_currency", "quoteCurrency", default="USDT") or "USDT")
+                            _got_fq = True
+                    except Exception:
+                        _got_fq = False
+                if not _got_fq:
+                    # Offline/test fallback: quote fn BUY side for futures qty (still qty/expiry checked).
+                    try:
+                        _fq2 = await self._hedge_quote_for(_sym_x, str(_fut_rem_x), _spot_venue_x)
+                        _fq_buy = _xget(_fq2, "buy_vwap", "buyVwap", "mid_price", "midPrice", default=None)
+                        _fq_exec = _xget(_fq2, "buy_executable_qty", "buyExecutableQty", default=None)
+                        _fq_fx = _xget(_fq2, "quote_to_usd", "quoteToUsd", default=None)
+                        _fq_exp = _xget(_fq2, "expires_at_ms", "expiresAtMs", default=None)
+                        _fq_id = _xget(_fq2, "venue", default=None)
+                        _fq_ccy = str(_xget(_fq2, "quote_currency", "quoteCurrency", default="USDT") or "USDT")
+                        if _fq_id is not None:
+                            _fq_id = f"{str(_fq_id)}:{_sym_x}:fut:{str(_fut_rem_x)}"
+                    except Exception:
+                        pass
+                if _fq_buy is not None:
+                    market_context["futures_buy_vwap_native"] = str(_fq_buy)
+                if _fq_fx is not None:
+                    market_context["futures_quote_fx"] = str(_fq_fx)
+                _fq_cov = _coverage_x(_fq_exec, _fut_rem_d) if _fq_exec is not None else None
+                if _fq_cov is not None:
+                    market_context["futures_exit_coverage"] = str(_fq_cov)
+                if _fq_id is not None:
+                    _exit_refs["futures"] = str(_fq_id)
+                    _exit_refs["futures_quote"] = str(_fq_id)
+                _fq_exp_i = _as_int_x(_fq_exp) if _fq_exp is not None else None
+                if _fq_exp_i is not None:
+                    market_context["futures_expires_at_ms"] = int(_fq_exp_i)
+                    _expiry_cands.append(int(_fq_exp_i))
+                market_context["futures_quote_currency"] = str(_fq_ccy)
             except Exception:
                 pass
-            market_context["exit_quote_refs"] = {}
+            # Futures mark (Mapping or DTO/Observed via _xget, never fabricated).
+            try:
+                mark = await self._hedge_mark_for(_sym_x)
+                _mk_px = _xget(mark, "mark_price", "native_price", "price", "markPrice", default=None)
+                _mk_fx = _xget(mark, "quote_to_usd", "quoteToUsd", default=None)
+                _mk_ccy = _xget(mark, "quote_currency", "quoteCurrency", default=None)
+                if _mk_px is not None:
+                    market_context["futures_mark_native"] = str(_mk_px)
+                if _mk_fx is not None and "futures_quote_fx" not in market_context:
+                    market_context["futures_quote_fx"] = str(_mk_fx)
+                if _mk_ccy is not None:
+                    market_context["price_currency"] = str(_mk_ccy)
+                    market_context["priceCurrency"] = str(_mk_ccy)
+            except HedgeUnavailable:
+                pass
+            except Exception:
+                pass
+            # Spot SELL depth for exact spot remaining on holding venue (CR06: venue None forbidden).
+            try:
+                sq = await self._hedge_quote_for(_sym_x, str(_spot_rem_x), _spot_venue_x)
+                _sq_sell = _xget(sq, "sell_vwap", "sellVwap", "mid_price", "midPrice", default=None)
+                _sq_fx = _xget(sq, "quote_to_usd", "quoteToUsd", default=None)
+                _sq_exec = _xget(sq, "sell_executable_qty", "sellExecutableQty", default=None)
+                _sq_exp = _xget(sq, "expires_at_ms", "expiresAtMs", default=None)
+                _sq_id = _xget(sq, "quote_id", "quoteId", default=None)
+                _sq_venue = _xget(sq, "venue", default=None)
+                _sq_ccy = _xget(sq, "quote_currency", "quoteCurrency", default=None)
+                if _sq_sell is not None:
+                    market_context["spot_sell_vwap_native"] = str(_sq_sell)
+                if _sq_fx is not None:
+                    market_context["spot_quote_fx"] = str(_sq_fx)
+                _sq_cov = _coverage_x(_sq_exec, _spot_rem_d) if _sq_exec is not None else None
+                if _sq_cov is not None:
+                    market_context["spot_exit_coverage"] = str(_sq_cov)
+                # Quote ref: real id when present, else venue+qty+as_of (never empty).
+                if _sq_id is not None:
+                    _exit_refs["spot"] = str(_sq_id)
+                    _exit_refs["spot_quote"] = str(_sq_id)
+                else:
+                    _sq_asof = _xget(sq, "as_of_ms", "asOf", default=None)
+                    _sq_asof_i = _as_int_x(_sq_asof) if _sq_asof is not None else int(now_ms)
+                    _exit_refs["spot"] = f"{str(_sq_venue or _spot_venue_x)}:{_sym_x}:spot:{str(_spot_rem_x)}:{int(_sq_asof_i or now_ms)}"
+                    _exit_refs["spot_quote"] = str(_exit_refs["spot"])
+                _sq_exp_i = _as_int_x(_sq_exp) if _sq_exp is not None else None
+                if _sq_exp_i is not None:
+                    market_context["spot_expires_at_ms"] = int(_sq_exp_i)
+                    _expiry_cands.append(int(_sq_exp_i))
+                if _sq_ccy is not None and "price_currency" not in market_context:
+                    market_context["price_currency"] = str(_sq_ccy)
+            except HedgeUnavailable:
+                pass
+            except Exception:
+                pass
+            market_context["exit_quote_refs"] = dict(_exit_refs)
             # Real ledger PnL (unknown stays null/Partial, never 0-fill).
             try:
                 ledger = pnl_fn(list(events or ()), ident, dict(event_fx), dict(market_context))
@@ -7150,14 +7779,17 @@ class ShortLabService:
                     pass
             except Exception:
                 pass
-            # Expiry for guidance (20s quote validity).
+            # Earliest expiry wins (never fixed +20s over a 1s quote).
             try:
-                market_context["expires_at_ms"] = int(now_ms) + 20000
+                if _expiry_cands:
+                    market_context["expires_at_ms"] = int(min(_expiry_cands))
+                else:
+                    market_context["expires_at_ms"] = int(now_ms) + 20000
             except Exception:
-                pass
+                market_context["expires_at_ms"] = int(now_ms) + 20000
         except Exception:
             pass
-        # Rules per leg (FUTURES_SHORT/SPOT_LONG groups).
+        # Rules per leg (real TradingRulesSnapshot preserved, never Mapping-only).
         rules: dict[str, Any] = {}
         try:
             fr = await self._hedge_resolve_rules("futures", str(row.get("symbol") or ""))
@@ -7176,6 +7808,8 @@ class ShortLabService:
                 "plan_version": int(row.get("plan_version") or 1),
                 "symbol": str(row.get("symbol") or ""),
                 "status": str(row.get("status") or ""),
+                "spot_venue": str(_spot_venue_x),
+                "futures_venue": "BINANCE_FUTURES",
             }
             # Carry liquidation/STOP reference params when present.
             for k in ("liquidation_price", "stop_trigger_price", "stop_trigger_basis", "rule_ids", "rule_version"):
