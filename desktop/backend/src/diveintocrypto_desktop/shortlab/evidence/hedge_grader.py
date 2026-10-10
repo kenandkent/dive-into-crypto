@@ -486,6 +486,12 @@ def _norm_bar(bar: Any) -> dict[str, Any] | None:
     fx = _field(bar, "fx_to_usd", "fxToUsd", "fx", "quote_to_usd", "quoteToUsd")
     known_at = _field(bar, "known_at_ms", "knownAtMs", "known_at", "fetched_at_ms")
     source = _field(bar, "source", "source_id", "sourceId")
+    basis_raw = _field(bar, "price_basis", "priceBasis", "basis")
+    if isinstance(basis_raw, str) and basis_raw.strip():
+        basis = basis_raw.strip().upper()
+    else:
+        # Legacy bars without provenance default to TRADE (never MARK).
+        basis = "TRADE"
     try:
         open_i = int(open_ms)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -513,6 +519,7 @@ def _norm_bar(bar: Any) -> dict[str, Any] | None:
         "fx_to_usd": _parse_dec("fx", fx),
         "known_at_ms": known_i,
         "source": str(source) if source is not None else "",
+        "price_basis": basis,
         "_raw": bar,
     }
 
@@ -1297,12 +1304,20 @@ def _drawdown_if_complete(
     return draw_s, adv_s
 
 
-def _mark_path_coverage(provider: Any, bars: list[dict[str, Any]], entry_ms: int, exit_ms: int) -> str:
+async def _mark_path_coverage(
+    provider: Any, symbol: str, entry_ms: int, exit_ms: int, grading_ms: int,
+) -> str:
     """R14b/D14.2 MARK liquidation-path coverage (COMPLETE/PARTIAL/UNKNOWN).
 
-    - provider without ``read_mark_price_bars`` (or unbound MARK fn) ->
-      UNKNOWN (never TRADE-as-MARK);
-    - straddling head/tail without finer MARK -> PARTIAL;
+    CR16: actually async-read then-known MARK bars and validate
+    ``price_basis``. Binding alone never grants coverage credit; TRADE bars
+    never masquerade as MARK.
+
+    - provider without callable ``read_mark_price_bars`` (or explicitly
+      unbound ``mark_price_bars_fn is None``) -> UNKNOWN (no read);
+    - read error / exception -> UNKNOWN;
+    - reader executed but empty / all non-MARK / window mismatch / gap ->
+      PARTIAL (never COMPLETE);
     - fully-contained MARK coverage with no gap -> COMPLETE else PARTIAL.
     Purely informational (never invents drawdown); old readers ignore it.
     """
@@ -1312,21 +1327,76 @@ def _mark_path_coverage(provider: Any, bars: list[dict[str, Any]], entry_ms: int
         )
     except Exception:
         return "UNKNOWN"
-    has_mark = False
-    mark_bars: list[Any] = []
-    fn = getattr(provider, "read_mark_price_bars", None)
-    bound = getattr(provider, "mark_price_bars_fn", "__missing__")
-    if callable(fn) and bound is not None:
-        # Bound MARK path exists; caller-grade MARK bars are authoritative
-        # when available. Without a live read here (offline grader already
-        # holds TRADE bars), report based on TRADE completeness but require
-        # MARK binding for COMPLETE.
-        has_mark = True
-        mark_bars = list(bars)
-    if not has_mark:
+    if provider is None:
         return "UNKNOWN"
+    fn = getattr(provider, "read_mark_price_bars", None)
+    if not callable(fn):
+        return "UNKNOWN"
+    # Explicitly unbound MARK history (RepositoryHistoricalMarketProvider
+    # with mark_price_bars_fn=None) stays UNKNOWN; callers must never fall
+    # back to TRADE bars. Binding alone (without a successful MARK read)
+    # never grants coverage credit.
     try:
-        return str(_coverage(mark_bars, entry_ms, exit_ms, has_mark=True))
+        if "mark_price_bars_fn" in dir(provider):
+            if getattr(provider, "mark_price_bars_fn") is None:
+                return "UNKNOWN"
+    except Exception:
+        pass
+    try:
+        entry_i = int(entry_ms)
+        exit_i = int(exit_ms)
+        grade_i = int(grading_ms)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    # Actually read then-known MARK bars (proves the reader executed; the
+    # test fakes count invocations). Window is the liquidation-path window
+    # [entry, exit]; the provider filters to fully-inside bars.
+    try:
+        try:
+            raw = await fn(symbol, entry_i, exit_i, None)
+        except TypeError:
+            raw = await fn(symbol, entry_i, exit_i)
+    except Exception:
+        return "UNKNOWN"
+    # Network history is learned at fetch completion (same as TRADE bars).
+    try:
+        completed = getattr(provider, "completed_at_ms", None)
+        if isinstance(completed, int) and completed > grade_i:
+            grade_i = completed
+    except Exception:
+        pass
+    mark_bars: list[dict[str, Any]] = []
+    try:
+        items = list(raw or ())
+    except TypeError:
+        return "PARTIAL"
+    for item in items:
+        # CR16: validate price_basis -- only MARK feeds the liquidation
+        # path; TRADE (or missing/legacy basis) is discarded, never
+        # substituted.
+        basis_raw = _field(item, "price_basis", "priceBasis", "basis")
+        if not isinstance(basis_raw, str) or basis_raw.strip().upper() != "MARK":
+            continue
+        norm = _norm_bar(item)
+        if norm is None:
+            continue
+        if norm.get("price_basis") != "MARK":
+            continue
+        # Only then-known bars (known after grading can never price the past).
+        known = norm.get("known_at_ms")
+        if known is not None:
+            try:
+                if int(known) > grade_i:  # type: ignore[arg-type]
+                    continue
+            except (TypeError, ValueError):
+                continue
+        mark_bars.append(norm)
+    if not mark_bars:
+        # Reader executed but yielded no usable MARK (empty / all TRADE /
+        # window mismatch): never COMPLETE.
+        return "PARTIAL"
+    try:
+        return str(_coverage(mark_bars, entry_i, exit_i, has_mark=True))
     except Exception:
         return "UNKNOWN"
 
@@ -1514,11 +1584,10 @@ async def _settle_complete(
         ctx.prec = 80
         spot_notional = spot_qty * spot_entry
         margin = futures_notional / leverage if leverage > 0 else Decimal("0")
-        # Legacy total (entry-notional for both legs) preserved as fees_usd
-        # for backward compatibility; R14b detailed legs follow exit notionals.
-        fees = (futures_notional * (rates["futures_entry_fee_rate"] + rates["futures_exit_fee_rate"])
-                + spot_notional * (rates["spot_entry_fee_rate"] + rates["spot_exit_fee_rate"]))
-        # R14b/D14 exit legs on exit notionals (FX1, no VWAP invention).
+        # CR18/D14.2: true two-leg fees on actual entry/exit notionals
+        # (FX1, no VWAP invention). Exit legs follow exit notionals; the
+        # legacy entry-notional total (entry price for both legs) is removed
+        # because it understated the exit leg whenever exit != entry.
         futures_exit_notional = exit_fut * futures_qty
         spot_exit_notional = exit_spot * spot_qty
         fut_entry_fee = futures_notional * rates["futures_entry_fee_rate"]
@@ -1526,6 +1595,7 @@ async def _settle_complete(
         spot_entry_fee = spot_notional * rates["spot_entry_fee_rate"]
         spot_exit_fee = spot_exit_notional * rates["spot_exit_fee_rate"]
         fees_exit_based = fut_entry_fee + fut_exit_fee + spot_entry_fee + spot_exit_fee
+        fees = fees_exit_based
         gas_entry = entry_quote.get("estimated_gas_usd") or Decimal("0")
         gas_exit = exit_quote.get("estimated_gas_usd") or Decimal("0")
         gas = gas_entry + gas_exit
@@ -1544,10 +1614,18 @@ async def _settle_complete(
         futures_pnl = (futures_entry - exit_fut) * futures_qty
         spot_pnl = (exit_spot - spot_entry) * spot_qty
         basis_pnl = futures_pnl + spot_pnl
-        net = basis_pnl + carry - fees - slip - gas
-        capital = spot_notional + margin + fees + gas
+        # CR18: net consumes true per-leg entry/exit-amount fees
+        # (fees_exit_based); capital denominator stays frozen
+        # (spot cash + futures margin + cost reserve), never one margin leg.
+        net = basis_pnl + carry - fees_exit_based - slip - gas
+        capital = spot_notional + margin + fees_exit_based + gas
         net_return = (net / capital) if capital != 0 else None
         fut_return = (net / futures_notional) if futures_notional != 0 else None
+    # CR16: MARK liquidation-path coverage from a real MARK read (async).
+    path_coverage = await _mark_path_coverage(
+        provider, symbol, int(entry_bar["open_ms"]),
+        int(exit_bar["open_ms"]), int(as_of_ms),
+    )
     drawdown_s, adverse_s = _drawdown_if_complete(
         bars, int(entry_bar["open_ms"]), int(exit_bar["open_ms"]),
         futures_qty, spot_qty, futures_entry, spot_entry, fcs["_contract_multiplier"],
@@ -1572,7 +1650,7 @@ async def _settle_complete(
             "capital_at_risk_usd": _dec_str(capital),
             "spot_cash_usd": _dec_str(spot_notional),
             "futures_margin_usd": _dec_str(margin),
-            "cost_reserve_usd": _dec_str(fees + gas),
+            "cost_reserve_usd": _dec_str(fees_exit_based + gas),
             "venue": venue,
             "canonical_id": canonical_id,
             "symbol": symbol,
@@ -1602,7 +1680,9 @@ async def _settle_complete(
             "futures_pnl_usd": _dec_str(futures_pnl),
             "basis_pnl_usd": _dec_str(basis_pnl),
             "funding_carry_usd": _dec_str(carry),
-            "fees_usd": _dec_str(fees),
+            # CR18: fees_usd is the true exit-based total (exit follows
+            # exit notional); detailed legs below sum to it.
+            "fees_usd": _dec_str(fees_exit_based),
             # R14b detailed exit-based legs (exit follows exit notional).
             "futures_entry_fee_usd": _dec_str(fut_entry_fee),
             "futures_exit_fee_usd": _dec_str(fut_exit_fee),
@@ -1626,7 +1706,8 @@ async def _settle_complete(
                                 if spot_qty != 0 else
                                 "INCOMPLETE_FUTURES_PATH" if drawdown_s is None else None),
             # R14b/D14.2: MARK path without finer history is PARTIAL/UNKNOWN.
-            "path_coverage": _mark_path_coverage(provider, bars, int(entry_bar["open_ms"]), int(exit_bar["open_ms"])),
+            # CR16: real MARK read above; TRADE never substitutes.
+            "path_coverage": path_coverage,
             "negative_funding_settlements": negatives,
             "funding_coverage": coverage,
             "funding_event_count": len(fundings),

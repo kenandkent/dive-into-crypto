@@ -47,6 +47,10 @@ class FakeMarketProvider:
         self.fundings: dict[str, list[Any]] = {}
         self.lifecycles: dict[str, Any] = {}
         self.quotes: list[dict[str, Any]] = []
+        # CR16: true MARK history (price_basis=MARK) + call proof that the
+        # grader really executed the MARK reader (never TRADE-as-MARK).
+        self.mark_bars: dict[str, list[Any]] = {}
+        self.read_mark_calls: list[tuple[Any, ...]] = []
 
     def add_bar(self, bar: Any) -> None:
         symbol = bar.symbol if hasattr(bar, "symbol") else bar["symbol"]
@@ -61,6 +65,10 @@ class FakeMarketProvider:
 
     def add_quote(self, quote: dict[str, Any]) -> None:
         self.quotes.append(dict(quote))
+
+    def add_mark_bar(self, bar: Any) -> None:
+        symbol = bar.symbol if hasattr(bar, "symbol") else bar["symbol"]
+        self.mark_bars.setdefault(str(symbol), []).append(bar)
 
     async def read_frozen_quote(self, snapshot_id: str) -> Any | None:
         for quote in self.quotes:
@@ -128,6 +136,27 @@ class FakeMarketProvider:
     async def read_lifecycle(self, symbol: str, cutoff_ms: int) -> Any | None:
         return self.lifecycles.get(str(symbol))
 
+    async def read_mark_price_bars(
+        self, symbol: str, start_ms: int, end_ms: int, request_context: Any = None
+    ) -> tuple[Any, ...]:
+        # Call proof for CR16: every grading that reaches settlement must
+        # invoke this reader; tests assert len(read_mark_calls) >= 1.
+        self.read_mark_calls.append((str(symbol), int(start_ms), int(end_ms)))
+        out = []
+        for bar in self.mark_bars.get(str(symbol), []):
+            open_ms = bar.open_ms if hasattr(bar, "open_ms") else bar["open_ms"]
+            close_ms = (
+                bar.close_ms if hasattr(bar, "close_ms") else bar.get("close_ms")
+            )
+            if close_ms is None:
+                close_ms = int(open_ms) + HOUR_MS
+            if int(start_ms) <= int(open_ms) and int(close_ms) <= int(end_ms):
+                out.append(bar)
+        return tuple(sorted(
+            out,
+            key=lambda b: int(b.open_ms if hasattr(b, "open_ms") else b["open_ms"]),
+        ))
+
 
 def _bar(symbol: str, open_ms: int, price: str, fx: str | None = "1") -> HistoricalPriceBar:
     return HistoricalPriceBar(
@@ -142,6 +171,31 @@ def _bar(symbol: str, open_ms: int, price: str, fx: str | None = "1") -> Histori
         fx_to_usd=fx,
         source="test-bars",
         known_at_ms=int(open_ms) + HOUR_MS,
+    )
+
+
+def _mark_bar(
+    symbol: str,
+    open_ms: int,
+    price: str,
+    fx: str | None = "1",
+    basis: str = "MARK",
+    known_at_ms: int | None = None,
+) -> HistoricalPriceBar:
+    """True MARK bar helper (CR16: price_basis=MARK, MARK source)."""
+    return HistoricalPriceBar(
+        symbol=symbol,
+        open_ms=int(open_ms),
+        close_ms=int(open_ms) + HOUR_MS,
+        native_open=str(price),
+        native_high=str(price),
+        native_low=str(price),
+        native_close=str(price),
+        quote_asset="USDT",
+        fx_to_usd=fx,
+        source="binance:fapi/markPriceKlines:1h",
+        known_at_ms=int(known_at_ms) if known_at_ms is not None else int(open_ms) + HOUR_MS,
+        price_basis=basis,
     )
 
 
@@ -403,8 +457,23 @@ async def test_capital_denominator_two_leg_cost_funding(repo):
     assert margin == Decimal("10000")
     assert capital == spot_cash + margin + Decimal(pnl["fees_usd"]) + Decimal(pnl["gas_usd"])
     assert capital > margin
-    # Two-leg fees: futures 0.0005+0.0005 on 10000, spot 0.001+0.001 on 10000.
-    assert Decimal(pnl["fees_usd"]) == Decimal("10") + Decimal("20")
+    # CR18: two-leg fees follow actual entry/exit notionals (FX1).
+    # Entry 100->exit 110, qty 100: futures 5 + 5.5, spot 10 + 11 = 31.5.
+    # The legacy entry-notional total (10 + 20 = 30) understated the exit leg.
+    assert Decimal(pnl["fees_usd"]) == Decimal("31.5")
+    assert Decimal(pnl["fees_usd_exit_based"]) == Decimal("31.5")
+    assert Decimal(pnl["futures_entry_fee_usd"]) == Decimal("5")
+    assert Decimal(pnl["futures_exit_fee_usd"]) == Decimal("5.5")
+    assert Decimal(pnl["spot_entry_fee_usd"]) == Decimal("10")
+    assert Decimal(pnl["spot_exit_fee_usd"]) == Decimal("11")
+    assert Decimal(pnl["entry_fee_usd"]) == Decimal("15")
+    assert Decimal(pnl["exit_fee_usd"]) == Decimal("16.5")
+    assert Decimal(entry["cost_reserve_usd"]) == Decimal(pnl["fees_usd"]) + Decimal(pnl["gas_usd"])
+    # Net consumes the true exit-based fees (CR18), not the legacy total.
+    carry = Decimal(pnl["funding_carry_usd"])
+    basis = Decimal(pnl["basis_pnl_usd"])
+    gas = Decimal(pnl["gas_usd"])
+    assert Decimal(pnl["net_pnl_usd"]) == basis + carry - Decimal("31.5") - gas
     # Funding carry: sum(rate * mark * futures_qty) over the window.
     assert Decimal(pnl["funding_carry_usd"]) > 0
     # Net return uses capital, and the futures-notional return is also shown.
@@ -838,3 +907,216 @@ async def test_run_due_grades_due_and_leaves_pending(repo):
         repo, None,
     )
     assert summary.sample_count == 2
+
+
+# ---------------------------------------------------------------------------
+# CR16 (D14.2): MARK path needs a real async MARK read + price_basis check.
+# TRADE-complete never masquerades as a complete liquidation path.
+# ---------------------------------------------------------------------------
+
+
+def _mark_daily(fake: FakeMarketProvider, start_ms: int, end_ms: int) -> None:
+    """Mirror the TRADE daily timeline with true MARK bars (price 100->110)."""
+    steps = max(1, (int(end_ms) - int(start_ms)) // DAY_MS)
+    for i in range(steps + 1):
+        open_ms = int(start_ms) + i * DAY_MS
+        if open_ms > int(end_ms):
+            break
+        frac = (open_ms - int(start_ms)) / max(1, int(end_ms) - int(start_ms))
+        price = str(Decimal("100") + (Decimal("110") - Decimal("100")) * Decimal(str(frac)))
+        fake.add_mark_bar(_mark_bar("BTCUSDT", open_ms, price))
+
+
+@pytest.mark.asyncio
+async def test_mark_empty_never_complete_reader_proved(repo):
+    """TRADE complete + MARK empty => PARTIAL (reader executed, no masquerade)."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-mark-empty", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
+    fake.quotes[0]["snapshot_id"] = "q-entry"
+    fake.quotes[1]["snapshot_id"] = "q-exit"
+    # No MARK bars added: reader returns () after a real async call.
+    outcome = await grade_hedge(
+        "fcs-mark-empty", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    # Proof the MARK reader really executed (not a binding existence check).
+    assert len(fake.read_mark_calls) >= 1
+    assert fake.read_mark_calls[0][0] == "BTCUSDT"
+    assert int(fake.read_mark_calls[0][1]) == NOW
+    assert int(fake.read_mark_calls[0][2]) == NOW + 7 * DAY_MS
+    cov = outcome.outcome_json["risk"]["path_coverage"]
+    assert cov in ("PARTIAL", "UNKNOWN")
+    assert cov != "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_mark_trade_basis_never_counts(repo):
+    """MARK reader returning TRADE-basis bars => PARTIAL, never COMPLETE."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-mark-trade", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
+    fake.quotes[0]["snapshot_id"] = "q-entry"
+    fake.quotes[1]["snapshot_id"] = "q-exit"
+    # Wrong basis: TRADE bars injected into the MARK store must be discarded.
+    t = NOW
+    while t <= NOW + 7 * DAY_MS:
+        fake.add_mark_bar(_bar("BTCUSDT", t, "105"))
+        t += DAY_MS
+    outcome = await grade_hedge(
+        "fcs-mark-trade", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    assert len(fake.read_mark_calls) >= 1
+    assert outcome.outcome_json["risk"]["path_coverage"] != "COMPLETE"
+    assert outcome.outcome_json["risk"]["path_coverage"] in ("PARTIAL", "UNKNOWN")
+
+
+@pytest.mark.asyncio
+async def test_mark_window_mismatch_partial(repo):
+    """MARK bars outside / covering only half the window => PARTIAL."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-mark-window", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
+    fake.quotes[0]["snapshot_id"] = "q-entry"
+    fake.quotes[1]["snapshot_id"] = "q-exit"
+    # Interior 72h gap (NOW+1d -> NOW+4d) voids COMPLETE per D14.2 gap rule.
+    for open_ms in (NOW, NOW + DAY_MS, NOW + 4 * DAY_MS, NOW + 5 * DAY_MS):
+        fake.add_mark_bar(_mark_bar("BTCUSDT", open_ms, "105"))
+    outcome = await grade_hedge(
+        "fcs-mark-window", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    assert len(fake.read_mark_calls) >= 1
+    assert outcome.outcome_json["risk"]["path_coverage"] == "PARTIAL"
+
+
+@pytest.mark.asyncio
+async def test_mark_complete_when_mark_covers(repo):
+    """True MARK bars covering the window => COMPLETE (binding + real read)."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-mark-full", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
+    fake.quotes[0]["snapshot_id"] = "q-entry"
+    fake.quotes[1]["snapshot_id"] = "q-exit"
+    _mark_daily(fake, NOW, NOW + 7 * DAY_MS)
+    outcome = await grade_hedge(
+        "fcs-mark-full", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    assert len(fake.read_mark_calls) >= 1
+    assert outcome.outcome_json["risk"]["path_coverage"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_mark_future_known_excluded(repo):
+    """MARK bars known after grading are not then-known => PARTIAL."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-mark-future", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = _complete_fake(NOW, NOW + 7 * DAY_MS, entry_qty="100")
+    fake.quotes[0]["snapshot_id"] = "q-entry"
+    fake.quotes[1]["snapshot_id"] = "q-exit"
+    grading_ms = NOW + 8 * DAY_MS
+    t = NOW
+    while t <= NOW + 7 * DAY_MS:
+        fake.add_mark_bar(_mark_bar("BTCUSDT", t, "105", known_at_ms=grading_ms + HOUR_MS))
+        t += DAY_MS
+    outcome = await grade_hedge(
+        "fcs-mark-future", "ABSOLUTE_100", 7, grading_ms, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    assert len(fake.read_mark_calls) >= 1
+    assert outcome.outcome_json["risk"]["path_coverage"] in ("PARTIAL", "UNKNOWN")
+    assert outcome.outcome_json["risk"]["path_coverage"] != "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_mark_unbound_and_missing_reader_unknown():
+    """No reader / explicitly unbound MARK fn => UNKNOWN (never TRADE)."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import (
+        _mark_path_coverage,
+    )
+
+    class _NoMark:
+        pass
+
+    assert await _mark_path_coverage(_NoMark(), "BTCUSDT", 1000, 2000, 3000) == "UNKNOWN"
+    assert await _mark_path_coverage(None, "BTCUSDT", 1000, 2000, 3000) == "UNKNOWN"
+
+    class _Unbound:
+        mark_price_bars_fn = None
+
+        async def read_mark_price_bars(self, symbol, start_ms, end_ms, ctx=None):
+            raise AssertionError("unbound MARK must not be read")
+
+    assert await _mark_path_coverage(_Unbound(), "BTCUSDT", 1000, 2000, 3000) == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# CR18 (D14.2/V15): net consumes true per-leg entry/exit-amount fees.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_net_consumes_exit_based_fees(repo):
+    """Exit 2x entry: exit fee follows exit notional; legacy total is wrong."""
+    from diveintocrypto_desktop.shortlab.evidence.hedge_grader import grade_hedge
+
+    await _save_fcs(repo, "fcs-fees-exit", NOW)
+    await _save_venue(repo, "q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100")
+    await _save_venue(repo, "q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100")
+    fake = FakeMarketProvider()
+    # TRADE bars 100 -> 200 (exit 2x) with complete funding/quotes.
+    t = NOW
+    steps = 7
+    for i in range(steps + 1):
+        open_ms = NOW + i * DAY_MS
+        frac = (open_ms - NOW) / max(1, 7 * DAY_MS)
+        price = str(Decimal("100") + (Decimal("200") - Decimal("100")) * Decimal(str(frac)))
+        fake.add_bar(_bar("BTCUSDT", open_ms, price))
+    cursor = NOW + 8 * HOUR_MS
+    while cursor <= NOW + 7 * DAY_MS:
+        fake.add_funding(_funding("BTCUSDT", cursor, "0.0001", "150", "1"))
+        cursor += 8 * HOUR_MS
+    fake.add_quote(_quote("q-entry", "bitcoin", "BINANCE_SPOT", NOW, "100", "100"))
+    fake.add_quote(_quote("q-exit", "bitcoin", "BINANCE_SPOT", NOW + 7 * DAY_MS, "100", "200"))
+    _mark_daily(fake, NOW, NOW + 7 * DAY_MS)
+    outcome = await grade_hedge(
+        "fcs-fees-exit", "ABSOLUTE_100", 7, NOW + 8 * DAY_MS, repo, fake, None,
+    )
+    assert outcome.outcome_status == "COMPLETE"
+    pnl = outcome.outcome_json["pnl"]
+    entry = outcome.outcome_json["entry"]
+    # Futures 10000 entry / 20000 exit; spot 10000 / 20000.
+    # True fees: 5 + 10 + 10 + 20 = 45; legacy entry-notional total would be 30.
+    assert Decimal(pnl["futures_entry_fee_usd"]) == Decimal("5")
+    assert Decimal(pnl["futures_exit_fee_usd"]) == Decimal("10")
+    assert Decimal(pnl["spot_entry_fee_usd"]) == Decimal("10")
+    assert Decimal(pnl["spot_exit_fee_usd"]) == Decimal("20")
+    assert Decimal(pnl["fees_usd"]) == Decimal("45")
+    assert Decimal(pnl["fees_usd_exit_based"]) == Decimal("45")
+    assert Decimal(pnl["fees_usd"]) != Decimal("30")
+    # Net consumes the true exit-based total (off by 15 vs legacy here).
+    carry = Decimal(pnl["funding_carry_usd"])
+    basis = Decimal(pnl["basis_pnl_usd"])
+    gas = Decimal(pnl["gas_usd"])
+    assert Decimal(pnl["net_pnl_usd"]) == basis + carry - Decimal("45") - gas
+    # Capital denominator stays frozen (spot cash + margin + reserve).
+    capital = Decimal(entry["capital_at_risk_usd"])
+    assert capital == Decimal("10000") + Decimal("10000") + Decimal("45") + gas
+    assert abs(Decimal(pnl["net_return"]) - Decimal(pnl["net_pnl_usd"]) / capital) < Decimal("1e-12")
