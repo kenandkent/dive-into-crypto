@@ -60,6 +60,101 @@ def _mapping(value):
     return asdict(value) if is_dataclass(value) else dict(value)
 
 
+def _funding_time_of(ev: Any) -> int | None:
+    """CR02 (D03/D05): compat settled time for FundingEventRecord + mappings.
+
+    Accepts ``FundingEventRecord`` dataclass (``funding_time_ms``), legacy
+    dicts (``funding_time_ms``/``fundingTime``/``t``/``funding_time``) and
+    ``Observed`` envelopes (``value``/``meta``). Returns ``None`` when the
+    time is missing or unparseable (caller skips, never ``e.get`` crash).
+    """
+    if isinstance(ev, Mapping):
+        for key in ("funding_time_ms", "fundingTime", "t", "funding_time",
+                    "event_time_ms", "time_ms"):
+            if key in ev and ev[key] is not None:
+                try:
+                    return int(ev[key])  # type: ignore[index]
+                except (TypeError, ValueError):
+                    return None
+        try:
+            nested = ev.get("value")
+        except Exception:
+            nested = None
+        if isinstance(nested, Mapping):
+            return _funding_time_of(nested)
+        return None
+    for attr in ("funding_time_ms", "fundingTime", "t"):
+        try:
+            if hasattr(ev, attr):
+                val = getattr(ev, attr)
+                return None if val is None else int(val)
+        except (TypeError, ValueError):
+            return None
+    try:
+        nested_obj = getattr(ev, "value", None)
+        if nested_obj is not None and nested_obj is not ev and isinstance(nested_obj, Mapping):
+            return _funding_time_of(nested_obj)
+    except Exception:
+        pass
+    return None
+
+
+def _funding_receipt_known_at(row: Any) -> int | None:
+    """CR02 (D03): compat ``known_at`` for persisted funding observation rows.
+
+    Handles ``list_funding_observations`` mappings (``known_at_ms`` top
+    level, possibly ``meta_json``) and ``FundingObservationRecord``
+    dataclasses. ``None`` when no receipt is carried.
+    """
+    if isinstance(row, Mapping):
+        for key in ("known_at_ms", "knownAt", "known_at"):
+            try:
+                if key in row and row[key] is not None:
+                    return int(row[key])  # type: ignore[index]
+            except (TypeError, ValueError):
+                return None
+        try:
+            meta = row.get("meta_json", row.get("meta"))
+        except Exception:
+            meta = None
+        if isinstance(meta, Mapping):
+            for key in ("known_at_ms", "knownAt", "known_at", "fetched_at_ms"):
+                try:
+                    if key in meta and meta[key] is not None:
+                        return int(meta[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
+    for attr in ("known_at_ms", "known_at", "fetched_at_ms"):
+        try:
+            if hasattr(row, attr):
+                val = getattr(row, attr)
+                return None if val is None else int(val)
+        except (TypeError, ValueError):
+            return None
+    try:
+        meta_obj = getattr(row, "meta", None)
+    except Exception:
+        meta_obj = None
+    if meta_obj is not None:
+        if isinstance(meta_obj, Mapping):
+            for key in ("known_at_ms", "known_at", "fetched_at_ms"):
+                try:
+                    if key in meta_obj and meta_obj[key] is not None:
+                        return int(meta_obj[key])
+                except (TypeError, ValueError):
+                    return None
+        else:
+            for attr in ("known_at_ms", "known_at", "fetched_at_ms"):
+                try:
+                    if hasattr(meta_obj, attr):
+                        val = getattr(meta_obj, attr)
+                        return None if val is None else int(val)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
 class ProductionHedgeMarket:
     def __init__(self, service, config, repo, budget, clock, env=None):
         self.service, self.config, self.repo = service, config, repo
@@ -643,14 +738,76 @@ class ProductionHedgeMarket:
         last_rate = getattr(metrics, 'last_settled_rate', None)
         last_obs: Any = None
         if last_rate is not None and events:
+            # CR02 (D03/D05): compat latest settled + persisted receipt.
+            # The canonical ``sl_funding_event`` row carries no receipt; the
+            # original ``sl_funding_observation`` receipt (``known_at``) for
+            # that ``funding_time`` known no later than ``as_of`` is restored
+            # verbatim. A missing receipt stays ``None`` (UNKNOWN downstream);
+            # an old event is never restamped with current ``as_of``.
+            latest_t: int | None = None
             try:
-                latest_t = max(int(e.get('funding_time_ms', e.get('t', 0)) or 0) for e in events)
-                last_obs = _obs.make_observation(
-                    {'rate': str(last_rate), 'funding_time_ms': latest_t},
-                    source="binance:fapi/fundingRate", source_as_of_ms=latest_t,
-                    fetched_at_ms=as_of, known_at_ms=as_of, status="OK")
+                for _ev in events:
+                    _t = _funding_time_of(_ev)
+                    if _t is None or _t > as_of:
+                        continue
+                    if latest_t is None or _t > latest_t:
+                        latest_t = _t
             except Exception:
-                last_obs = None
+                latest_t = None
+            if latest_t is not None:
+                receipt_known: int | None = None
+                receipt_fetched: int | None = None
+                try:
+                    _list_obs = getattr(self.repo, "list_funding_observations", None)
+                    if callable(_list_obs):
+                        try:
+                            _rows = await _list_obs(symbol, latest_t, latest_t, as_of)
+                        except Exception as _exc:
+                            if isinstance(_exc, BudgetExhausted) or _is_budget_denial(_exc):
+                                raise
+                            _rows = ()
+                        if _rows:
+                            _best_known: int | None = None
+                            _best_fetched: int | None = None
+                            for _row in _rows:
+                                _k = _funding_receipt_known_at(_row)
+                                if _k is None or _k > as_of:
+                                    continue
+                                if _best_known is None or _k > _best_known:
+                                    _best_known = _k
+                                    _best_fetched = _k
+                                    try:
+                                        if isinstance(_row, Mapping):
+                                            _f = _row.get("fetched_at_ms", _row.get("fetchedAt"))
+                                            if _f is None:
+                                                _mj = _row.get("meta_json", _row.get("meta"))
+                                                if isinstance(_mj, Mapping):
+                                                    _f = _mj.get("fetched_at_ms", _mj.get("known_at_ms"))
+                                            if _f is not None:
+                                                _best_fetched = int(_f)
+                                        else:
+                                            _f2 = getattr(_row, "fetched_at_ms", None)
+                                            if _f2 is not None:
+                                                _best_fetched = int(_f2)
+                                    except (TypeError, ValueError):
+                                        _best_fetched = _k
+                            receipt_known = _best_known
+                            receipt_fetched = _best_fetched
+                except BudgetExhausted:
+                    raise
+                except Exception:
+                    receipt_known = None
+                if receipt_known is not None:
+                    try:
+                        last_obs = _obs.make_observation(
+                            {'rate': str(last_rate), 'funding_time_ms': latest_t},
+                            source="binance:fapi/fundingRate", source_as_of_ms=latest_t,
+                            fetched_at_ms=int(receipt_fetched if receipt_fetched is not None else receipt_known),
+                            known_at_ms=int(receipt_known), status="OK")
+                    except Exception:
+                        last_obs = None
+                else:
+                    last_obs = None
         return build_funding_context(
             metrics, cov7, cov30, cov90, history_class=history_class,
             listing_age_days=listing_days,
