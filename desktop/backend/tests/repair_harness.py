@@ -101,6 +101,231 @@ def canonical_scenario(scenario: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# seed_funding helper (harness-only, never production).
+# Writes CONFIRMED schedule + funding events + observations for honest
+# six-item activation. Scenario-aware: negative-funding forces negative
+# rate, unknown-schedule is a no-op (never broadcasts schedule).
+# ---------------------------------------------------------------------------
+
+
+async def _do_seed_funding(
+    repo: Any,
+    symbol: str,
+    rate: float,
+    days: int,
+    interval_hours: int,
+    now_ms: int,
+) -> dict[str, Any]:
+    """Seed CONFIRMED funding history for ``symbol`` up to ``now_ms``.
+
+    Reuses an existing CONFIRMED schedule with the same interval when
+    present (avoids overlapping CONFIRMED overlap-UNKNOWN); otherwise
+    creates one with ``effective_from=start`` and ``anchor=first slot``.
+    Events/observations are upserted for every slot in
+    ``(start, now]`` (left-open, right-closed, matching funding_score).
+    Observations carry ``known_at=slot`` (<= cutoff) so the market
+    ``collect_funding`` last-settled receipt is honestly present.
+    """
+    sym = str(symbol).upper().strip()
+    if not sym:
+        raise ValueError("symbol must be non-empty str")
+    try:
+        rate_f = float(rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"rate must be a number: {exc}") from exc
+    import math as _math
+
+    if not _math.isfinite(rate_f):
+        raise ValueError("rate must be finite")
+    try:
+        days_i = int(days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"days must be an int: {exc}") from exc
+    try:
+        interval_i = int(interval_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"interval_hours must be an int: {exc}") from exc
+    if days_i < 1 or days_i > 365:
+        raise ValueError("days must be in 1..365")
+    if interval_i < 1 or interval_i > 24:
+        raise ValueError("interval_hours must be in 1..24")
+    now = int(now_ms)
+    if now < 0:
+        raise ValueError("now_ms must be >= 0")
+    interval_ms = int(interval_i) * 3_600_000
+    day_ms = 86_400_000
+    # Reuse existing CONFIRMED schedule with same interval when present.
+    existing_start: int | None = None
+    existing_anchor: int | None = None
+    existing_id: str | None = None
+    try:
+        rows = await repo.list_funding_schedules(sym, int(now))  # type: ignore[attr-defined]
+    except Exception:
+        rows = ()
+    try:
+        for _r in (rows or ()):
+            try:
+                _sj: Any = None
+                if isinstance(_r, dict):
+                    _sj = _r.get("schedule_json")
+                else:
+                    _sj = getattr(_r, "schedule_json", None)
+                    if isinstance(_sj, str):
+                        import json as _js0
+
+                        try:
+                            _sj = _js0.loads(_sj)
+                        except Exception:
+                            _sj = None
+                if isinstance(_sj, dict):
+                    _ver = str(_sj.get("verification") or "")
+                    _iv = _sj.get("interval_hours")
+                    try:
+                        _iv_i = int(_iv) if _iv is not None else None
+                    except (TypeError, ValueError):
+                        _iv_i = None
+                    if _ver == "CONFIRMED" and _iv_i == int(interval_i):
+                        # Reuse earliest effective_from for stability.
+                        try:
+                            if isinstance(_r, dict):
+                                _eff = int(_r.get("effective_from_ms"))  # type: ignore[arg-type]
+                                _anc = int(_sj.get("anchor_ms"))  # type: ignore[arg-type]
+                                _sid = str(_sj.get("schedule_id") or _r.get("schedule_id"))
+                            else:
+                                _eff = int(getattr(_r, "effective_from_ms"))
+                                _anc = int(_sj.get("anchor_ms"))
+                                _sid = str(_sj.get("schedule_id") or getattr(_r, "schedule_id"))
+                        except (TypeError, ValueError, AttributeError):
+                            continue
+                        if existing_start is None or int(_eff) < int(existing_start):
+                            existing_start = int(_eff)
+                            existing_anchor = int(_anc)
+                            existing_id = str(_sid)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if existing_start is not None and existing_anchor is not None and existing_id is not None:
+        start = int(existing_start)
+        anchor = int(existing_anchor)
+        schedule_id = str(existing_id)
+        need_new_schedule = False
+    else:
+        start = int(now) - int(days_i) * int(day_ms)
+        # First slot after start (left-open window (start, now]).
+        anchor = int(start) + int(interval_ms)
+        schedule_id = f"seed-{sym}-{int(interval_i)}h-{int(start)}"
+        need_new_schedule = True
+    # Slots in (start, now] aligned to anchor + k*interval.
+    import math as _math2
+
+    slots: list[int] = []
+    try:
+        k_min = _math2.ceil((int(start) + 1 - int(anchor)) / float(interval_ms))
+        k_max = _math2.floor((int(now) - int(anchor)) / float(interval_ms))
+        for _k in range(int(k_min), int(k_max) + 1):
+            _t = int(anchor) + int(_k) * int(interval_ms)
+            if _t > int(start) and _t <= int(now):
+                slots.append(int(_t))
+    except Exception:
+        # Fallback linear walk (same result, slower).
+        _cur = int(start) + int(interval_ms)
+        while _cur <= int(now):
+            slots.append(int(_cur))
+            _cur += int(interval_ms)
+    # Events (canonical funding history; conflicts keep old, never overwrite).
+    try:
+        await repo.upsert_funding_events(  # type: ignore[attr-defined]
+            [{"symbol": sym, "funding_time_ms": int(_s), "funding_rate": float(rate_f)} for _s in slots]
+        )
+    except Exception as exc:
+        raise RuntimeError(f"seed events failed: {type(exc).__name__}: {exc}") from exc
+    # Observations (persisted receipts for last-settled; same id+content is no-op).
+    obs_ok = 0
+    for _s in slots:
+        _oid = f"seed-obs-{sym}-{int(_s)}"
+        try:
+            await repo.save_funding_observation(  # type: ignore[attr-defined]
+                {
+                    "observation_id": _oid,
+                    "symbol": sym,
+                    "funding_time_ms": int(_s),
+                    "known_at_ms": int(_s),
+                    "raw_json": {"rate": str(float(rate_f)), "funding_time_ms": int(_s)},
+                    "interval_hours": float(interval_i),
+                    "interval_source": "CONFIRMED_SCHEDULE",
+                    "observation_status": "OBSERVED",
+                }
+            )
+            obs_ok += 1
+        except Exception:
+            # Immutable same-content retry is fine; different-content keeps old.
+            # Swallow per-slot to stay honest (events already carry history).
+            try:
+                # If immutable conflict with different content, keep old (honest).
+                pass
+            except Exception:
+                pass
+            continue
+    # Schedule (CONFIRMED, idempotent on same id+content).
+    sched_ok = 0
+    if need_new_schedule:
+        try:
+            await repo.save_funding_schedule(  # type: ignore[attr-defined]
+                {
+                    "schedule_id": schedule_id,
+                    "symbol": sym,
+                    "effective_from_ms": int(start),
+                    "effective_to_ms": None,
+                    "known_at_ms": int(start),
+                    "schedule_json": {
+                        "schedule_id": schedule_id,
+                        "symbol": sym,
+                        "effective_from_ms": int(start),
+                        "effective_to_ms": None,
+                        "interval_hours": int(interval_i),
+                        "anchor_ms": int(anchor),
+                        "known_at_ms": int(start),
+                        "source": "binance:fapi/fundingInfo",
+                        "evidence_ref": f"seed-{sym}",
+                        "verification": "CONFIRMED",
+                    },
+                }
+            )
+            sched_ok = 1
+        except Exception as exc:
+            # Same id same content is fine (already seeded); different content
+            # with same id must not silently overwrite (honest 409-style).
+            try:
+                from diveintocrypto_desktop.shortlab.repository import SnapshotImmutableError as _Imm  # type: ignore
+
+                if isinstance(exc, _Imm):
+                    # Already seeded with same id (reuse path should have hit);
+                    # treat as ok without overwrite.
+                    sched_ok = 0
+                else:
+                    raise
+            except RuntimeError:
+                raise
+            except Exception:
+                # If SnapshotImmutableError import fails, re-raise original.
+                if "immutable" in str(exc).lower():
+                    sched_ok = 0
+                else:
+                    raise RuntimeError(f"seed schedule failed: {exc}") from exc
+    return {
+        "symbol": sym,
+        "rate": str(float(rate_f)),
+        "days": int(days_i),
+        "interval_hours": int(interval_i),
+        "slots": int(len(slots)),
+        "observations": int(obs_ok),
+        "schedule": int(sched_ok),
+        "reused": bool(not need_new_schedule),
+    }
+
+
+# ---------------------------------------------------------------------------
 # FakeClock (advancing test clock; injected as Runtime ``clock``).
 # ---------------------------------------------------------------------------
 
@@ -442,7 +667,7 @@ def create_repair_test_app(
     app = create_app(shortlab_runtime_factory=shortlab_runtime_factory)
 
     # -- test-only harness control routes (absent from production) -----------
-    from fastapi import APIRouter
+    from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
     control = APIRouter(prefix="/test/harness", tags=["repair-harness"])
@@ -488,6 +713,168 @@ def create_repair_test_app(
         harness_state["canonical_scenario"] = canonical_scenario(name)
         return {"scenario": name, "canonicalScenario": harness_state["canonical_scenario"]}
 
+    @control.post("/seed_funding")
+    async def _harness_seed_funding(payload: dict[str, Any]) -> Any:
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        try:
+            symbol = str(payload.get("symbol", "") or "").strip()
+            rate_raw = payload.get("rate", None)
+            days_raw = payload.get("days", None)
+            interval_raw = payload.get("interval_hours", payload.get("intervalHours", None))
+            if not symbol:
+                return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+            if rate_raw is None or days_raw is None or interval_raw is None:
+                return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+            rate_f = float(str(rate_raw))
+            days_i = int(days_raw)
+            interval_i = int(interval_raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        # Scenario-aware: unknown-schedule never broadcasts schedule/events.
+        try:
+            _canon = str(harness_state.get("canonical_scenario") or harness_state.get("scenario") or "")
+        except Exception:
+            _canon = ""
+        if _canon == "unknown-schedule":
+            return {"symbol": symbol.upper(), "seeded": 0, "slots": 0, "reason": "UNKNOWN_SCHEDULE_NO_BROADCAST"}
+        # Negative scenario broadcasts negative rate (force negative).
+        if _canon == "negative-funding" and float(rate_f) > 0:
+            rate_f = -abs(float(rate_f))
+        try:
+            now_ms = int(clock_ms())
+        except Exception:
+            return JSONResponse({"error": "HARNESS_CLOCK_NOT_ADVANCEABLE"}, status_code=400)
+        try:
+            _rt = app.state.shortlab_runtime  # type: ignore[attr-defined]
+        except Exception:
+            _rt = None
+        _repo: Any = None
+        try:
+            if _rt is not None:
+                _repo = getattr(_rt, "_repository", None) or getattr(_rt, "repository", None)
+                if _repo is None:
+                    try:
+                        _svc = getattr(_rt, "service", None)
+                        # service may be property raising when unavailable.
+                        if _svc is not None and not callable(_svc):
+                            _repo = getattr(_svc, "_repository", None)
+                        elif callable(_svc):
+                            try:
+                                _s2 = _svc()
+                                _repo = getattr(_s2, "_repository", None)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                # repository property may be None before start; try service repo.
+                if _repo is None:
+                    try:
+                        _svc2 = _rt.service  # type: ignore[attr-defined]
+                        _repo = getattr(_svc2, "_repository", None)
+                    except Exception:
+                        pass
+        except Exception:
+            _repo = None
+        if _repo is None:
+            return JSONResponse({"error": "HARNESS_STORE_UNAVAILABLE"}, status_code=503)
+        try:
+            out = await _do_seed_funding(_repo, symbol, float(rate_f), int(days_i), int(interval_i), int(now_ms))
+        except ValueError:
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        except RuntimeError as exc:
+            return JSONResponse({"error": "HARNESS_SEED_FAILED", "detail": str(exc)[:200]}, status_code=500)
+        except Exception as exc:
+            return JSONResponse({"error": "HARNESS_SEED_FAILED", "detail": f"{type(exc).__name__}"[:200]}, status_code=500)
+        # Honest cache invalidation for FakeClock jumps (real-time QuoteCache).
+        try:
+            _svc3 = None
+            try:
+                _svc3 = _rt.service  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    _svc3 = getattr(_rt, "_service", None)
+                except Exception:
+                    pass
+            _mkt = getattr(_svc3, "_hedge_market", None) if _svc3 is not None else None
+            if _mkt is not None:
+                try:
+                    getattr(_mkt, "_marks", {}).clear()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    getattr(_mkt, "_funding_cache", {}).clear()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    _mkt._exchange_cache = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                for _vn in ("spot", "alpha"):
+                    try:
+                        _v = getattr(_mkt, _vn, None)
+                        if _v is not None and hasattr(_v, "reset_cache"):
+                            _v.reset_cache()  # type: ignore
+                        elif _v is not None and hasattr(_v, "_quotes"):
+                            try:
+                                _v._quotes.clear()  # type: ignore
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {"symbol": out.get("symbol"), "seeded": out.get("slots"), "slots": out.get("slots"), **out}
+
+    @control.get("/debug_activation")
+    async def _harness_debug_activation(symbol: str = "") -> Any:
+        sym = str(symbol or "").upper().strip() or "BTCUSDT"
+        try:
+            _rt2 = app.state.shortlab_runtime  # type: ignore[attr-defined]
+        except Exception:
+            _rt2 = None
+        _repo2: Any = None
+        try:
+            if _rt2 is not None:
+                _repo2 = getattr(_rt2, "_repository", None) or getattr(_rt2, "repository", None)
+                if _repo2 is None:
+                    try:
+                        _svc = getattr(_rt2, "service", None)
+                        if _svc is not None and not callable(_svc):
+                            _repo2 = getattr(_svc, "_repository", None)
+                    except Exception:
+                        pass
+                if _repo2 is None:
+                    try:
+                        _svc2 = _rt2.service  # type: ignore[attr-defined]
+                        _repo2 = getattr(_svc2, "_repository", None)
+                    except Exception:
+                        pass
+        except Exception:
+            _repo2 = None
+        if _repo2 is None:
+            return JSONResponse({"error": "HARNESS_STORE_UNAVAILABLE"}, status_code=503)
+        try:
+            now2 = int(clock_ms())
+        except Exception:
+            now2 = 0
+        try:
+            rows = await _repo2.list_market_observations(sym, "ACTIVATION_CHECK", 0, int(now2) + 1000, int(now2) + 1000)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+        if not rows:
+            return {"symbol": sym, "count": 0, "checks": {}}
+        last = rows[-1]
+        try:
+            vj = last.get("value_json") or {}
+            if isinstance(vj, str):
+                import json as _jsd
+
+                vj = _jsd.loads(vj)
+        except Exception:
+            vj = {}
+        return {"symbol": sym, "count": len(rows), "checks": (vj.get("checks") if isinstance(vj, dict) else {}), "value": vj}
+
     app.include_router(control)
 
     # Starlette matches routes in order; production mounts StaticFiles at "/"
@@ -495,7 +882,7 @@ def create_repair_test_app(
     # afterwards. Reorder so harness control stays reachable while the UI
     # mount remains last. Production sources are untouched.
     try:
-        _harness_paths = {"/test/harness/state", "/test/harness/advance", "/test/harness/scenario"}
+        _harness_paths = {"/test/harness/state", "/test/harness/advance", "/test/harness/scenario", "/test/harness/seed_funding", "/test/harness/debug_activation"}
         _harness_routes = [r for r in app.routes if str(getattr(r, "path", "")) in _harness_paths]
         if _harness_routes:
             _rest = [r for r in app.routes if r not in _harness_routes]
@@ -961,7 +1348,7 @@ def create_repair_acceptance_app(
 
     app = create_app(shortlab_runtime_factory=shortlab_runtime_factory)
 
-    from fastapi import APIRouter
+    from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
     control = APIRouter(prefix="/test/harness", tags=["repair-harness"])
@@ -1008,10 +1395,168 @@ def create_repair_acceptance_app(
         harness_state["canonical_scenario"] = canonical_scenario(name)
         return {"scenario": name, "canonicalScenario": harness_state["canonical_scenario"]}
 
+    @control.post("/seed_funding")
+    async def _harness_seed_funding(payload: dict[str, Any]) -> Any:
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        try:
+            symbol = str(payload.get("symbol", "") or "").strip()
+            rate_raw = payload.get("rate", None)
+            days_raw = payload.get("days", None)
+            interval_raw = payload.get("interval_hours", payload.get("intervalHours", None))
+            if not symbol:
+                return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+            if rate_raw is None or days_raw is None or interval_raw is None:
+                return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+            rate_f = float(str(rate_raw))
+            days_i = int(days_raw)
+            interval_i = int(interval_raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        try:
+            _canon = str(harness_state.get("canonical_scenario") or harness_state.get("scenario") or "")
+        except Exception:
+            _canon = ""
+        if _canon == "unknown-schedule":
+            return {"symbol": symbol.upper(), "seeded": 0, "slots": 0, "reason": "UNKNOWN_SCHEDULE_NO_BROADCAST"}
+        if _canon == "negative-funding" and float(rate_f) > 0:
+            rate_f = -abs(float(rate_f))
+        try:
+            now_ms = int(clock_ms())
+        except Exception:
+            return JSONResponse({"error": "HARNESS_CLOCK_NOT_ADVANCEABLE"}, status_code=400)
+        try:
+            _rt = app.state.shortlab_runtime  # type: ignore[attr-defined]
+        except Exception:
+            _rt = None
+        _repo: Any = None
+        try:
+            if _rt is not None:
+                _repo = getattr(_rt, "_repository", None) or getattr(_rt, "repository", None)
+                if _repo is None:
+                    try:
+                        _svc = getattr(_rt, "service", None)
+                        if _svc is not None and not callable(_svc):
+                            _repo = getattr(_svc, "_repository", None)
+                        elif callable(_svc):
+                            try:
+                                _s2 = _svc()
+                                _repo = getattr(_s2, "_repository", None)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if _repo is None:
+                    try:
+                        _svc2 = _rt.service  # type: ignore[attr-defined]
+                        _repo = getattr(_svc2, "_repository", None)
+                    except Exception:
+                        pass
+        except Exception:
+            _repo = None
+        if _repo is None:
+            return JSONResponse({"error": "HARNESS_STORE_UNAVAILABLE"}, status_code=503)
+        try:
+            out = await _do_seed_funding(_repo, symbol, float(rate_f), int(days_i), int(interval_i), int(now_ms))
+        except ValueError:
+            return JSONResponse({"error": "HARNESS_INPUT_INVALID"}, status_code=422)
+        except RuntimeError as exc:
+            return JSONResponse({"error": "HARNESS_SEED_FAILED", "detail": str(exc)[:200]}, status_code=500)
+        except Exception as exc:
+            return JSONResponse({"error": "HARNESS_SEED_FAILED", "detail": f"{type(exc).__name__}"[:200]}, status_code=500)
+        # Honest cache invalidation for FakeClock jumps (real-time QuoteCache).
+        try:
+            _svc3 = None
+            try:
+                _svc3 = _rt.service  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    _svc3 = getattr(_rt, "_service", None)
+                except Exception:
+                    pass
+            _mkt = getattr(_svc3, "_hedge_market", None) if _svc3 is not None else None
+            if _mkt is not None:
+                try:
+                    getattr(_mkt, "_marks", {}).clear()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    getattr(_mkt, "_funding_cache", {}).clear()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    _mkt._exchange_cache = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                for _vn in ("spot", "alpha"):
+                    try:
+                        _v = getattr(_mkt, _vn, None)
+                        if _v is not None and hasattr(_v, "reset_cache"):
+                            _v.reset_cache()  # type: ignore
+                        elif _v is not None and hasattr(_v, "_quotes"):
+                            try:
+                                _v._quotes.clear()  # type: ignore
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {"symbol": out.get("symbol"), "seeded": out.get("slots"), "slots": out.get("slots"), **out}
+
+    @control.get("/debug_activation")
+    async def _harness_debug_activation(symbol: str = "") -> Any:
+        sym = str(symbol or "").upper().strip() or "BTCUSDT"
+        try:
+            _rt2 = app.state.shortlab_runtime  # type: ignore[attr-defined]
+        except Exception:
+            _rt2 = None
+        _repo2: Any = None
+        try:
+            if _rt2 is not None:
+                _repo2 = getattr(_rt2, "_repository", None) or getattr(_rt2, "repository", None)
+                if _repo2 is None:
+                    try:
+                        _svc = getattr(_rt2, "service", None)
+                        if _svc is not None and not callable(_svc):
+                            _repo2 = getattr(_svc, "_repository", None)
+                    except Exception:
+                        pass
+                if _repo2 is None:
+                    try:
+                        _svc2 = _rt2.service  # type: ignore[attr-defined]
+                        _repo2 = getattr(_svc2, "_repository", None)
+                    except Exception:
+                        pass
+        except Exception:
+            _repo2 = None
+        if _repo2 is None:
+            return JSONResponse({"error": "HARNESS_STORE_UNAVAILABLE"}, status_code=503)
+        try:
+            now2 = int(clock_ms())
+        except Exception:
+            now2 = 0
+        try:
+            rows = await _repo2.list_market_observations(sym, "ACTIVATION_CHECK", 0, int(now2) + 1000, int(now2) + 1000)  # type: ignore[attr-defined]
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+        if not rows:
+            return {"symbol": sym, "count": 0, "checks": {}}
+        last = rows[-1]
+        try:
+            vj = last.get("value_json") or {}
+            if isinstance(vj, str):
+                import json as _jsd
+
+                vj = _jsd.loads(vj)
+        except Exception:
+            vj = {}
+        return {"symbol": sym, "count": len(rows), "checks": (vj.get("checks") if isinstance(vj, dict) else {}), "value": vj}
+
     app.include_router(control)
 
     try:
-        _harness_paths = {"/test/harness/state", "/test/harness/advance", "/test/harness/scenario"}
+        _harness_paths = {"/test/harness/state", "/test/harness/advance", "/test/harness/scenario", "/test/harness/seed_funding", "/test/harness/debug_activation"}
         _harness_routes = [r for r in app.routes if str(getattr(r, "path", "")) in _harness_paths]
         if _harness_routes:
             _rest = [r for r in app.routes if r not in _harness_routes]

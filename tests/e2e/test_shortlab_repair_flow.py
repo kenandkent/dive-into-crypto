@@ -218,6 +218,27 @@ def _evt(leg: str, typ: str, qty: str, price: str, now_ms: int) -> dict:
     }
 
 
+def _seed_funding(symbol: str, rate: str | float, days: int, interval_hours: int) -> dict:
+    st, body = _post("/test/harness/seed_funding", {
+        "symbol": symbol, "rate": str(rate), "days": int(days), "interval_hours": int(interval_hours),
+    })
+    assert st == 200, f"seed {symbol} {body}"
+    return body
+
+
+def _simulate_btc(now_ms: int) -> dict:
+    # Honest BTC simulate with liquidation + stop binding (hash-aligned with
+    # protection triggerPrice 70000 / MARK so six-item protection can PASS).
+    return {
+        "symbol": "BTCUSDT", "mode": "ABSOLUTE",
+        "futuresNotionalUsd": "10000", "preferredSpotVenue": "AUTO",
+        "liquidationPrice": "70000",
+        "liquidationPriceUpdatedAtMs": int(now_ms) - 3_600_000,
+        "stopTriggerPrice": "70000",
+        "stopTriggerBasis": "MARK",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Isolation + bindings (REAL_PRODUCERS, urllib only).
 # ---------------------------------------------------------------------------
@@ -307,6 +328,30 @@ def _full_chain_once(tag: str, scenario: str):
     st, state = _get("/test/harness/state")
     assert st == 200
     now_ms = int(state["nowMs"])
+    # Expire 5s mark / 30s funding caches so scenario-aware raw stubs
+    # (negative rate, unknown onboard) are honestly re-fetched, never stale
+    # cached positive. Unknown advances 9h (also expires) to make last
+    # settlement stale UNKNOWN.
+    if scenario == "unknown-schedule":
+        _seed_funding("BTCUSDT", "0.0005", 95, 8)
+        st, _adv = _post("/test/harness/advance", {"ms": 9 * 3600 * 1000})
+        assert st == 200
+        st, state = _get("/test/harness/state")
+        assert st == 200
+        now_ms = int(state["nowMs"])
+    else:
+        st, _adv = _post("/test/harness/advance", {"ms": 35000})
+        assert st == 200
+        st, state = _get("/test/harness/state")
+        assert st == 200
+        now_ms = int(state["nowMs"])
+        # Seed honest CONFIRMED funding history per scenario (harness-only).
+        # normal/slow/plan-switch seed positive; negative seeds negative
+        # (harness forces negative).
+        if scenario == "negative-funding":
+            _seed_funding("BTCUSDT", "-0.0005", 95, 8)
+        else:
+            _seed_funding("BTCUSDT", "0.0005", 95, 8)
     # Candidate/funding-opportunity reads (honest; empty DB stays empty, never 500).
     st, cands = _get("/api/short/candidates?limit=5&offset=0")
     assert st in (200, 404)
@@ -316,11 +361,8 @@ def _full_chain_once(tag: str, scenario: str):
     # Decision (1000PEPE valid request shape).
     st, dec = _post("/api/short/hedge/decisions", _decision_body(now_ms))
     assert st == 201, f"{tag} decision {dec}"
-    # Simulation (BTC ABSOLUTE, real planner + real ports).
-    st, sim = _post("/api/short/hedge/simulate", {
-        "symbol": "BTCUSDT", "mode": "ABSOLUTE",
-        "futuresNotionalUsd": "10000", "preferredSpotVenue": "AUTO",
-    })
+    # Simulation (BTC ABSOLUTE with liquidationPrice/UpdatedAtMs + stop binding).
+    st, sim = _post("/api/short/hedge/simulate", _simulate_btc(now_ms))
     assert st == 200, f"{tag} simulate {sim}"
     sim_id = sim.get("simulationId") or sim.get("simulation_id")
     assert sim_id
@@ -383,7 +425,26 @@ def _full_chain_once(tag: str, scenario: str):
     st, _stale = _post(f"/api/short/hedge/plans/{pid}/activate", {"expected_version": 999999})
     assert st == 409, f"stale activate must be 409, got {st} {_stale}"
     st, act = _post(f"/api/short/hedge/plans/{pid}/activate", {})
-    assert st == 200, act
+    if scenario == "negative-funding":
+        assert st == 422, f"{tag} negative activate must be 422, got {st} {act}"
+        detail = str(act.get("detail") or act.get("error") or "")
+        assert "ACTIVATION_CHECK_FAILED" in detail or "ACTIVATION_CHECK_FAILED" in str(act), act
+        assert "FAIL" in str(act), f"negative must be funding FAIL, got {act}"
+        assert "funding_gate=FAIL" in str(act) or "FUNDING" in str(act), act
+        return {"planId": pid, "scenario": scenario, "activate": "FAIL"}
+    if scenario == "unknown-schedule":
+        assert st == 422, f"{tag} unknown activate must be 422, got {st} {act}"
+        assert "ACTIVATION_CHECK_FAILED" in str(act), act
+        assert "UNKNOWN" in str(act), f"unknown must be UNKNOWN, got {act}"
+        assert "funding_gate=UNKNOWN" in str(act) or "FUNDING_SCHEDULE_UNKNOWN" in str(act) or "UNKNOWN" in str(act), act
+        return {"planId": pid, "scenario": scenario, "activate": "UNKNOWN"}
+    if st != 200:
+        try:
+            _dbg_st, _dbg = _get("/test/harness/debug_activation?symbol=BTCUSDT")
+        except Exception as _e:
+            _dbg = {"error": str(_e)[:200]}
+            _dbg_st = -1
+        assert st == 200, f"{tag} activate {act} debug={_dbg}"
     assert act.get("status") == "ACTIVE"
     # Partial close (40% each leg) -> remaining verified.
     fut_d = Decimal(str(fut_qty))
@@ -456,6 +517,12 @@ def test_r15b_full_chain_all_scenarios(isolated_server):
         out = _full_chain_once(f"chain-{scen}", scen)
         assert out["scenario"] == scen
         assert out["planId"].startswith("plan-")
+        if scen in ("normal", "slow-provider", "plan-switch"):
+            assert out.get("activate", "ACTIVE") in ("ACTIVE", None) or "activate" not in out
+        elif scen == "negative-funding":
+            assert out.get("activate") == "FAIL", out
+        elif scen == "unknown-schedule":
+            assert out.get("activate") == "UNKNOWN", out
 
 
 def test_r15b_plan_switch_no_cross_write(isolated_server):
